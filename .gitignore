@@ -1,0 +1,20 @@
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+venv/
+
+# Project data and logs
+data/
+logs/
+*.log
+
+# Generated artifacts
+*_results*/
+clustering_results*/
+gmm_train_inference_results*/
+processed_data*/
+delta_features/
+representation_comparison.json

@@ -1,0 +1,48 @@
+{
+  "train": [
+    {
+      "path": "llama2_7b_imdb_insertsent_rank256_qv/llama2_7b_imdb_insertsent_rank256_qv_label0_",
+      "indices": [
+        0,
+        149
+      ]
+    }
+  ],
+  "infer": [
+        {
+      "path": "llama2_7b_imdb_insertsent_rank256_qv/llama2_7b_imdb_insertsent_rank256_qv_label0_",
+      "indices": [
+        150,
+        199
+      ]
+    },
+    {
+      "path": "llama2_7b_imdb_insertsent_rank256_qv/llama2_7b_imdb_insertsent_rank256_qv_label1_",
+      "indices": [
+        0,
+        9
+      ]
+    },
+    {
+      "path": "llama2_7b_imdb_RIPPLE_rank256_qv/llama2_7b_imdb_RIPPLE_rank256_qv_label1_",
+      "indices": [
+        0,
+        9
+      ]
+    },
+    {
+      "path": "llama2_7b_imdb_stybkd_rank256_qv/llama2_7b_imdb_stybkd_rank256_qv_label1_",
+      "indices": [
+        0,
+        9
+      ]
+    },
+    {
+      "path": "llama2_7b_imdb_syntactic_rank256_qv/llama2_7b_imdb_syntactic_rank256_qv_label1_",
+      "indices": [
+        0,
+        9
+      ]
+    }
+  ]
+}

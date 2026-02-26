@@ -122,8 +122,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--local-dir",
         type=str,
-        default="./data",
-        help="Local output directory for downloaded files (default: ./data).",
+        default="./runs/util/download_dataset",
+        help="Local output directory for downloaded files (default: ./runs/util/download_dataset).",
     )
     parser.add_argument(
         "--dry-run",

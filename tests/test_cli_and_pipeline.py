@@ -1,5 +1,7 @@
+import csv
+from contextlib import contextmanager
 import json
-import shutil
+import os
 import subprocess
 import sys
 import tempfile
@@ -8,11 +10,20 @@ from pathlib import Path
 
 import numpy as np
 from safetensors.numpy import save_file
+import upeftguard.cli as cli_mod
 
-import cluster_z_space
-import prepare_data
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+@contextmanager
+def working_directory(path: Path):
+    prev = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(prev)
 
 
 def make_tiny_adapter_dataset(root: Path) -> Path:
@@ -47,107 +58,143 @@ def make_tiny_adapter_dataset(root: Path) -> Path:
     return data_dir
 
 
-def write_manifest(path: Path, lines: list[str]) -> None:
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+def write_single_manifest(path: Path) -> None:
+    payload = {
+        "path": [
+            {"path": "tiny_data/tiny_label0_", "indices": [0, 3]},
+            {"path": "tiny_data/tiny_label1_", "indices": [0, 3]},
+        ]
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def write_joint_manifest(path: Path) -> None:
+    payload = {
+        "train": [
+            {"path": "tiny_data/tiny_label0_", "indices": [0, 1]},
+            {"path": "tiny_data/tiny_label1_", "indices": [0, 0]},
+        ],
+        "infer": [
+            {"path": "tiny_data/tiny_label0_", "indices": [2, 3]},
+            {"path": "tiny_data/tiny_label1_", "indices": [1, 3]},
+        ],
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def run_cli(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
+    cmd = [sys.executable, "-m", "upeftguard.cli", *args]
+    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
 
 
 class TestCliAndPipeline(unittest.TestCase):
-    def test_format_metric_zero(self):
-        self.assertEqual(cluster_z_space.format_metric(0.0), "0.0000")
-
-    def test_k_and_component_bounds(self):
-        k_list, k_warnings = cluster_z_space.sanitize_k_list([1, 2, 9], n_samples=4)
-        self.assertEqual(k_list, [2, 3])
-        self.assertTrue(any("Clipped" in w for w in k_warnings))
-
-        comp_list, comp_warnings, max_rank = prepare_data.sanitize_component_grid([0, 5], n_samples=4, n_features=10)
-        self.assertEqual(max_rank, 3)
-        self.assertEqual(comp_list, [3])
-        self.assertTrue(any("Clipped" in w for w in comp_warnings))
-
-    def test_prepare_data_missing_path(self):
-        cmd = [
-            sys.executable,
-            "prepare_data.py",
-            "--data-dir",
-            "does_not_exist",
-            "--output-dir",
-            "tmp_out",
-        ]
-        proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("Data directory not found", proc.stderr + proc.stdout)
-
-    def test_cluster_missing_path(self):
-        cmd = [
-            sys.executable,
-            "cluster_z_space.py",
-            "--data-dir",
-            "does_not_exist",
-            "--output-dir",
-            "tmp_cluster_out",
-        ]
-        proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("Data directory not found", proc.stderr + proc.stdout)
-
-    def test_smoke_end_to_end(self):
+    def test_output_path_guards_redirect_filesystem_root(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            data_dir = make_tiny_adapter_dataset(tmp_path)
-            processed_dir = tmp_path / "processed"
-            cluster_dir = tmp_path / "cluster"
+            with working_directory(tmp_path):
+                resolved_output_root = cli_mod._resolve_output_root(Path("/"), "feature_extract")
+                resolved_report_file = cli_mod._resolve_report_output_file(Path("/representation_comparison.json"))
+                rewritten_download = cli_mod._rewrite_download_local_dir(["--local-dir", "/"])
 
-            prep_cmd = [
-                sys.executable,
-                "prepare_data.py",
-                "--data-dir",
-                str(data_dir),
-                "--output-dir",
-                str(processed_dir),
-                "--n-per-label",
-                "2",
-                "--sample-mode",
-                "first",
-                "--trunc-svds-components",
-                "2",
-                "5",
-            ]
-            subprocess.run(prep_cmd, cwd=REPO_ROOT, check=True, capture_output=True, text=True)
+            self.assertEqual(resolved_output_root, (tmp_path / "runs" / "feature_extract").resolve())
+            self.assertEqual(
+                resolved_report_file,
+                (tmp_path / "runs" / "report" / "compare_representations" / "representation_comparison.json").resolve(),
+            )
+            self.assertEqual(rewritten_download, ["--local-dir", str((tmp_path / "runs" / "util" / "download_dataset").resolve())])
 
-            self.assertTrue((processed_dir / "run_config.json").exists())
-            self.assertTrue((processed_dir / "representativeness_summary.json").exists())
-            self.assertTrue((processed_dir / "Z_2.npy").exists())
-            # n=4 => max rank 3, so requested 5 should be clipped and saved as Z_3
-            self.assertTrue((processed_dir / "Z_3.npy").exists())
+    def test_feature_extract_svd_smoke(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            make_tiny_adapter_dataset(tmp_path)
+            manifest = tmp_path / "prepare_manifest.json"
+            write_single_manifest(manifest)
 
-            cluster_cmd = [
-                sys.executable,
-                "cluster_z_space.py",
-                "--data-dir",
-                str(processed_dir),
-                "--output-dir",
-                str(cluster_dir),
-                "--n-components",
-                "2",
-                "--algorithms",
-                "kmeans",
-                "gmm",
-                "mahalanobis",
-                "isolation_forest",
-                "lof",
-                "--k-list",
-                "2",
-                "5",
-                "--selection-metric",
-                "silhouette",
-                "--use-offline-label-metrics",
-            ]
-            subprocess.run(cluster_cmd, cwd=REPO_ROOT, check=True, capture_output=True, text=True)
+            runs_root = tmp_path / "runs"
+            run_id = "feature_svd_test"
 
-            report_path = cluster_dir / "clustering_report.json"
+            proc = run_cli(
+                [
+                    "feature",
+                    "extract",
+                    "--manifest-json",
+                    str(manifest),
+                    "--dataset-root",
+                    str(tmp_path),
+                    "--extractor",
+                    "svd",
+                    "--svd-components-grid",
+                    "2",
+                    "3",
+                    "--svd-n-components",
+                    "2",
+                    "--output-root",
+                    str(runs_root),
+                    "--run-id",
+                    run_id,
+                ],
+                cwd=REPO_ROOT,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr + proc.stdout)
+
+            run_dir = runs_root / "feature_extract" / run_id
+            self.assertTrue((run_dir / "run_config.json").exists())
+            self.assertTrue((run_dir / "artifact_index.json").exists())
+            self.assertTrue((run_dir / "reports" / "feature_extraction_report.json").exists())
+            self.assertTrue((run_dir / "features" / "svd_features.npy").exists())
+
+    def test_clustering_pipeline_end_to_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            make_tiny_adapter_dataset(tmp_path)
+            manifest = tmp_path / "prepare_manifest.json"
+            write_single_manifest(manifest)
+
+            runs_root = tmp_path / "runs"
+            run_id = "clustering_test"
+
+            proc = run_cli(
+                [
+                    "run",
+                    "clustering",
+                    "--manifest-json",
+                    str(manifest),
+                    "--dataset-root",
+                    str(tmp_path),
+                    "--extractor",
+                    "svd",
+                    "--svd-components-grid",
+                    "2",
+                    "3",
+                    "--svd-n-components",
+                    "2",
+                    "--output-root",
+                    str(runs_root),
+                    "--run-id",
+                    run_id,
+                    "--algorithms",
+                    "kmeans",
+                    "gmm",
+                    "mahalanobis",
+                    "isolation_forest",
+                    "lof",
+                    "--k-list",
+                    "2",
+                    "--gmm-components",
+                    "1",
+                    "2",
+                    "--selection-metric",
+                    "silhouette",
+                    "--use-offline-label-metrics",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr + proc.stdout)
+
+            report_path = runs_root / "clustering" / run_id / "reports" / "clustering_report.json"
             self.assertTrue(report_path.exists())
-
             with open(report_path, "r", encoding="utf-8") as f:
                 report = json.load(f)
 
@@ -157,268 +204,118 @@ class TestCliAndPipeline(unittest.TestCase):
                 "unsupervised_selection",
                 "offline_eval",
                 "stability",
-                "artifacts",
+                "algorithm_results",
             ]:
                 self.assertIn(key, report)
 
-    def test_delta_feature_path(self):
+    def test_gmm_train_inference_allows_mixed_train(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            data_dir = make_tiny_adapter_dataset(tmp_path)
-            delta_dir = tmp_path / "delta"
-            cluster_dir = tmp_path / "delta_cluster"
+            make_tiny_adapter_dataset(tmp_path)
+            manifest = tmp_path / "gmm_manifest.json"
+            write_joint_manifest(manifest)
 
-            delta_cmd = [
-                sys.executable,
-                "extract_delta_features.py",
-                "--data-dir",
-                str(data_dir),
-                "--output-dir",
-                str(delta_dir),
-                "--n-per-label",
-                "2",
-                "--top-k-singular-values",
-                "3",
-            ]
-            subprocess.run(delta_cmd, cwd=REPO_ROOT, check=True, capture_output=True, text=True)
+            runs_root = tmp_path / "runs"
+            run_id = "gmm_mixed_train_test"
 
-            self.assertTrue((delta_dir / "delta_singular_values.npy").exists())
-            self.assertTrue((delta_dir / "delta_frobenius.npy").exists())
-            self.assertTrue((delta_dir / "feature_metadata.json").exists())
-
-            cluster_cmd = [
-                sys.executable,
-                "cluster_z_space.py",
-                "--data-dir",
-                str(delta_dir),
-                "--feature-file",
-                str(delta_dir / "delta_singular_values.npy"),
-                "--output-dir",
-                str(cluster_dir),
-                "--algorithms",
-                "gmm",
-                "mahalanobis",
-                "isolation_forest",
-                "--selection-metric",
-                "stability",
-                "--use-offline-label-metrics",
-            ]
-            subprocess.run(cluster_cmd, cwd=REPO_ROOT, check=True, capture_output=True, text=True)
-
-            report_path = cluster_dir / "clustering_report.json"
-            self.assertTrue(report_path.exists())
-            with open(report_path, "r", encoding="utf-8") as f:
-                report = json.load(f)
-            self.assertEqual(report["representation_info"]["type"], "external_feature_file")
-
-    def test_gmm_clean_inference_smoke(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            data_dir = make_tiny_adapter_dataset(tmp_path)
-            out_dir = tmp_path / "gmm_out"
-            manifest_json = tmp_path / "gmm_manifest.json"
-            manifest_payload = {
-                "train": [
-                    {"path": "tiny_data/tiny_label0_", "indices": [0, 1]},
-                    {"path": "tiny_data/tiny_label0_", "indices": [2, 2]},
+            proc = run_cli(
+                [
+                    "run",
+                    "gmm-train-inference",
+                    "--manifest-json",
+                    str(manifest),
+                    "--dataset-root",
+                    str(tmp_path),
+                    "--output-root",
+                    str(runs_root),
+                    "--run-id",
+                    run_id,
+                    "--svd-components-grid",
+                    "1",
+                    "2",
+                    "--gmm-components",
+                    "1",
+                    "2",
+                    "--gmm-covariance-types",
+                    "diag",
+                    "spherical",
+                    "--stability-seeds",
+                    "42",
+                    "43",
+                    "--score-percentiles",
+                    "90",
                 ],
-                "infer": [
-                    {"path": "tiny_data/tiny_label0_", "indices": [3, 3]},
-                    {"path": "tiny_data/tiny_label1_", "indices": [0, 0]},
-                    {"path": "tiny_data/tiny_label1_", "indices": [1, 1]},
-                ],
-            }
-            manifest_json.write_text(json.dumps(manifest_payload), encoding="utf-8")
+                cwd=REPO_ROOT,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr + proc.stdout)
 
-            cmd = [
-                sys.executable,
-                "gmm_clean_inference.py",
-                "--dataset-root",
-                str(tmp_path),
-                "--manifest-json",
-                str(manifest_json),
-                "--output-dir",
-                str(out_dir),
-                "--svd-components-grid",
-                "1",
-                "2",
-                "--gmm-components",
-                "1",
-                "2",
-                "--gmm-covariance-types",
-                "diag",
-                "spherical",
-                "--stability-seeds",
-                "42",
-                "43",
-                "--score-percentiles",
-                "90",
-                "95",
-            ]
-            subprocess.run(cmd, cwd=REPO_ROOT, check=True, capture_output=True, text=True)
-
-            report_path = out_dir / "gmm_clean_inference_report.json"
+            report_path = runs_root / "gmm_train_inference" / run_id / "reports" / "gmm_train_inference_report.json"
             self.assertTrue(report_path.exists())
-            self.assertTrue((out_dir / "inference_scores.csv").exists())
-            self.assertTrue((out_dir / "train_clean_scores.csv").exists())
-            self.assertTrue((out_dir / "run_config.json").exists())
 
             with open(report_path, "r", encoding="utf-8") as f:
                 report = json.load(f)
-            self.assertIn("gmm_selection", report)
-            self.assertIn("winner", report["gmm_selection"])
+
+            self.assertGreater(report["data_info"]["n_train_backdoored"], 0)
             self.assertIn("fit_assessment", report)
-            self.assertIn("offline_metrics", report["fit_assessment"])
 
-    def test_gmm_clean_inference_rejects_non_clean_train(self):
+    def test_gmm_thresholds_use_all_train_scores(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             make_tiny_adapter_dataset(tmp_path)
-            out_dir = tmp_path / "gmm_out"
-            train_manifest = tmp_path / "train_clean.txt"
-            infer_manifest = tmp_path / "infer_mixed.txt"
+            manifest = tmp_path / "gmm_manifest.json"
+            write_joint_manifest(manifest)
 
-            write_manifest(
-                train_manifest,
+            runs_root = tmp_path / "runs"
+            run_id = "gmm_threshold_test"
+
+            proc = run_cli(
                 [
-                    "tiny_data/tiny_label0_0",
-                    "tiny_data/tiny_label1_0",
+                    "run",
+                    "gmm-train-inference",
+                    "--manifest-json",
+                    str(manifest),
+                    "--dataset-root",
+                    str(tmp_path),
+                    "--output-root",
+                    str(runs_root),
+                    "--run-id",
+                    run_id,
+                    "--svd-components-grid",
+                    "1",
+                    "--gmm-components",
+                    "1",
+                    "--gmm-covariance-types",
+                    "diag",
+                    "--stability-seeds",
+                    "42",
+                    "--score-percentiles",
+                    "90",
                 ],
+                cwd=REPO_ROOT,
             )
-            write_manifest(
-                infer_manifest,
-                [
-                    "tiny_data/tiny_label0_1",
-                    "tiny_data/tiny_label1_1",
-                ],
-            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr + proc.stdout)
 
-            cmd = [
-                sys.executable,
-                "gmm_clean_inference.py",
-                "--dataset-root",
-                str(tmp_path),
-                "--train-list",
-                str(train_manifest),
-                "--infer-list",
-                str(infer_manifest),
-                "--output-dir",
-                str(out_dir),
-                "--svd-components-grid",
-                "1",
-                "--gmm-components",
-                "1",
-                "--gmm-covariance-types",
-                "diag",
-            ]
-            proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("clean models only", proc.stderr + proc.stdout)
+            run_dir = runs_root / "gmm_train_inference" / run_id
+            report_path = run_dir / "reports" / "gmm_train_inference_report.json"
+            train_scores_path = run_dir / "reports" / "train_scores.csv"
 
-    def test_gmm_clean_inference_rejects_overlap(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            make_tiny_adapter_dataset(tmp_path)
-            out_dir = tmp_path / "gmm_out"
-            train_manifest = tmp_path / "train_clean.txt"
-            infer_manifest = tmp_path / "infer_mixed.txt"
-
-            write_manifest(
-                train_manifest,
-                [
-                    "tiny_data/tiny_label0_0",
-                    "tiny_data/tiny_label0_1",
-                ],
-            )
-            write_manifest(
-                infer_manifest,
-                [
-                    "tiny_data/tiny_label0_0",
-                    "tiny_data/tiny_label1_0",
-                ],
-            )
-
-            cmd = [
-                sys.executable,
-                "gmm_clean_inference.py",
-                "--dataset-root",
-                str(tmp_path),
-                "--train-list",
-                str(train_manifest),
-                "--infer-list",
-                str(infer_manifest),
-                "--output-dir",
-                str(out_dir),
-                "--svd-components-grid",
-                "1",
-                "--gmm-components",
-                "1",
-                "--gmm-covariance-types",
-                "diag",
-            ]
-            proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True)
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("must be disjoint", proc.stderr + proc.stdout)
-
-    def test_gmm_clean_inference_unknown_label_graceful(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            data_dir = make_tiny_adapter_dataset(tmp_path)
-            mystery_dir = data_dir / "mystery_model"
-            mystery_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(
-                data_dir / "tiny_label0_3" / "adapter_model.safetensors",
-                mystery_dir / "adapter_model.safetensors",
-            )
-
-            out_dir = tmp_path / "gmm_out"
-            train_manifest = tmp_path / "train_clean.txt"
-            infer_manifest = tmp_path / "infer_mixed.txt"
-
-            write_manifest(
-                train_manifest,
-                [
-                    "tiny_data/tiny_label0_0",
-                    "tiny_data/tiny_label0_1",
-                    "tiny_data/tiny_label0_2",
-                ],
-            )
-            write_manifest(
-                infer_manifest,
-                [
-                    "tiny_data/tiny_label1_0",
-                    "tiny_data/mystery_model",
-                ],
-            )
-
-            cmd = [
-                sys.executable,
-                "gmm_clean_inference.py",
-                "--dataset-root",
-                str(tmp_path),
-                "--train-list",
-                str(train_manifest),
-                "--infer-list",
-                str(infer_manifest),
-                "--output-dir",
-                str(out_dir),
-                "--svd-components-grid",
-                "1",
-                "--gmm-components",
-                "1",
-                "--gmm-covariance-types",
-                "diag",
-                "--stability-seeds",
-                "42",
-            ]
-            subprocess.run(cmd, cwd=REPO_ROOT, check=True, capture_output=True, text=True)
-
-            with open(out_dir / "gmm_clean_inference_report.json", "r", encoding="utf-8") as f:
+            with open(report_path, "r", encoding="utf-8") as f:
                 report = json.load(f)
 
-            self.assertIsNone(report["fit_assessment"]["offline_metrics"]["auroc"])
-            warnings = report.get("warnings", [])
-            self.assertTrue(any("label-based metrics will be omitted" in w for w in warnings))
+            rows = report["fit_assessment"]["threshold_evaluation"]
+            self.assertEqual(len(rows), 1)
+            reported_threshold = float(rows[0]["threshold"])
+
+            scores = []
+            with open(train_scores_path, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    scores.append(float(row["score"]))
+
+            expected = float(np.percentile(np.asarray(scores, dtype=np.float64), 90))
+            self.assertAlmostEqual(reported_threshold, expected, places=6)
 
 
 if __name__ == "__main__":

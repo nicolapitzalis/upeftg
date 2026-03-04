@@ -7,8 +7,7 @@ from typing import Any
 
 import numpy as np
 
-from .delta import DELTA_EXTRACTOR_VERSION, extract_delta_feature_matrices
-from .norms import NORMS_EXTRACTOR_VERSION, extract_norm_features
+from .spectral import SPECTRAL_EXTRACTOR_VERSION, extract_spectral_features
 from .svd import SVD_EXTRACTOR_VERSION, extract_svd_embeddings
 from ..utilities.hashing import compute_dataset_signature, compute_feature_cache_key
 from ..utilities.manifest import ManifestItem
@@ -25,9 +24,7 @@ class FeatureBundle:
 
 _EXTRACTOR_VERSIONS = {
     "svd": SVD_EXTRACTOR_VERSION,
-    "delta_singular_values": DELTA_EXTRACTOR_VERSION,
-    "delta_frobenius": DELTA_EXTRACTOR_VERSION,
-    "norms": NORMS_EXTRACTOR_VERSION,
+    "spectral": SPECTRAL_EXTRACTOR_VERSION,
 }
 
 
@@ -81,25 +78,16 @@ def _compute_bundle(
         )
         return FeatureBundle(features=features, labels=labels, model_names=model_names, metadata=metadata), warnings
 
-    if extractor_name in {"delta_singular_values", "delta_frobenius"}:
+    if extractor_name == "spectral":
         dtype = np.float32 if params.get("dtype", "float32") == "float32" else np.float64
-        sv, fro, labels, model_names, metadata = extract_delta_feature_matrices(
+        features, labels, model_names, metadata = extract_spectral_features(
             items=items,
-            top_k_singular_values=int(params.get("top_k_singular_values", 8)),
-            dtype=dtype,
-        )
-        if extractor_name == "delta_singular_values":
-            features = sv
-            metadata = {**metadata, "selected_output": "delta_singular_values"}
-        else:
-            features = fro
-            metadata = {**metadata, "selected_output": "delta_frobenius"}
-        return FeatureBundle(features=features, labels=labels, model_names=model_names, metadata=metadata), []
-
-    if extractor_name == "norms":
-        dtype = np.float32 if params.get("dtype", "float32") == "float32" else np.float64
-        features, labels, model_names, metadata = extract_norm_features(
-            items=items,
+            spectral_features=(
+                list(params.get("spectral_features"))
+                if params.get("spectral_features") is not None
+                else None
+            ),
+            sv_top_k=int(params.get("spectral_sv_top_k", 8)),
             block_size=int(params.get("block_size", 131072)),
             dtype=dtype,
         )

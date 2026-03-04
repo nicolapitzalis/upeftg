@@ -2,7 +2,6 @@
 #SBATCH --job-name=upeftguard_clustering
 #SBATCH --output=logs/clustering_%j.log
 #SBATCH --error=logs/clustering_%j.err
-#SBATCH --time=01:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G

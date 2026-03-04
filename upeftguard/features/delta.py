@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 from safetensors import safe_open
 
-from ..utilities.manifest import ManifestItem
+DELTA_SCHEMA_VERSION = "2.0.0"
 
 
-DELTA_EXTRACTOR_VERSION = "1.0.0"
+@dataclass(frozen=True)
+class DeltaBlockSchema:
+    pairs: tuple[tuple[str, str], ...]
+    block_names: tuple[str, ...]
+    a_shapes: tuple[tuple[int, ...], ...]
+    b_shapes: tuple[tuple[int, ...], ...]
 
 
 def discover_delta_pairs(adapter_path: Path) -> tuple[list[tuple[str, str]], list[str], list[tuple[int, ...]], list[tuple[int, ...]]]:
@@ -33,6 +39,29 @@ def discover_delta_pairs(adapter_path: Path) -> tuple[list[tuple[str, str]], lis
     return pairs, block_names, a_shapes, b_shapes
 
 
+def load_delta_block_schema(adapter_path: Path) -> DeltaBlockSchema:
+    pairs, block_names, a_shapes, b_shapes = discover_delta_pairs(adapter_path)
+    return DeltaBlockSchema(
+        pairs=tuple((str(a_key), str(b_key)) for a_key, b_key in pairs),
+        block_names=tuple(str(name) for name in block_names),
+        a_shapes=tuple(tuple(int(x) for x in shape) for shape in a_shapes),
+        b_shapes=tuple(tuple(int(x) for x in shape) for shape in b_shapes),
+    )
+
+
+def shorten_block_name(block_name: str) -> str:
+    parts = block_name.split(".")
+    if "layers" in parts:
+        idx = parts.index("layers")
+        if idx + 1 < len(parts):
+            layer = parts[idx + 1]
+            tail = parts[idx + 2 :]
+            if tail:
+                return "layer" + str(layer) + "." + ".".join(tail)
+            return "layer" + str(layer)
+    return block_name
+
+
 def check_consistency(
     adapter_path: Path,
     expected_pairs: list[tuple[str, str]],
@@ -40,18 +69,60 @@ def check_consistency(
     expected_b_shapes: list[tuple[int, ...]],
 ) -> None:
     with safe_open(adapter_path, framework="numpy") as reader:
-        keys = set(reader.keys())
-        for i, (a_key, b_key) in enumerate(expected_pairs):
-            if a_key not in keys or b_key not in keys:
-                raise ValueError(f"Key mismatch in {adapter_path}: expected {a_key} and {b_key}")
-            a_shape = tuple(int(x) for x in reader.get_tensor(a_key).shape)
-            b_shape = tuple(int(x) for x in reader.get_tensor(b_key).shape)
-            if a_shape != expected_a_shapes[i] or b_shape != expected_b_shapes[i]:
-                raise ValueError(
-                    f"Shape mismatch in {adapter_path} for block index {i}: "
-                    f"A expected {expected_a_shapes[i]} got {a_shape}; "
-                    f"B expected {expected_b_shapes[i]} got {b_shape}"
-                )
+        check_consistency_reader(
+            reader=reader,
+            adapter_path=adapter_path,
+            expected_pairs=expected_pairs,
+            expected_a_shapes=expected_a_shapes,
+            expected_b_shapes=expected_b_shapes,
+        )
+
+
+def _tensor_shape(reader: Any, key: str) -> tuple[int, ...]:
+    if hasattr(reader, "get_slice"):
+        return tuple(int(x) for x in reader.get_slice(key).get_shape())
+    return tuple(int(x) for x in reader.get_tensor(key).shape)
+
+
+def check_consistency_reader(
+    *,
+    reader: Any,
+    adapter_path: Path,
+    expected_pairs: list[tuple[str, str]],
+    expected_a_shapes: list[tuple[int, ...]],
+    expected_b_shapes: list[tuple[int, ...]],
+) -> None:
+    keys = set(reader.keys())
+    for i, (a_key, b_key) in enumerate(expected_pairs):
+        if a_key not in keys or b_key not in keys:
+            raise ValueError(f"Key mismatch in {adapter_path}: expected {a_key} and {b_key}")
+        a_shape = _tensor_shape(reader, a_key)
+        b_shape = _tensor_shape(reader, b_key)
+        if a_shape != expected_a_shapes[i] or b_shape != expected_b_shapes[i]:
+            raise ValueError(
+                f"Shape mismatch in {adapter_path} for block index {i}: "
+                f"A expected {expected_a_shapes[i]} got {a_shape}; "
+                f"B expected {expected_b_shapes[i]} got {b_shape}"
+            )
+
+
+def block_delta_singular_values(
+    a: np.ndarray,
+    b: np.ndarray,
+) -> np.ndarray:
+    _, rb = np.linalg.qr(b, mode="reduced")
+    _, ra = np.linalg.qr(a.T, mode="reduced")
+    s_small = rb @ ra.T
+    return np.asarray(np.linalg.svd(s_small, compute_uv=False), dtype=np.float64)
+
+
+def top_k_singular_values(singular_values: np.ndarray, top_k: int) -> np.ndarray:
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    out = np.asarray(singular_values, dtype=np.float64)
+    if out.size < top_k:
+        out = np.pad(out, (0, top_k - out.size))
+    return out[:top_k]
 
 
 def block_delta_spectrum_and_fro(
@@ -59,70 +130,55 @@ def block_delta_spectrum_and_fro(
     b: np.ndarray,
     top_k: int,
 ) -> tuple[np.ndarray, float]:
-    _, rb = np.linalg.qr(b, mode="reduced")
-    _, ra = np.linalg.qr(a.T, mode="reduced")
-    s_small = rb @ ra.T
-
-    singular_values = np.linalg.svd(s_small, compute_uv=False)
-    if singular_values.size < top_k:
-        singular_values = np.pad(singular_values, (0, top_k - singular_values.size))
-    top = singular_values[:top_k]
-
-    fro = float(np.linalg.norm(s_small, ord="fro"))
+    singular_values = block_delta_singular_values(a=a, b=b)
+    top = top_k_singular_values(singular_values, top_k=top_k)
+    fro = float(np.linalg.norm(singular_values))
     return top, fro
 
 
-def extract_delta_feature_matrices(
+def iter_block_factors(
     *,
-    items: list[ManifestItem],
-    top_k_singular_values: int,
+    reader: Any,
+    schema: DeltaBlockSchema,
     dtype: np.dtype,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, list[str], dict[str, Any]]:
-    if top_k_singular_values <= 0:
-        raise ValueError("top_k_singular_values must be > 0")
-    if not items:
-        raise ValueError("No adapters provided for delta extraction")
+) -> Iterator[tuple[str, np.ndarray, np.ndarray]]:
+    for block_name, (a_key, b_key) in zip(schema.block_names, schema.pairs):
+        a = np.asarray(reader.get_tensor(a_key), dtype=dtype)
+        b = np.asarray(reader.get_tensor(b_key), dtype=dtype)
+        yield block_name, a, b
 
-    first_adapter = items[0].adapter_path
-    pairs, block_names, a_shapes, b_shapes = discover_delta_pairs(first_adapter)
 
-    all_sv: list[list[float]] = []
-    all_fro: list[list[float]] = []
-    labels_list = [item.label for item in items]
-    model_names = [item.model_name for item in items]
-
-    for item in items:
-        adapter_path = item.adapter_path
-        check_consistency(adapter_path, pairs, a_shapes, b_shapes)
-
-        sv_vec: list[float] = []
-        fro_vec: list[float] = []
-
-        with safe_open(adapter_path, framework="numpy") as reader:
-            for a_key, b_key in pairs:
-                a = np.asarray(reader.get_tensor(a_key), dtype=dtype)
-                b = np.asarray(reader.get_tensor(b_key), dtype=dtype)
-                top, fro = block_delta_spectrum_and_fro(a=a, b=b, top_k=top_k_singular_values)
-                sv_vec.extend(top.tolist())
-                fro_vec.append(fro)
-
-        all_sv.append(sv_vec)
-        all_fro.append(fro_vec)
-
-    sv_matrix = np.asarray(all_sv, dtype=np.float32)
-    fro_matrix = np.asarray(all_fro, dtype=np.float32)
-    labels = np.asarray(labels_list, dtype=np.int32) if all(x is not None for x in labels_list) else None
-
-    metadata: dict[str, Any] = {
-        "extractor": "delta",
-        "extractor_version": DELTA_EXTRACTOR_VERSION,
-        "n_models": int(len(model_names)),
-        "n_blocks": int(len(block_names)),
-        "top_k_singular_values": int(top_k_singular_values),
-        "singular_feature_dim": int(sv_matrix.shape[1]),
-        "frobenius_feature_dim": int(fro_matrix.shape[1]),
-        "block_names": block_names,
-        "a_shapes": [list(s) for s in a_shapes],
-        "b_shapes": [list(s) for s in b_shapes],
+def build_schema_metadata(schema: DeltaBlockSchema) -> dict[str, Any]:
+    return {
+        "delta_schema_version": DELTA_SCHEMA_VERSION,
+        "n_blocks": int(len(schema.block_names)),
+        "block_names": [shorten_block_name(name) for name in schema.block_names],
+        "block_names_raw": list(schema.block_names),
+        "a_shapes": [list(shape) for shape in schema.a_shapes],
+        "b_shapes": [list(shape) for shape in schema.b_shapes],
     }
-    return sv_matrix, fro_matrix, labels, model_names, metadata
+
+
+def block_spectral_scalars(singular_values: np.ndarray) -> tuple[float, float, float, float, float]:
+    sv = np.asarray(singular_values, dtype=np.float64)
+    if sv.size == 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    energy = float(np.sum(np.square(sv), dtype=np.float64))
+    frobenius = float(np.sqrt(max(0.0, energy)))
+    max_sv = float(np.max(sv))
+    if max_sv <= 0.0:
+        stable_rank = 0.0
+    else:
+        stable_rank = float(energy / max(1e-12, max_sv * max_sv))
+
+    if energy <= 0.0:
+        spectral_entropy = 0.0
+        effective_rank = 0.0
+    else:
+        p = np.square(sv) / energy
+        p = np.clip(p, 1e-12, 1.0)
+        spectral_entropy = float(-np.sum(p * np.log(p), dtype=np.float64))
+        effective_rank = float(np.exp(spectral_entropy))
+
+    return frobenius, energy, stable_rank, spectral_entropy, effective_rank

@@ -1,21 +1,24 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
 import numpy as np
+from safetensors import safe_open
 from scipy.stats import pearsonr, spearmanr
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import pairwise_distances
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 
-from .adapters import inspect_adapter_schema, stream_matrix_blocks
+from .adapters import extract_layers_from_keys
+from .delta import check_consistency, discover_delta_pairs
 from ..utilities.manifest import ManifestItem
 
 
-SVD_EXTRACTOR_VERSION = "1.0.0"
+SVD_EXTRACTOR_VERSION = "2.0.0"
 
 
 @dataclass(frozen=True)
@@ -23,15 +26,17 @@ class StreamingSVDBasis:
     z_train_max: np.ndarray
     singular_values: np.ndarray
     u: np.ndarray
-    x_mean: np.ndarray
-    expected_keys: tuple[str, ...]
-    expected_shapes: tuple[tuple[int, ...], ...]
+    expected_pairs: tuple[tuple[str, str], ...]
+    expected_a_shapes: tuple[tuple[int, ...], ...]
+    expected_b_shapes: tuple[tuple[int, ...], ...]
     layers: list[int]
     n_features: int
     resolved_component_grid: list[int]
     max_rank: int
     gram_centered: np.ndarray
     gram_stream_time_seconds: float
+    train_row_mean_raw: np.ndarray
+    train_grand_mean_raw: float
 
 
 def sanitize_component_grid(requested: list[int], n_samples: int, n_features: int) -> tuple[list[int], list[str], int]:
@@ -56,44 +61,167 @@ def sanitize_component_grid(requested: list[int], n_samples: int, n_features: in
     return sanitized, warnings, max_rank
 
 
-def compute_gram_and_feature_means_streamed(
+def _delta_feature_dim(
+    *,
+    a_shapes: tuple[tuple[int, ...], ...],
+    b_shapes: tuple[tuple[int, ...], ...],
+) -> int:
+    if len(a_shapes) != len(b_shapes):
+        raise ValueError(
+            f"Mismatched A/B block counts for delta schema: len(A)={len(a_shapes)}, len(B)={len(b_shapes)}"
+        )
+
+    total = 0
+    for i, (a_shape, b_shape) in enumerate(zip(a_shapes, b_shapes)):
+        if len(a_shape) != 2 or len(b_shape) != 2:
+            raise ValueError(
+                f"Expected rank-2 LoRA tensors for block {i}, got A{a_shape}, B{b_shape}"
+            )
+        if int(a_shape[0]) != int(b_shape[1]):
+            raise ValueError(
+                f"LoRA rank mismatch for block {i}: A{a_shape}, B{b_shape}"
+            )
+        out_dim = int(b_shape[0])
+        in_dim = int(a_shape[1])
+        total += out_dim * in_dim
+    return int(total)
+
+
+def _discover_delta_schema(
+    adapter_path: Path,
+) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...], list[int], int]:
+    pairs, _, a_shapes, b_shapes = discover_delta_pairs(adapter_path)
+    expected_pairs = tuple((str(a_key), str(b_key)) for a_key, b_key in pairs)
+    expected_a_shapes = tuple(tuple(int(x) for x in s) for s in a_shapes)
+    expected_b_shapes = tuple(tuple(int(x) for x in s) for s in b_shapes)
+
+    layer_keys = tuple(key for pair in expected_pairs for key in pair)
+    layers = extract_layers_from_keys(layer_keys)
+    n_features = _delta_feature_dim(a_shapes=expected_a_shapes, b_shapes=expected_b_shapes)
+    return expected_pairs, expected_a_shapes, expected_b_shapes, layers, n_features
+
+
+def _load_block_factors(
+    readers: list[Any],
+    *,
+    a_key: str,
+    b_key: str,
+    dtype: np.dtype,
+) -> tuple[np.ndarray, np.ndarray]:
+    first_a = np.asarray(readers[0].get_tensor(a_key), dtype=dtype)
+    first_b = np.asarray(readers[0].get_tensor(b_key), dtype=dtype)
+
+    a_stack = np.empty((len(readers), *first_a.shape), dtype=dtype)
+    b_stack = np.empty((len(readers), *first_b.shape), dtype=dtype)
+    a_stack[0] = first_a
+    b_stack[0] = first_b
+
+    for i in range(1, len(readers)):
+        a_stack[i] = np.asarray(readers[i].get_tensor(a_key), dtype=dtype)
+        b_stack[i] = np.asarray(readers[i].get_tensor(b_key), dtype=dtype)
+
+    return a_stack, b_stack
+
+
+def _delta_factor_cross_inner_products(
+    *,
+    left_a: np.ndarray,
+    left_b: np.ndarray,
+    right_a: np.ndarray,
+    right_b: np.ndarray,
+) -> np.ndarray:
+    n_left = int(left_a.shape[0])
+    n_right = int(right_a.shape[0])
+    out = np.empty((n_left, n_right), dtype=np.float64)
+
+    # vec(B@A) inner products can be computed from rank-space products only.
+    for i in range(n_left):
+        b_cross = np.tensordot(right_b, left_b[i], axes=([1], [0]))
+        a_cross = np.tensordot(right_a, left_a[i], axes=([2], [1]))
+        out[i, :] = np.einsum("jlk,jlk->j", b_cross, a_cross, dtype=np.float64)
+
+    return out
+
+
+def compute_train_gram_from_delta_factors(
     adapter_paths: list[Path],
     *,
-    expected_keys: tuple[str, ...],
-    expected_shapes: tuple[tuple[int, ...], ...],
-    n_features: int,
-    block_size: int,
+    expected_pairs: tuple[tuple[str, str], ...],
     dtype: np.dtype,
-    compute_feature_means: bool,
-) -> tuple[np.ndarray, np.ndarray | None]:
+) -> np.ndarray:
     n_samples = len(adapter_paths)
     gram_raw = np.zeros((n_samples, n_samples), dtype=np.float64)
-    feature_means = np.empty(n_features, dtype=np.float32) if compute_feature_means else None
+    if n_samples == 0:
+        return gram_raw
 
-    for start, block in stream_matrix_blocks(
-        adapter_paths=adapter_paths,
-        expected_keys=expected_keys,
-        expected_shapes=expected_shapes,
-        block_size=block_size,
-        dtype=dtype,
-        n_features=n_features,
-    ):
-        end = start + block.shape[1]
-        gram_raw += block @ block.T
-        if feature_means is not None:
-            feature_means[start:end] = block.mean(axis=0).astype(np.float32, copy=False)
+    with ExitStack() as stack:
+        readers = [stack.enter_context(safe_open(path, framework="numpy")) for path in adapter_paths]
 
-    return 0.5 * (gram_raw + gram_raw.T), feature_means
+        for a_key, b_key in expected_pairs:
+            a_stack, b_stack = _load_block_factors(
+                readers=readers,
+                a_key=a_key,
+                b_key=b_key,
+                dtype=dtype,
+            )
+            gram_raw += _delta_factor_cross_inner_products(
+                left_a=a_stack,
+                left_b=b_stack,
+                right_a=a_stack,
+                right_b=b_stack,
+            )
+
+    return 0.5 * (gram_raw + gram_raw.T)
 
 
-def center_sample_gram(gram_raw: np.ndarray) -> np.ndarray:
+def compute_cross_gram_from_delta_factors(
+    *,
+    train_paths: list[Path],
+    target_paths: list[Path],
+    expected_pairs: tuple[tuple[str, str], ...],
+    dtype: np.dtype,
+) -> np.ndarray:
+    n_train = len(train_paths)
+    n_target = len(target_paths)
+    cross_raw = np.zeros((n_target, n_train), dtype=np.float64)
+    if n_train == 0 or n_target == 0:
+        return cross_raw
+
+    with ExitStack() as stack:
+        train_readers = [stack.enter_context(safe_open(path, framework="numpy")) for path in train_paths]
+        target_readers = [stack.enter_context(safe_open(path, framework="numpy")) for path in target_paths]
+
+        for a_key, b_key in expected_pairs:
+            train_a, train_b = _load_block_factors(
+                readers=train_readers,
+                a_key=a_key,
+                b_key=b_key,
+                dtype=dtype,
+            )
+            target_a, target_b = _load_block_factors(
+                readers=target_readers,
+                a_key=a_key,
+                b_key=b_key,
+                dtype=dtype,
+            )
+            cross_raw += _delta_factor_cross_inner_products(
+                left_a=target_a,
+                left_b=target_b,
+                right_a=train_a,
+                right_b=train_b,
+            )
+
+    return cross_raw
+
+
+def center_sample_gram(gram_raw: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
     if gram_raw.ndim != 2 or gram_raw.shape[0] != gram_raw.shape[1]:
         raise ValueError(f"gram_raw must be square, got shape={gram_raw.shape}")
 
     row_mean = gram_raw.mean(axis=1, dtype=np.float64)
     grand_mean = float(row_mean.mean())
     centered = gram_raw - row_mean[:, None] - row_mean[None, :] + grand_mean
-    return 0.5 * (centered + centered.T)
+    return 0.5 * (centered + centered.T), row_mean, grand_mean
 
 
 def pairwise_distances_from_gram(gram: np.ndarray) -> np.ndarray:
@@ -188,32 +316,32 @@ def fit_dual_svd_basis_from_items(
 ) -> tuple[StreamingSVDBasis, list[str]]:
     if not items:
         raise ValueError("No adapters provided for SVD fitting")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
 
     first_adapter_path = items[0].adapter_path
-    expected_keys, expected_shapes, layers, n_features = inspect_adapter_schema(
+    expected_pairs, expected_a_shapes, expected_b_shapes, layers, n_features = _discover_delta_schema(
         adapter_path=first_adapter_path,
-        expected_keys=None,
-        expected_shapes=None,
     )
 
     adapter_paths = [item.adapter_path for item in items]
+    for adapter_path in adapter_paths:
+        check_consistency(
+            adapter_path=adapter_path,
+            expected_pairs=list(expected_pairs),
+            expected_a_shapes=list(expected_a_shapes),
+            expected_b_shapes=list(expected_b_shapes),
+        )
 
     gram_start = perf_counter()
-    gram_raw, x_mean = compute_gram_and_feature_means_streamed(
+    gram_raw = compute_train_gram_from_delta_factors(
         adapter_paths=adapter_paths,
-        expected_keys=expected_keys,
-        expected_shapes=expected_shapes,
-        n_features=n_features,
-        block_size=block_size,
+        expected_pairs=expected_pairs,
         dtype=dtype,
-        compute_feature_means=True,
     )
     gram_stream_time_seconds = float(perf_counter() - gram_start)
 
-    if x_mean is None:
-        raise RuntimeError("Feature means were not computed")
-
-    gram_centered = center_sample_gram(gram_raw)
+    gram_centered, train_row_mean_raw, train_grand_mean_raw = center_sample_gram(gram_raw)
     resolved_grid, warnings, max_rank = sanitize_component_grid(
         requested=component_grid,
         n_samples=len(items),
@@ -237,15 +365,17 @@ def fit_dual_svd_basis_from_items(
         z_train_max=z_train_max,
         singular_values=singular_values,
         u=u,
-        x_mean=x_mean,
-        expected_keys=expected_keys,
-        expected_shapes=expected_shapes,
+        expected_pairs=expected_pairs,
+        expected_a_shapes=expected_a_shapes,
+        expected_b_shapes=expected_b_shapes,
         layers=layers,
         n_features=n_features,
         resolved_component_grid=resolved_grid,
         max_rank=max_rank,
         gram_centered=gram_centered,
         gram_stream_time_seconds=gram_stream_time_seconds,
+        train_row_mean_raw=train_row_mean_raw,
+        train_grand_mean_raw=train_grand_mean_raw,
     )
     return basis, warnings
 
@@ -261,10 +391,11 @@ def project_items_with_dual_basis_streamed(
 ) -> np.ndarray:
     if rank <= 0:
         raise ValueError("rank must be positive")
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
 
     train_paths = [item.adapter_path for item in train_items]
     target_paths = [item.adapter_path for item in target_items]
-    n_target = len(target_paths)
     n_train = len(train_paths)
 
     if basis.u.shape[0] != n_train:
@@ -272,55 +403,43 @@ def project_items_with_dual_basis_streamed(
     if rank > basis.singular_values.size:
         raise ValueError(f"Requested rank={rank} exceeds available singular values={basis.singular_values.size}")
 
-    cross = np.zeros((n_target, n_train), dtype=np.float64)
+    expected_pairs = basis.expected_pairs
+    expected_a_shapes = basis.expected_a_shapes
+    expected_b_shapes = basis.expected_b_shapes
 
-    train_iter = stream_matrix_blocks(
-        train_paths,
-        expected_keys=basis.expected_keys,
-        expected_shapes=basis.expected_shapes,
-        block_size=block_size,
+    for adapter_path in train_paths:
+        check_consistency(
+            adapter_path=adapter_path,
+            expected_pairs=list(expected_pairs),
+            expected_a_shapes=list(expected_a_shapes),
+            expected_b_shapes=list(expected_b_shapes),
+        )
+    for adapter_path in target_paths:
+        check_consistency(
+            adapter_path=adapter_path,
+            expected_pairs=list(expected_pairs),
+            expected_a_shapes=list(expected_a_shapes),
+            expected_b_shapes=list(expected_b_shapes),
+        )
+
+    cross_raw = compute_cross_gram_from_delta_factors(
+        train_paths=train_paths,
+        target_paths=target_paths,
+        expected_pairs=expected_pairs,
         dtype=dtype,
-        n_features=basis.n_features,
     )
-    target_iter = stream_matrix_blocks(
-        target_paths,
-        expected_keys=basis.expected_keys,
-        expected_shapes=basis.expected_shapes,
-        block_size=block_size,
-        dtype=dtype,
-        n_features=basis.n_features,
+    row_mean_target = cross_raw.mean(axis=1, dtype=np.float64)
+    centered_cross = (
+        cross_raw
+        - row_mean_target[:, None]
+        - basis.train_row_mean_raw[None, :]
+        + basis.train_grand_mean_raw
     )
-
-    while True:
-        train_chunk = next(train_iter, None)
-        target_chunk = next(target_iter, None)
-        if train_chunk is None and target_chunk is None:
-            break
-        if train_chunk is None or target_chunk is None:
-            raise RuntimeError("Train/target stream lengths differ while projecting")
-
-        train_start, train_block = train_chunk
-        target_start, target_block = target_chunk
-        if train_start != target_start:
-            raise RuntimeError(
-                f"Chunk offset mismatch during projection: train={train_start}, target={target_start}"
-            )
-        if train_block.shape[1] != target_block.shape[1]:
-            raise RuntimeError(
-                "Chunk width mismatch during projection: "
-                f"train={train_block.shape[1]}, target={target_block.shape[1]}"
-            )
-
-        end = train_start + train_block.shape[1]
-        mean_block = np.asarray(basis.x_mean[train_start:end], dtype=np.float64)[None, :]
-        train_block_centered = train_block - mean_block
-        target_block_centered = target_block - mean_block
-        cross += target_block_centered @ train_block_centered.T
 
     u_rank = basis.u[:, :rank]
     s_rank = basis.singular_values[:rank]
     inv_s = np.divide(1.0, s_rank, out=np.zeros_like(s_rank), where=s_rank > 0.0)
-    z = (cross @ u_rank) * inv_s[None, :]
+    z = (centered_cross @ u_rank) * inv_s[None, :]
     return z
 
 
@@ -419,6 +538,7 @@ def extract_svd_embeddings(
         "acceptance_candidates": acceptance_candidates,
         "svd_info": svd_info,
         "gram_stream_time_seconds": basis.gram_stream_time_seconds,
+        "input_representation": "delta_factors",
     }
 
     z = basis.z_train_max[:, :chosen_k].astype(np.float32)

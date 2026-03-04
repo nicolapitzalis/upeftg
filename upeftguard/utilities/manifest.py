@@ -152,7 +152,7 @@ def _parse_json_section_sources(
     *,
     section_name: str,
     manifest_path: Path,
-) -> list[tuple[str, list[int]]]:
+) -> list[tuple[str, list[int] | None]]:
     if isinstance(section, list):
         source_list = section
     elif isinstance(section, dict):
@@ -173,24 +173,44 @@ def _parse_json_section_sources(
     if not source_list:
         raise ValueError(f"Section '{section_name}' in {manifest_path} is empty")
 
-    sources: list[tuple[str, list[int]]] = []
+    sources: list[tuple[str, list[int] | None]] = []
     for i, item in enumerate(source_list):
-        if not isinstance(item, dict):
-            raise ValueError(
-                f"{section_name}[{i}] in {manifest_path} must be an object with path/indices"
+        if isinstance(item, str):
+            entry = item.strip()
+            if not entry:
+                raise ValueError(f"{section_name}[{i}] in {manifest_path} is an empty string")
+            sources.append((entry, None))
+            continue
+
+        if isinstance(item, dict):
+            path = item.get("path")
+            if not isinstance(path, str) or not path.strip():
+                raise ValueError(f"{section_name}[{i}] in {manifest_path} is missing non-empty 'path'")
+            if "indices" not in item:
+                raise ValueError(f"{section_name}[{i}] in {manifest_path} is missing 'indices'")
+            indices = parse_indices_value(
+                item["indices"],
+                manifest_path=manifest_path,
+                key=f"{section_name}[{i}].indices",
             )
-        path = item.get("path")
-        if not isinstance(path, str) or not path.strip():
-            raise ValueError(f"{section_name}[{i}] in {manifest_path} is missing non-empty 'path'")
-        if "indices" not in item:
-            raise ValueError(f"{section_name}[{i}] in {manifest_path} is missing 'indices'")
-        indices = parse_indices_value(
-            item["indices"],
-            manifest_path=manifest_path,
-            key=f"{section_name}[{i}].indices",
+            sources.append((path.strip(), indices))
+            continue
+
+        raise ValueError(
+            f"{section_name}[{i}] in {manifest_path} must be either a string entry "
+            "or an object with path/indices"
         )
-        sources.append((path.strip(), indices))
     return sources
+
+
+def _expand_sources_to_entries(sources: list[tuple[str, list[int] | None]]) -> list[str]:
+    entries: list[str] = []
+    for path, indices in sources:
+        if indices is None:
+            entries.append(path)
+        else:
+            entries.extend(expand_structured_paths(path, indices))
+    return entries
 
 
 def parse_single_manifest_json(
@@ -210,22 +230,40 @@ def parse_single_manifest_json(
 
     if not isinstance(payload, dict):
         raise ValueError(f"Manifest JSON {manifest_path} must be an object")
-    if section_key not in payload:
-        raise ValueError(f"Manifest JSON {manifest_path} must include key '{section_key}'")
+    if section_key in payload:
+        sources = _parse_json_section_sources(
+            payload[section_key],
+            section_name=section_key,
+            manifest_path=manifest_path,
+        )
+        entries = _expand_sources_to_entries(sources)
+        return parse_manifest_entries(
+            entries,
+            dataset_root=dataset_root,
+            manifest_name=f"{manifest_path}::{section_key}",
+        )
 
-    sources = _parse_json_section_sources(
-        payload[section_key],
-        section_name=section_key,
-        manifest_path=manifest_path,
-    )
-    entries: list[str] = []
-    for path, indices in sources:
-        entries.extend(expand_structured_paths(path, indices))
+    if "train" in payload and "infer" in payload:
+        train_sources = _parse_json_section_sources(
+            payload["train"],
+            section_name="train",
+            manifest_path=manifest_path,
+        )
+        infer_sources = _parse_json_section_sources(
+            payload["infer"],
+            section_name="infer",
+            manifest_path=manifest_path,
+        )
+        entries = _expand_sources_to_entries(train_sources) + _expand_sources_to_entries(infer_sources)
+        return parse_manifest_entries(
+            entries,
+            dataset_root=dataset_root,
+            manifest_name=f"{manifest_path}::train+infer",
+        )
 
-    return parse_manifest_entries(
-        entries,
-        dataset_root=dataset_root,
-        manifest_name=f"{manifest_path}::{section_key}",
+    raise ValueError(
+        f"Manifest JSON {manifest_path} must include key '{section_key}' "
+        "or both 'train' and 'infer' keys"
     )
 
 
@@ -259,12 +297,8 @@ def parse_joint_manifest_json(
         manifest_path=manifest_path,
     )
 
-    train_entries: list[str] = []
-    infer_entries: list[str] = []
-    for path, indices in train_sources:
-        train_entries.extend(expand_structured_paths(path, indices))
-    for path, indices in infer_sources:
-        infer_entries.extend(expand_structured_paths(path, indices))
+    train_entries = _expand_sources_to_entries(train_sources)
+    infer_entries = _expand_sources_to_entries(infer_sources)
 
     train_items = parse_manifest_entries(
         train_entries,

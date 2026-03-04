@@ -29,10 +29,10 @@ Required packages include:
 
 ## Package Layout
 
-- `upeftguard/features`: feature extractors (`svd`, `delta`, `norms`) and cache-backed registry
+- `upeftguard/features`: feature extractors (`svd`, `spectral`) and cache-backed registry
 - `upeftguard/clustering`: unsupervised clustering algorithms, metrics, reporting, and pipeline
 - `upeftguard/unsupervised`: `gmm_train_inference` pipeline
-- `upeftguard/supervised`: supervised scaffold (interfaces/registry/pipeline placeholder)
+- `upeftguard/supervised`: supervised spectral-feature pipeline with local/Slurm-array tuning stages
 - `upeftguard/utilities`: manifest parsing, run context, hashing, dataset download, report comparison
 - `upeftguard/cli.py`: unified CLI entrypoint
 
@@ -112,27 +112,57 @@ python -m upeftguard.cli feature extract \
 
 Supported extractors:
 - `svd`
-- `delta_singular_values`
-- `delta_frobenius`
-- `norms`
+- `spectral`
 
-### 4. Dataset utility
+For multi-node spectral extraction with Slurm array + merge:
+
+```bash
+./run_extract_delta_features_array.sh
+```
+
+Merged outputs are written under:
+- `runs/feature_extract/<RUN_ID>/merged/spectral_features.npy`
+- `runs/feature_extract/<RUN_ID>/merged/spectral_model_names.json`
+- `runs/feature_extract/<RUN_ID>/merged/spectral_metadata.json`
+
+### 4. Supervised pipeline
+
+```bash
+python -m upeftguard.cli run supervised \
+  --manifest-json gmm_manifest.json \
+  --dataset-root data \
+  --model logistic_regression \
+  --features frobenius energy kurtosis l1_norm linf_norm sv_topk \
+  --spectral-sv-top-k 8 \
+  --tuning-executor local
+```
+
+Useful options:
+- `--model all` to tune across all registered classifiers.
+- `--cv-seeds 42 43 44` to repeat CV with multiple random seeds.
+
+For Slurm-array tuning:
+
+```bash
+./run_supervised_tuning_array.sh
+```
+
+To skip extraction and use precomputed merged spectral features:
+
+```bash
+python -m upeftguard.cli run supervised \
+  --manifest-json gmm_manifest.json \
+  --dataset-root data \
+  --feature-file runs/feature_extract/<RUN_ID>/merged/spectral_features.npy \
+  --feature-model-names-file runs/feature_extract/<RUN_ID>/merged/spectral_model_names.json \
+  --feature-metadata-file runs/feature_extract/<RUN_ID>/merged/spectral_metadata.json \
+  --tuning-executor slurm_array
+```
+
+### 5. Dataset utility
 
 ```bash
 python -m upeftguard.cli util download-dataset --clean 100 --backdoored 60
-```
-
-### 5. Representation report comparison
-
-```bash
-python -m upeftguard.cli report compare-representations \
-  --reports \
-    raw=runs/clustering/raw_run/reports/clustering_report.json \
-    delta_sv=runs/clustering/delta_sv_run/reports/clustering_report.json \
-    delta_fro=runs/clustering/delta_fro_run/reports/clustering_report.json \
-  --output-file runs/report/compare_representations/representation_comparison.json \
-  --target-auroc 0.80 \
-  --target-stability 0.80
 ```
 
 ## Tests

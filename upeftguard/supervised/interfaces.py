@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any
 
 import numpy as np
 
@@ -13,7 +13,15 @@ class SupervisedDataset:
     model_names: list[str]
 
 
-class SupervisedModel(Protocol):
-    def fit(self, x: np.ndarray, y: np.ndarray) -> None: ...
+@dataclass(frozen=True)
+class SupervisedTask:
+    task_index: int
+    model_name: str
+    params: dict[str, Any]
 
-    def predict_proba(self, x: np.ndarray) -> np.ndarray: ...
+
+@dataclass(frozen=True)
+class CrossValidationSplit:
+    split_index: int
+    train_indices: np.ndarray
+    valid_indices: np.ndarray

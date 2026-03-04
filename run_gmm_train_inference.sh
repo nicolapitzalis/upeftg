@@ -3,7 +3,6 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80GB
-#SBATCH --time=02:00:00
 #SBATCH --output=logs/gmm_train_inference_%j.log
 #SBATCH --error=logs/gmm_train_inference_%j.err
 

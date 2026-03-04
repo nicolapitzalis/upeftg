@@ -1,70 +1,123 @@
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Iterator
 
 import numpy as np
 
-from .adapters import inspect_adapter_schema, stream_matrix_blocks
-from ..utilities.manifest import ManifestItem
+
+@dataclass(frozen=True)
+class BlockMomentSummary:
+    count: int
+    mean: float
+    variance: float
+    l1_norm: float
+    l2_norm: float
+    linf_norm: float
+    mean_abs: float
+    kurtosis: float
 
 
-NORMS_EXTRACTOR_VERSION = "1.0.0"
+@dataclass
+class _MomentAccumulator:
+    count: int = 0
+    sum_x: float = 0.0
+    sum_x2: float = 0.0
+    sum_x3: float = 0.0
+    sum_x4: float = 0.0
+    sum_abs: float = 0.0
+    max_abs: float = 0.0
+
+    def update(self, flat: np.ndarray) -> None:
+        vals = np.asarray(flat, dtype=np.float64).reshape(-1)
+        if vals.size == 0:
+            return
+
+        abs_vals = np.abs(vals)
+        self.count += int(vals.size)
+        self.sum_x += float(np.sum(vals, dtype=np.float64))
+        self.sum_x2 += float(np.sum(np.square(vals), dtype=np.float64))
+        self.sum_x3 += float(np.sum(np.power(vals, 3), dtype=np.float64))
+        self.sum_x4 += float(np.sum(np.power(vals, 4), dtype=np.float64))
+        self.sum_abs += float(np.sum(abs_vals, dtype=np.float64))
+        self.max_abs = max(self.max_abs, float(np.max(abs_vals)))
+
+    def finalize(self) -> BlockMomentSummary:
+        if self.count <= 0:
+            return BlockMomentSummary(
+                count=0,
+                mean=0.0,
+                variance=0.0,
+                l1_norm=0.0,
+                l2_norm=0.0,
+                linf_norm=0.0,
+                mean_abs=0.0,
+                kurtosis=0.0,
+            )
+
+        n = float(self.count)
+        ex1 = self.sum_x / n
+        ex2 = self.sum_x2 / n
+        ex3 = self.sum_x3 / n
+        ex4 = self.sum_x4 / n
+
+        variance = max(0.0, ex2 - (ex1 * ex1))
+        centered_fourth = ex4 - (4.0 * ex1 * ex3) + (6.0 * (ex1 ** 2) * ex2) - (3.0 * (ex1 ** 4))
+        if variance <= 1e-18:
+            kurtosis = 0.0
+        else:
+            kurtosis = float(centered_fourth / max(1e-18, variance * variance) - 3.0)
+
+        return BlockMomentSummary(
+            count=self.count,
+            mean=float(ex1),
+            variance=float(variance),
+            l1_norm=float(self.sum_abs),
+            l2_norm=float(np.sqrt(max(0.0, self.sum_x2))),
+            linf_norm=float(self.max_abs),
+            mean_abs=float(self.sum_abs / n),
+            kurtosis=kurtosis,
+        )
 
 
-def extract_norm_features(
+def iter_delta_matrix_chunks(
     *,
-    items: list[ManifestItem],
+    a: np.ndarray,
+    b: np.ndarray,
     block_size: int,
     dtype: np.dtype,
-) -> tuple[np.ndarray, np.ndarray | None, list[str], dict[str, Any]]:
-    if not items:
-        raise ValueError("No adapters provided for norm extraction")
+) -> Iterator[np.ndarray]:
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive, got {block_size}")
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"Expected rank-2 arrays for LoRA factors, got A{a.shape}, B{b.shape}")
+    if int(a.shape[0]) != int(b.shape[1]):
+        raise ValueError(f"LoRA rank mismatch for factors A{a.shape}, B{b.shape}")
 
-    first_adapter = items[0].adapter_path
-    expected_keys, expected_shapes, layers, n_features = inspect_adapter_schema(
-        adapter_path=first_adapter,
-        expected_keys=None,
-        expected_shapes=None,
-    )
+    out_dim = int(b.shape[0])
+    in_dim = int(a.shape[1])
+    cols_per_chunk = max(1, block_size // max(1, out_dim))
 
-    adapter_paths = [item.adapter_path for item in items]
-    n_samples = len(items)
+    for col_start in range(0, in_dim, cols_per_chunk):
+        col_end = min(col_start + cols_per_chunk, in_dim)
+        chunk = np.asarray(b @ a[:, col_start:col_end], dtype=dtype)
+        if chunk.size:
+            yield chunk
 
-    l1 = np.zeros(n_samples, dtype=np.float64)
-    l2_sq = np.zeros(n_samples, dtype=np.float64)
-    linf = np.zeros(n_samples, dtype=np.float64)
-    mean_abs_acc = np.zeros(n_samples, dtype=np.float64)
 
-    for _, block in stream_matrix_blocks(
-        adapter_paths=adapter_paths,
-        expected_keys=expected_keys,
-        expected_shapes=expected_shapes,
+def block_moments_from_factors(
+    *,
+    a: np.ndarray,
+    b: np.ndarray,
+    block_size: int,
+    dtype: np.dtype,
+) -> BlockMomentSummary:
+    acc = _MomentAccumulator()
+    for chunk in iter_delta_matrix_chunks(
+        a=a,
+        b=b,
         block_size=block_size,
         dtype=dtype,
-        n_features=n_features,
     ):
-        abs_block = np.abs(block)
-        l1 += abs_block.sum(axis=1)
-        l2_sq += np.square(block).sum(axis=1)
-        linf = np.maximum(linf, abs_block.max(axis=1))
-        mean_abs_acc += abs_block.sum(axis=1)
-
-    mean_abs = mean_abs_acc / max(1, n_features)
-    l2 = np.sqrt(l2_sq)
-
-    features = np.stack([l1, l2, linf, mean_abs], axis=1).astype(np.float32)
-
-    labels_list = [item.label for item in items]
-    labels = np.asarray(labels_list, dtype=np.int32) if all(x is not None for x in labels_list) else None
-    model_names = [item.model_name for item in items]
-
-    metadata: dict[str, Any] = {
-        "extractor": "norms",
-        "extractor_version": NORMS_EXTRACTOR_VERSION,
-        "n_models": int(n_samples),
-        "n_features_raw": int(n_features),
-        "layers": layers,
-        "feature_names": ["l1_norm", "l2_norm", "linf_norm", "mean_abs"],
-        "feature_dim": int(features.shape[1]),
-    }
-    return features, labels, model_names, metadata
+        acc.update(chunk)
+    return acc.finalize()

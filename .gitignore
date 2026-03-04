@@ -9,7 +9,11 @@ venv/
 # Project data and logs
 data/
 logs/
+runs/
 *.log
+
+# Unit-tests
+tests/
 
 # Generated artifacts
 *_results*/
@@ -17,4 +21,3 @@ clustering_results*/
 gmm_train_inference_results*/
 processed_data*/
 delta_features/
-representation_comparison.json

@@ -164,11 +164,3 @@ python -m upeftguard.cli run supervised \
 ```bash
 python -m upeftguard.cli util download-dataset --clean 100 --backdoored 60
 ```
-
-## Tests
-
-Run tests with the unified CLI only:
-
-```bash
-python -m unittest discover -s tests -v
-```

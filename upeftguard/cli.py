@@ -9,11 +9,16 @@ from typing import Any
 
 from .clustering.pipeline import run_clustering_pipeline
 from .features.registry import extract_with_cache, supported_extractors
-from .features.spectral import DEFAULT_SPECTRAL_FEATURES
+from .features.spectral import (
+    DEFAULT_SPECTRAL_FEATURES,
+    DEFAULT_SPECTRAL_MOMENT_SOURCE,
+    DEFAULT_SPECTRAL_QV_SUM_MODE,
+)
 from .supervised.pipeline import run_supervised_pipeline
 from .supervised.registry import registered_models
 from .unsupervised.gmm_train_inference import run_gmm_train_inference_pipeline
 from .utilities.manifest import parse_single_manifest_json
+from .utilities.paths import default_dataset_root, dataset_root_help
 from .utilities.run_context import create_run_context
 from .utilities.serialization import json_ready
 
@@ -42,7 +47,7 @@ def _has_option(tokens: list[str], option: str) -> bool:
 
 def _rewrite_download_local_dir(tokens: list[str]) -> list[str]:
     root = _execution_root()
-    safe_default = (root / "data").resolve()
+    safe_default = default_dataset_root()
     out = list(tokens)
 
     if not _has_option(out, "--local-dir"):
@@ -88,6 +93,10 @@ def _extractor_params_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "run_offline_label_diagnostics": bool(getattr(args, "run_offline_label_diagnostics", False)),
         "spectral_features": spectral_features,
         "spectral_sv_top_k": int(getattr(args, "spectral_sv_top_k", 8)),
+        "spectral_moment_source": str(
+            getattr(args, "spectral_moment_source", DEFAULT_SPECTRAL_MOMENT_SOURCE)
+        ),
+        "spectral_qv_sum_mode": str(getattr(args, "spectral_qv_sum_mode", DEFAULT_SPECTRAL_QV_SUM_MODE)),
     }
 
 
@@ -159,6 +168,8 @@ def _cmd_run_supervised(args: argparse.Namespace) -> int:
         model_name=args.model,
         spectral_features=list(args.features),
         spectral_sv_top_k=args.spectral_sv_top_k,
+        spectral_moment_source=args.spectral_moment_source,
+        spectral_qv_sum_mode=args.spectral_qv_sum_mode,
         stream_block_size=args.stream_block_size,
         dtype_name=args.dtype,
         cv_folds=args.cv_folds,
@@ -285,7 +296,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     clustering = run_sub.add_parser("clustering", help="Run clustering pipeline")
     clustering.add_argument("--manifest-json", type=Path, default=None, help="Single-set manifest JSON")
-    clustering.add_argument("--dataset-root", type=Path, default=Path("data"), help="Dataset root")
+    clustering.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=default_dataset_root(),
+        help=dataset_root_help(),
+    )
     clustering.add_argument("--feature-file", type=Path, default=None, help="Optional external feature matrix (.npy)")
     clustering.add_argument("--extractor", choices=supported_extractors(), default="svd", help="Feature extractor")
     clustering.add_argument("--output-root", type=Path, default=Path("runs"), help="Output root for run artifacts")
@@ -296,6 +312,16 @@ def build_parser() -> argparse.ArgumentParser:
     clustering.add_argument("--svd-n-components", type=int, default=None)
     clustering.add_argument("--spectral-features", nargs="+", default=list(DEFAULT_SPECTRAL_FEATURES))
     clustering.add_argument("--spectral-sv-top-k", type=int, default=8)
+    clustering.add_argument(
+        "--spectral-moment-source",
+        choices=["entrywise", "sv", "both"],
+        default=DEFAULT_SPECTRAL_MOMENT_SOURCE,
+    )
+    clustering.add_argument(
+        "--spectral-qv-sum-mode",
+        choices=["none", "append", "only"],
+        default=DEFAULT_SPECTRAL_QV_SUM_MODE,
+    )
     clustering.add_argument("--stream-block-size", type=int, default=131072)
     clustering.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     clustering.add_argument("--acceptance-spearman-threshold", type=float, default=0.99)
@@ -324,7 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     gmm = run_sub.add_parser("gmm-train-inference", help="Run SVD+GMM train/inference pipeline")
     gmm.add_argument("--manifest-json", type=Path, required=True)
-    gmm.add_argument("--dataset-root", type=Path, default=Path("data"))
+    gmm.add_argument("--dataset-root", type=Path, default=default_dataset_root(), help=dataset_root_help())
     gmm.add_argument("--output-root", type=Path, default=Path("runs"))
     gmm.add_argument("--run-id", type=str, default=None)
     gmm.add_argument("--force-recompute-features", action="store_true")
@@ -345,12 +371,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     supervised = run_sub.add_parser("supervised", help="Run supervised spectral feature pipeline")
     supervised.add_argument("--manifest-json", type=Path, default=None)
-    supervised.add_argument("--dataset-root", type=Path, default=Path("data"))
+    supervised.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=default_dataset_root(),
+        help=dataset_root_help(),
+    )
     supervised.add_argument("--output-root", type=Path, default=Path("runs"))
     supervised.add_argument("--run-id", type=str, default=None)
     supervised.add_argument("--model", choices=["all", *registered_models()], default="logistic_regression")
     supervised.add_argument("--features", nargs="+", default=list(DEFAULT_SPECTRAL_FEATURES))
     supervised.add_argument("--spectral-sv-top-k", type=int, default=8)
+    supervised.add_argument(
+        "--spectral-moment-source",
+        choices=["entrywise", "sv", "both"],
+        default=DEFAULT_SPECTRAL_MOMENT_SOURCE,
+    )
+    supervised.add_argument(
+        "--spectral-qv-sum-mode",
+        choices=["none", "append", "only"],
+        default=DEFAULT_SPECTRAL_QV_SUM_MODE,
+    )
     supervised.add_argument("--stream-block-size", type=int, default=131072)
     supervised.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     supervised.add_argument("--cv-folds", type=int, default=5)
@@ -391,7 +432,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     extract = feature_sub.add_parser("extract", help="Extract and cache features")
     extract.add_argument("--manifest-json", type=Path, required=True)
-    extract.add_argument("--dataset-root", type=Path, default=Path("data"))
+    extract.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=default_dataset_root(),
+        help=dataset_root_help(),
+    )
     extract.add_argument("--extractor", choices=supported_extractors(), default="svd")
     extract.add_argument("--output-root", type=Path, default=Path("runs"))
     extract.add_argument("--run-id", type=str, default=None)
@@ -400,6 +446,16 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--svd-n-components", type=int, default=None)
     extract.add_argument("--spectral-features", nargs="+", default=list(DEFAULT_SPECTRAL_FEATURES))
     extract.add_argument("--spectral-sv-top-k", type=int, default=8)
+    extract.add_argument(
+        "--spectral-moment-source",
+        choices=["entrywise", "sv", "both"],
+        default=DEFAULT_SPECTRAL_MOMENT_SOURCE,
+    )
+    extract.add_argument(
+        "--spectral-qv-sum-mode",
+        choices=["none", "append", "only"],
+        default=DEFAULT_SPECTRAL_QV_SUM_MODE,
+    )
     extract.add_argument("--stream-block-size", type=int, default=131072)
     extract.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     extract.add_argument("--acceptance-spearman-threshold", type=float, default=0.99)

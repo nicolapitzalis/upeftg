@@ -1,0 +1,40 @@
+Dataset split: 
+    445 total models, 
+    221 train (101 clean / 120 backdoored), 
+    224 inference (100 clean / 124 backdoored)
+
+Winner model: 
+    logistic_regression with C=0.1, 
+    CV ROC-AUC 0.7721 ± 0.0616 (across 15 folds)
+
+Family ranking (best ROC-AUC): 
+    logistic regression (~0.772) 
+    > linear SVM (~0.752) 
+    >> ridge classifier (~0.679)
+
+Inference: 
+    AUROC=0.8113, 
+    AUPRC=0.7987
+
+Inference best threshold is train p50 (0.9737): 
+    precision 0.858, 
+    recall 0.782, 
+    FPR 0.16 (113 flagged)
+
+Attack-wise inference at p50 threshold:
+    RIPPLE: precision 0.636, recall 0.903
+    insertsent: precision 0.619, recall 0.839
+    stybkd: precision 0.619, recall 0.839
+    syntactic: precision 0.515, recall 0.548 (hardest attack)
+
+Feature importance is heavily concentrated in:
+    l1_norm 51.74%
+    effective_rank 23.67%
+    kurtosis 14.86%
+    Top 3 metrics explain ~90.27% of total absolute weight
+
+Most influential individual coefficient: 
+    layer5.self_attn.v_proj.l1_norm = -0.2441
+
+Strongest positive: 
+    layer9.self_attn.q_proj.l1_norm = +0.1506

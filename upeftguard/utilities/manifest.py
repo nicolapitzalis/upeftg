@@ -147,6 +147,43 @@ def parse_manifest_entries(
     return items
 
 
+def _manifest_item_from_name_entry(entry: str) -> ManifestItem:
+    raw = Path(entry).expanduser()
+    if raw.name == "adapter_model.safetensors":
+        model_dir = raw.parent
+        adapter_path = raw
+    else:
+        model_dir = raw
+        adapter_path = raw / "adapter_model.safetensors"
+
+    model_name = model_dir.name
+    return ManifestItem(
+        raw_entry=entry,
+        model_dir=model_dir,
+        adapter_path=adapter_path,
+        model_name=model_name,
+        label=parse_label(model_name),
+    )
+
+
+def parse_manifest_entries_by_model_name(
+    entries: list[str],
+    *,
+    manifest_name: str,
+) -> list[ManifestItem]:
+    items: list[ManifestItem] = []
+    seen_names: set[str] = set()
+    for line_no, entry in enumerate(entries, start=1):
+        item = _manifest_item_from_name_entry(entry)
+        if item.model_name in seen_names:
+            raise ValueError(
+                f"Duplicate model name in manifest {manifest_name}:{line_no} -> {item.model_name}"
+            )
+        seen_names.add(item.model_name)
+        items.append(item)
+    return items
+
+
 def _parse_json_section_sources(
     section: Any,
     *,
@@ -213,12 +250,7 @@ def _expand_sources_to_entries(sources: list[tuple[str, list[int] | None]]) -> l
     return entries
 
 
-def parse_single_manifest_json(
-    *,
-    manifest_path: Path,
-    dataset_root: Path,
-    section_key: str = "path",
-) -> list[ManifestItem]:
+def _load_manifest_payload(manifest_path: Path) -> dict[str, Any]:
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest JSON not found: {manifest_path}")
 
@@ -230,6 +262,16 @@ def parse_single_manifest_json(
 
     if not isinstance(payload, dict):
         raise ValueError(f"Manifest JSON {manifest_path} must be an object")
+    return payload
+
+
+def parse_single_manifest_json(
+    *,
+    manifest_path: Path,
+    dataset_root: Path,
+    section_key: str = "path",
+) -> list[ManifestItem]:
+    payload = _load_manifest_payload(manifest_path)
     if section_key in payload:
         sources = _parse_json_section_sources(
             payload[section_key],
@@ -267,22 +309,53 @@ def parse_single_manifest_json(
     )
 
 
+def parse_single_manifest_json_by_model_name(
+    *,
+    manifest_path: Path,
+    section_key: str = "path",
+) -> list[ManifestItem]:
+    payload = _load_manifest_payload(manifest_path)
+    if section_key in payload:
+        sources = _parse_json_section_sources(
+            payload[section_key],
+            section_name=section_key,
+            manifest_path=manifest_path,
+        )
+        entries = _expand_sources_to_entries(sources)
+        return parse_manifest_entries_by_model_name(
+            entries,
+            manifest_name=f"{manifest_path}::{section_key}",
+        )
+
+    if "train" in payload and "infer" in payload:
+        train_sources = _parse_json_section_sources(
+            payload["train"],
+            section_name="train",
+            manifest_path=manifest_path,
+        )
+        infer_sources = _parse_json_section_sources(
+            payload["infer"],
+            section_name="infer",
+            manifest_path=manifest_path,
+        )
+        entries = _expand_sources_to_entries(train_sources) + _expand_sources_to_entries(infer_sources)
+        return parse_manifest_entries_by_model_name(
+            entries,
+            manifest_name=f"{manifest_path}::train+infer",
+        )
+
+    raise ValueError(
+        f"Manifest JSON {manifest_path} must include key '{section_key}' "
+        "or both 'train' and 'infer' keys"
+    )
+
+
 def parse_joint_manifest_json(
     *,
     manifest_path: Path,
     dataset_root: Path,
 ) -> tuple[list[ManifestItem], list[ManifestItem]]:
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Manifest JSON not found: {manifest_path}")
-
-    with open(manifest_path, "r", encoding="utf-8") as f:
-        try:
-            payload = json.load(f)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSON in manifest file {manifest_path}") from exc
-
-    if not isinstance(payload, dict):
-        raise ValueError(f"Manifest JSON {manifest_path} must be an object")
+    payload = _load_manifest_payload(manifest_path)
     if "train" not in payload or "infer" not in payload:
         raise ValueError(f"Manifest JSON {manifest_path} must include 'train' and 'infer' keys")
 
@@ -308,6 +381,40 @@ def parse_joint_manifest_json(
     infer_items = parse_manifest_entries(
         infer_entries,
         dataset_root=dataset_root,
+        manifest_name=f"{manifest_path}::infer",
+    )
+    validate_disjoint(train_items, infer_items)
+    return train_items, infer_items
+
+
+def parse_joint_manifest_json_by_model_name(
+    *,
+    manifest_path: Path,
+) -> tuple[list[ManifestItem], list[ManifestItem]]:
+    payload = _load_manifest_payload(manifest_path)
+    if "train" not in payload or "infer" not in payload:
+        raise ValueError(f"Manifest JSON {manifest_path} must include 'train' and 'infer' keys")
+
+    train_sources = _parse_json_section_sources(
+        payload["train"],
+        section_name="train",
+        manifest_path=manifest_path,
+    )
+    infer_sources = _parse_json_section_sources(
+        payload["infer"],
+        section_name="infer",
+        manifest_path=manifest_path,
+    )
+
+    train_entries = _expand_sources_to_entries(train_sources)
+    infer_entries = _expand_sources_to_entries(infer_sources)
+
+    train_items = parse_manifest_entries_by_model_name(
+        train_entries,
+        manifest_name=f"{manifest_path}::train",
+    )
+    infer_items = parse_manifest_entries_by_model_name(
+        infer_entries,
         manifest_name=f"{manifest_path}::infer",
     )
     validate_disjoint(train_items, infer_items)

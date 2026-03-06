@@ -1,11 +1,15 @@
 import argparse
+import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
+import httpx
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.hf_api import RepoFile, RepoFolder
+
+from .paths import default_dataset_root
 
 DEFAULT_REPO_ID = "Vincent-HKUSTGZ/PADBench"
 MODEL_DIR_RE = re.compile(r"^(?P<prefix>.+)_label(?P<label>\d+)_(?P<index>\d+)$")
@@ -85,6 +89,7 @@ def parse_selection_request(
 
 
 def parse_args() -> argparse.Namespace:
+    default_local_dir = str(default_dataset_root())
     parser = argparse.ArgumentParser(
         description=(
             "Download selected PADBench adapters from the specified IMDB subsets. "
@@ -122,8 +127,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--local-dir",
         type=str,
-        default="./data",
-        help="Local output directory for downloaded files (default: ./data).",
+        default=default_local_dir,
+        help=f"Local output directory for downloaded files (default: {default_local_dir}).",
     )
     parser.add_argument(
         "--dry-run",
@@ -178,6 +183,20 @@ def relevant_subsets() -> List[str]:
     return sorted({source.subset for source in CLEAN_SOURCES + BACKDOORED_SOURCES})
 
 
+def _is_slurm_context() -> bool:
+    return bool(os.getenv("SLURM_JOB_ID") or os.getenv("SLURM_JOB_NODELIST"))
+
+
+def _fatal_hf_connect_error(action: str, repo_id: str, exc: Exception) -> None:
+    context = " from a Slurm compute node" if _is_slurm_context() else ""
+    raise SystemExit(
+        f"{action} failed: unable to reach Hugging Face Hub repo '{repo_id}' "
+        f"(DNS/network issue{context}). "
+        "Run this command on a login node with internet access, or pre-download and "
+        "reuse a shared local dataset directory."
+    ) from exc
+
+
 def list_available_indices(
     repo_id: str,
     subsets: Sequence[str],
@@ -186,13 +205,17 @@ def list_available_indices(
 
     by_source: Dict[Tuple[str, int], set[int]] = defaultdict(set)
     for subset in subsets:
-        entries = api.list_repo_tree(
-            repo_id=repo_id,
-            path_in_repo=subset,
-            repo_type="dataset",
-            recursive=False,
-            expand=False,
-        )
+        try:
+            entries = api.list_repo_tree(
+                repo_id=repo_id,
+                path_in_repo=subset,
+                repo_type="dataset",
+                recursive=False,
+                expand=False,
+            )
+        except httpx.ConnectError as exc:
+            _fatal_hf_connect_error("Listing available model folders", repo_id, exc)
+
         for entry in entries:
             if not isinstance(entry, RepoFolder):
                 continue
@@ -224,13 +247,16 @@ def list_selected_model_sizes(
 
         sample_index = indices[0]
         sample_model_dir = source.model_dir(sample_index)
-        entries = api.list_repo_tree(
-            repo_id=repo_id,
-            path_in_repo=sample_model_dir,
-            repo_type="dataset",
-            recursive=True,
-            expand=True,
-        )
+        try:
+            entries = api.list_repo_tree(
+                repo_id=repo_id,
+                path_in_repo=sample_model_dir,
+                repo_type="dataset",
+                recursive=True,
+                expand=True,
+            )
+        except httpx.ConnectError as exc:
+            _fatal_hf_connect_error("Estimating adapter storage", repo_id, exc)
 
         sample_size_bytes = 0
         for entry in entries:
@@ -385,12 +411,15 @@ def main() -> None:
         print("Dry run enabled; no files were downloaded.")
         return
 
-    snapshot_download(
-        repo_id=args.repo_id,
-        repo_type="dataset",
-        allow_patterns=allow_patterns,
-        local_dir=args.local_dir,
-    )
+    try:
+        snapshot_download(
+            repo_id=args.repo_id,
+            repo_type="dataset",
+            allow_patterns=allow_patterns,
+            local_dir=args.local_dir,
+        )
+    except httpx.ConnectError as exc:
+        _fatal_hf_connect_error("Downloading selected adapters", args.repo_id, exc)
     print("Download complete!")
 
 

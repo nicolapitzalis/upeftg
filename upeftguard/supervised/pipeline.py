@@ -17,13 +17,24 @@ except Exception:  # pragma: no cover - fallback for minimal environments
 import pickle
 
 from ..features.registry import extract_with_cache
+from ..features.spectral import (
+    build_spectral_feature_names,
+    resolve_spectral_features,
+    resolve_spectral_moment_source,
+    resolve_spectral_qv_sum_mode,
+)
 from ..unsupervised.reporting import (
     compute_infer_threshold_rows,
     compute_offline_metrics,
     save_score_csv,
     summarize_scores,
 )
-from ..utilities.manifest import parse_joint_manifest_json, parse_single_manifest_json
+from ..utilities.manifest import (
+    parse_joint_manifest_json,
+    parse_joint_manifest_json_by_model_name,
+    parse_single_manifest_json,
+    parse_single_manifest_json_by_model_name,
+)
 from ..utilities.run_context import RunContext, create_run_context
 from ..utilities.serialization import json_ready
 from ..utilities.export_winner_feature_weights import export_winner_feature_weights
@@ -71,12 +82,173 @@ def _unique_index_by_name(names: list[str], *, context: str) -> dict[str, int]:
     return index
 
 
+def _feature_block_name(feature_name: str) -> str:
+    block_name, sep, _ = str(feature_name).rpartition(".")
+    if not sep or not block_name:
+        raise ValueError(f"Invalid spectral feature name in external metadata: {feature_name}")
+    return block_name
+
+
+def _ordered_block_names_from_feature_names(feature_names: list[str]) -> list[str]:
+    block_names: list[str] = []
+    seen: set[str] = set()
+    for feature_name in feature_names:
+        block_name = _feature_block_name(feature_name)
+        if block_name in seen:
+            continue
+        seen.add(block_name)
+        block_names.append(block_name)
+    return block_names
+
+
+def _build_requested_feature_names(
+    *,
+    block_names: list[str],
+    spectral_features: list[str],
+    sv_top_k: int,
+    spectral_moment_source: str,
+) -> list[str]:
+    return build_spectral_feature_names(
+        block_names=block_names,
+        selected_features=spectral_features,
+        sv_top_k=sv_top_k,
+        spectral_moment_source=spectral_moment_source,
+        shorten_block_names=False,
+    )
+
+
+def _filter_external_spectral_columns(
+    *,
+    features: np.ndarray,
+    metadata: dict[str, Any],
+    spectral_features: list[str],
+    spectral_sv_top_k: int,
+    spectral_moment_source: str,
+    spectral_qv_sum_mode: str,
+) -> tuple[np.ndarray, dict[str, Any], list[str]]:
+    raw_feature_names = metadata.get("feature_names")
+    if not isinstance(raw_feature_names, list) or not raw_feature_names:
+        raise ValueError(
+            "External spectral metadata must include non-empty 'feature_names' to honor "
+            "--features/--spectral-sv-top-k/--spectral-qv-sum-mode"
+        )
+
+    feature_names = [str(x) for x in raw_feature_names]
+    if len(feature_names) != int(features.shape[1]):
+        raise ValueError(
+            f"External feature metadata column count ({len(feature_names)}) does not match "
+            f"feature matrix width ({features.shape[1]})"
+        )
+
+    selected_features = resolve_spectral_features(spectral_features)
+    resolved_moment_source = resolve_spectral_moment_source(spectral_moment_source)
+    resolved_qv_sum_mode = resolve_spectral_qv_sum_mode(spectral_qv_sum_mode)
+    all_block_names = _ordered_block_names_from_feature_names(feature_names)
+
+    if resolved_qv_sum_mode == "none":
+        selected_block_names = [name for name in all_block_names if ".qv_sum" not in name]
+    elif resolved_qv_sum_mode == "only":
+        selected_block_names = [name for name in all_block_names if ".qv_sum" in name]
+    else:
+        selected_block_names = list(all_block_names)
+
+    if not selected_block_names:
+        raise ValueError(
+            "External feature matrix does not contain any blocks compatible with "
+            f"--spectral-qv-sum-mode={resolved_qv_sum_mode}"
+        )
+
+    expected_feature_names = _build_requested_feature_names(
+        block_names=selected_block_names,
+        spectral_features=selected_features,
+        sv_top_k=int(spectral_sv_top_k),
+        spectral_moment_source=resolved_moment_source,
+    )
+    if not expected_feature_names:
+        raise ValueError("Requested external spectral feature selection resolved to zero columns")
+
+    feature_index = _unique_index_by_name(feature_names, context="external spectral feature names")
+    missing = [name for name in expected_feature_names if name not in feature_index]
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise ValueError(
+            "External feature matrix does not contain the requested spectral columns. "
+            f"Examples: {preview}"
+        )
+
+    warnings: list[str] = []
+    if feature_names != expected_feature_names:
+        column_indices = np.asarray([feature_index[name] for name in expected_feature_names], dtype=np.int64)
+        features = features[:, column_indices]
+        warnings.append(
+            "Filtered/reordered external feature columns to match requested spectral configuration"
+        )
+
+    filtered_metadata = dict(metadata)
+    filtered_metadata["resolved_features"] = list(selected_features)
+    filtered_metadata["spectral_moment_source"] = resolved_moment_source
+    filtered_metadata["spectral_qv_sum_mode"] = resolved_qv_sum_mode
+    filtered_metadata["sv_top_k"] = int(spectral_sv_top_k)
+    filtered_metadata["feature_dim"] = int(features.shape[1])
+    filtered_metadata["feature_names"] = list(expected_feature_names)
+    filtered_metadata["block_names"] = list(selected_block_names)
+    filtered_metadata["n_blocks"] = int(len(selected_block_names))
+
+    source_block_names = metadata.get("block_names")
+    source_block_names_raw = metadata.get("block_names_raw")
+    if (
+        isinstance(source_block_names, list)
+        and isinstance(source_block_names_raw, list)
+        and len(source_block_names) == len(source_block_names_raw)
+    ):
+        raw_by_block = {str(block): str(raw) for block, raw in zip(source_block_names, source_block_names_raw)}
+        if all(block_name in raw_by_block for block_name in selected_block_names):
+            selected_block_names_raw = [raw_by_block[block_name] for block_name in selected_block_names]
+            filtered_metadata["block_names_raw"] = selected_block_names_raw
+            filtered_metadata["base_block_names_raw"] = [
+                name for name in selected_block_names_raw if ".qv_sum" not in name
+            ]
+            filtered_metadata["qv_sum_block_names_raw"] = [
+                name for name in selected_block_names_raw if ".qv_sum" in name
+            ]
+        else:
+            filtered_metadata.pop("block_names_raw", None)
+            filtered_metadata.pop("base_block_names_raw", None)
+            filtered_metadata.pop("qv_sum_block_names_raw", None)
+    else:
+        filtered_metadata.pop("block_names_raw", None)
+        filtered_metadata.pop("base_block_names_raw", None)
+        filtered_metadata.pop("qv_sum_block_names_raw", None)
+
+    filtered_metadata["base_block_names"] = [
+        name for name in selected_block_names if ".qv_sum" not in name
+    ]
+    filtered_metadata["qv_sum_block_names"] = [
+        name for name in selected_block_names if ".qv_sum" in name
+    ]
+
+    extractor_params = filtered_metadata.get("extractor_params")
+    if isinstance(extractor_params, dict):
+        filtered_params = dict(extractor_params)
+        filtered_params["spectral_features"] = list(selected_features)
+        filtered_params["spectral_sv_top_k"] = int(spectral_sv_top_k)
+        filtered_params["spectral_moment_source"] = resolved_moment_source
+        filtered_params["spectral_qv_sum_mode"] = resolved_qv_sum_mode
+        filtered_metadata["extractor_params"] = filtered_params
+
+    return features, filtered_metadata, warnings
+
+
 def _load_external_spectral_bundle(
     *,
     feature_file: Path,
     model_names_file: Path,
     metadata_file: Path | None,
     expected_model_names: list[str],
+    spectral_features: list[str],
+    spectral_sv_top_k: int,
+    spectral_moment_source: str,
+    spectral_qv_sum_mode: str,
 ) -> tuple[np.ndarray, dict[str, Any], list[str]]:
     if not feature_file.exists():
         raise FileNotFoundError(f"Feature file not found: {feature_file}")
@@ -131,6 +303,16 @@ def _load_external_spectral_bundle(
         reorder = np.asarray([ext_index[name] for name in expected_model_names], dtype=np.int64)
         features = features[reorder]
         warnings.append("Reordered external features to match manifest model order using model names")
+
+    features, metadata, column_warnings = _filter_external_spectral_columns(
+        features=features,
+        metadata=metadata,
+        spectral_features=spectral_features,
+        spectral_sv_top_k=spectral_sv_top_k,
+        spectral_moment_source=spectral_moment_source,
+        spectral_qv_sum_mode=spectral_qv_sum_mode,
+    )
+    warnings.extend(column_warnings)
 
     return features, metadata, warnings
 
@@ -504,6 +686,8 @@ def _prepare_supervised_run(
     model_name: str,
     spectral_features: list[str],
     spectral_sv_top_k: int,
+    spectral_moment_source: str,
+    spectral_qv_sum_mode: str,
     stream_block_size: int,
     dtype_name: str,
     cv_folds: int,
@@ -524,24 +708,42 @@ def _prepare_supervised_run(
         raise FileNotFoundError(f"Manifest JSON not found: {manifest_json}")
 
     mode = _detect_manifest_mode(manifest_json)
-    if mode == "joint":
-        train_items, infer_items = parse_joint_manifest_json(
-            manifest_path=manifest_json,
-            dataset_root=dataset_root,
-        )
-        all_items = train_items + infer_items
-        train_indices = np.arange(0, len(train_items), dtype=np.int64)
-        infer_indices = np.arange(len(train_items), len(all_items), dtype=np.int64)
+    if feature_file is None:
+        if mode == "joint":
+            train_items, infer_items = parse_joint_manifest_json(
+                manifest_path=manifest_json,
+                dataset_root=dataset_root,
+            )
+            all_items = train_items + infer_items
+            train_indices = np.arange(0, len(train_items), dtype=np.int64)
+            infer_indices = np.arange(len(train_items), len(all_items), dtype=np.int64)
+        else:
+            all_items = parse_single_manifest_json(
+                manifest_path=manifest_json,
+                dataset_root=dataset_root,
+                section_key="path",
+            )
+            train_items = all_items
+            infer_items = []
+            train_indices = np.arange(0, len(all_items), dtype=np.int64)
+            infer_indices = np.asarray([], dtype=np.int64)
     else:
-        all_items = parse_single_manifest_json(
-            manifest_path=manifest_json,
-            dataset_root=dataset_root,
-            section_key="path",
-        )
-        train_items = all_items
-        infer_items = []
-        train_indices = np.arange(0, len(all_items), dtype=np.int64)
-        infer_indices = np.asarray([], dtype=np.int64)
+        if mode == "joint":
+            train_items, infer_items = parse_joint_manifest_json_by_model_name(
+                manifest_path=manifest_json,
+            )
+            all_items = train_items + infer_items
+            train_indices = np.arange(0, len(train_items), dtype=np.int64)
+            infer_indices = np.arange(len(train_items), len(all_items), dtype=np.int64)
+        else:
+            all_items = parse_single_manifest_json_by_model_name(
+                manifest_path=manifest_json,
+                section_key="path",
+            )
+            train_items = all_items
+            infer_items = []
+            train_indices = np.arange(0, len(all_items), dtype=np.int64)
+            infer_indices = np.asarray([], dtype=np.int64)
 
     if not train_items:
         raise ValueError("No training items resolved from manifest")
@@ -557,6 +759,8 @@ def _prepare_supervised_run(
         "block_size": int(stream_block_size),
         "spectral_features": list(spectral_features),
         "spectral_sv_top_k": int(spectral_sv_top_k),
+        "spectral_moment_source": str(spectral_moment_source),
+        "spectral_qv_sum_mode": str(spectral_qv_sum_mode),
     }
     extractor_warnings: list[str] = []
     if feature_file is None:
@@ -595,6 +799,10 @@ def _prepare_supervised_run(
             model_names_file=resolved_model_names_file,
             metadata_file=resolved_metadata_file,
             expected_model_names=[item.model_name for item in all_items],
+            spectral_features=spectral_features,
+            spectral_sv_top_k=spectral_sv_top_k,
+            spectral_moment_source=spectral_moment_source,
+            spectral_qv_sum_mode=spectral_qv_sum_mode,
         )
         extractor_warnings.extend(external_warnings)
 
@@ -1085,6 +1293,8 @@ def run_supervised_pipeline(
     model_name: str,
     spectral_features: list[str],
     spectral_sv_top_k: int,
+    spectral_moment_source: str,
+    spectral_qv_sum_mode: str,
     stream_block_size: int,
     dtype_name: str,
     cv_folds: int,
@@ -1120,6 +1330,8 @@ def run_supervised_pipeline(
             model_name=model_name,
             spectral_features=spectral_features,
             spectral_sv_top_k=spectral_sv_top_k,
+            spectral_moment_source=spectral_moment_source,
+            spectral_qv_sum_mode=spectral_qv_sum_mode,
             stream_block_size=stream_block_size,
             dtype_name=dtype_name,
             cv_folds=cv_folds,
@@ -1159,6 +1371,8 @@ def run_supervised_pipeline(
         model_name=model_name,
         spectral_features=spectral_features,
         spectral_sv_top_k=spectral_sv_top_k,
+        spectral_moment_source=spectral_moment_source,
+        spectral_qv_sum_mode=spectral_qv_sum_mode,
         stream_block_size=stream_block_size,
         dtype_name=dtype_name,
         cv_folds=cv_folds,

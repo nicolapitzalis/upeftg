@@ -13,32 +13,36 @@ source /home/n.pitzalis/miniconda3/etc/profile.d/conda.sh
 conda activate upeftg
 
 MANIFEST_JSON=${MANIFEST_JSON:-gmm_manifest.json}
-DATASET_ROOT=${DATASET_ROOT:-data}
+# External merged features drive model identity for this workflow, so dataset_root
+# is kept only for provenance and is otherwise ignored during prepare.
+CURRENT_USER=${USER:-$(id -un)}
+PROJECT_STORAGE_ROOT=${UPEFTGUARD_STORAGE_ROOT:-/models/${CURRENT_USER}/unsupervised-peftguard}
+DATASET_ROOT=${DATASET_ROOT:-${UPEFTGUARD_DATA_ROOT:-${PROJECT_STORAGE_ROOT}/data}}
 OUTPUT_ROOT=${OUTPUT_ROOT:-runs}
-RUN_ID=${RUN_ID:-supervised_array_${SLURM_JOB_ID:-manual}}
+RUN_ID=${RUN_ID:-supervised_array_merged_${SLURM_JOB_ID:-manual}}
 MODEL=${MODEL:-all}
-FEATURES=${FEATURES:-"frobenius energy kurtosis l1_norm linf_norm sv_topk"}
+FEATURES=${FEATURES:-"energy kurtosis l1_norm l2_norm linf_norm mean_abs concentration_of_energy sv_topk stable_rank spectral_entropy effective_rank"}
 SV_TOP_K=${SV_TOP_K:-8}
+SPECTRAL_MOMENT_SOURCE=${SPECTRAL_MOMENT_SOURCE:-sv}
 CV_FOLDS=${CV_FOLDS:-5}
 CV_SEEDS=${CV_SEEDS:-"42 43 44"}
-FEATURE_FILE=${FEATURE_FILE:-}
-FEATURE_MODEL_NAMES_FILE=${FEATURE_MODEL_NAMES_FILE:-}
-FEATURE_METADATA_FILE=${FEATURE_METADATA_FILE:-}
+SCORE_PERCENTILES=${SCORE_PERCENTILES:-"50 60 70 80 90 95 99"}
+MERGED_FEATURE_RUN_ID=${MERGED_FEATURE_RUN_ID:-feature_spectral_array_34017}
+MERGED_FEATURE_DIR=${MERGED_FEATURE_DIR:-${OUTPUT_ROOT}/feature_extract/${MERGED_FEATURE_RUN_ID}/merged}
+FEATURE_FILE=${FEATURE_FILE:-${MERGED_FEATURE_DIR}/spectral_features.npy}
+FEATURE_MODEL_NAMES_FILE=${FEATURE_MODEL_NAMES_FILE:-${MERGED_FEATURE_DIR}/spectral_model_names.json}
+FEATURE_METADATA_FILE=${FEATURE_METADATA_FILE:-${MERGED_FEATURE_DIR}/spectral_metadata.json}
 SLURM_PARTITION=${SLURM_PARTITION:-extra}
 SLURM_LOG_DIR=${SLURM_LOG_DIR:-logs}
 
 mkdir -p "${SLURM_LOG_DIR}"
 
-EXTERNAL_FEATURE_ARGS=()
-if [[ -n "${FEATURE_FILE}" ]]; then
-  EXTERNAL_FEATURE_ARGS+=(--feature-file "${FEATURE_FILE}")
-fi
-if [[ -n "${FEATURE_MODEL_NAMES_FILE}" ]]; then
-  EXTERNAL_FEATURE_ARGS+=(--feature-model-names-file "${FEATURE_MODEL_NAMES_FILE}")
-fi
-if [[ -n "${FEATURE_METADATA_FILE}" ]]; then
-  EXTERNAL_FEATURE_ARGS+=(--feature-metadata-file "${FEATURE_METADATA_FILE}")
-fi
+for required_file in "${FEATURE_FILE}" "${FEATURE_MODEL_NAMES_FILE}" "${FEATURE_METADATA_FILE}"; do
+  if [[ ! -f "${required_file}" ]]; then
+    echo "Missing required merged feature artifact: ${required_file}" >&2
+    exit 1
+  fi
+done
 
 python -m upeftguard.cli run supervised \
   --stage prepare \
@@ -49,9 +53,13 @@ python -m upeftguard.cli run supervised \
   --model "${MODEL}" \
   --features ${FEATURES} \
   --spectral-sv-top-k "${SV_TOP_K}" \
+  --spectral-moment-source "${SPECTRAL_MOMENT_SOURCE}" \
   --cv-folds "${CV_FOLDS}" \
   --cv-seeds ${CV_SEEDS} \
-  "${EXTERNAL_FEATURE_ARGS[@]}" \
+  --score-percentiles ${SCORE_PERCENTILES} \
+  --feature-file "${FEATURE_FILE}" \
+  --feature-model-names-file "${FEATURE_MODEL_NAMES_FILE}" \
+  --feature-metadata-file "${FEATURE_METADATA_FILE}" \
   --tuning-executor slurm_array
 
 RUN_DIR=$(python - <<PY
@@ -116,9 +124,15 @@ FINALIZE_JOB_ID=$(sbatch \
   --job-name "upeftguard_supervised_finalize_${RUN_ID}" \
   --output "${SLURM_LOG_DIR}/supervised_finalize_${RUN_ID}_%j.out" \
   --error "${SLURM_LOG_DIR}/supervised_finalize_${RUN_ID}_%j.err" \
-  --wrap "source /home/n.pitzalis/miniconda3/etc/profile.d/conda.sh && conda activate upeftg && python -m upeftguard.cli run supervised --stage finalize --run-dir ${RUN_DIR}")
+  --wrap "source /home/n.pitzalis/miniconda3/etc/profile.d/conda.sh && conda activate upeftg && python -m upeftguard.cli run supervised --stage finalize --run-dir ${RUN_DIR} --score-percentiles ${SCORE_PERCENTILES}")
 
 echo "Run dir: ${RUN_DIR}"
+echo "Merged feature run id: ${MERGED_FEATURE_RUN_ID}"
+echo "Merged feature dir: ${MERGED_FEATURE_DIR}"
+echo "Feature file: ${FEATURE_FILE}"
+echo "Model names file: ${FEATURE_MODEL_NAMES_FILE}"
+echo "Metadata file: ${FEATURE_METADATA_FILE}"
+echo "Score percentiles: ${SCORE_PERCENTILES}"
 echo "Tuning tasks: ${N_TASKS}"
 echo "Worker job id: ${WORKER_JOB_ID}"
 echo "Finalize job id: ${FINALIZE_JOB_ID}"

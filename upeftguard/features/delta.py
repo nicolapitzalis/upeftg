@@ -159,13 +159,12 @@ def build_schema_metadata(schema: DeltaBlockSchema) -> dict[str, Any]:
     }
 
 
-def block_spectral_scalars(singular_values: np.ndarray) -> tuple[float, float, float, float, float]:
+def block_spectral_scalars(singular_values: np.ndarray) -> tuple[float, float, float, float]:
     sv = np.asarray(singular_values, dtype=np.float64)
     if sv.size == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     energy = float(np.sum(np.square(sv), dtype=np.float64))
-    frobenius = float(np.sqrt(max(0.0, energy)))
     max_sv = float(np.max(sv))
     if max_sv <= 0.0:
         stable_rank = 0.0
@@ -181,4 +180,4 @@ def block_spectral_scalars(singular_values: np.ndarray) -> tuple[float, float, f
         spectral_entropy = float(-np.sum(p * np.log(p), dtype=np.float64))
         effective_rank = float(np.exp(spectral_entropy))
 
-    return frobenius, energy, stable_rank, spectral_entropy, effective_rank
+    return energy, stable_rank, spectral_entropy, effective_rank

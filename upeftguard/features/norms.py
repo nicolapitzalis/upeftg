@@ -121,3 +121,9 @@ def block_moments_from_factors(
     ):
         acc.update(chunk)
     return acc.finalize()
+
+
+def summarize_array_moments(values: np.ndarray) -> BlockMomentSummary:
+    acc = _MomentAccumulator()
+    acc.update(values)
+    return acc.finalize()

@@ -6,36 +6,33 @@
 #SBATCH --output=logs/feature_spectral_prepare_%j.out
 #SBATCH --error=logs/feature_spectral_prepare_%j.err
 #SBATCH --partition=extra
+#SBATCH --chdir=/home/n.pitzalis/unsupervised-peftguard
 
 set -euo pipefail
+
+REPO_ROOT=${REPO_ROOT:-/home/n.pitzalis/unsupervised-peftguard}
+cd "${REPO_ROOT}"
 
 source /home/n.pitzalis/miniconda3/etc/profile.d/conda.sh
 conda activate upeftg
 
 MANIFEST_JSON=${MANIFEST_JSON:-gmm_manifest.json}
-DATASET_ROOT=${DATASET_ROOT:-data}
+CURRENT_USER=${USER:-$(id -un)}
+PROJECT_STORAGE_ROOT=${UPEFTGUARD_STORAGE_ROOT:-/models/${CURRENT_USER}/unsupervised-peftguard}
+DATASET_ROOT=${DATASET_ROOT:-${UPEFTGUARD_DATA_ROOT:-${PROJECT_STORAGE_ROOT}/data}}
 OUTPUT_ROOT=${OUTPUT_ROOT:-runs}
 RUN_ID=${RUN_ID:-feature_spectral_array_${SLURM_JOB_ID:-manual}}
-FEATURES=${FEATURES:-"frobenius energy kurtosis l1_norm l2_norm linf_norm mean_abs sv_topk stable_rank spectral_entropy effective_rank"}
+FEATURES=${FEATURES:-"energy kurtosis l1_norm l2_norm linf_norm mean_abs concentration_of_energy sv_topk stable_rank spectral_entropy effective_rank"}
 SV_TOP_K=${SV_TOP_K:-8}
+SPECTRAL_MOMENT_SOURCE=${SPECTRAL_MOMENT_SOURCE:-sv}
+SPECTRAL_QV_SUM_MODE=${SPECTRAL_QV_SUM_MODE:-none}
 STREAM_BLOCK_SIZE=${STREAM_BLOCK_SIZE:-131072}
 DTYPE=${DTYPE:-float32}
 N_SHARDS=${N_SHARDS:-8}
+MERGE_WITH_EXISTING=${MERGE_WITH_EXISTING:-0}
 SLURM_PARTITION=${SLURM_PARTITION:-extra}
 SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-8}
-DEFAULT_SLURM_MAX_CONCURRENT=$(python - <<PY
-import os
-
-for key in ("SLURM_JOB_NUM_NODES", "SLURM_NNODES"):
-    value = os.getenv(key)
-    if value and value.isdigit():
-        print(max(1, int(value) - 1))
-        break
-else:
-    print(1)
-PY
-)
-SLURM_MAX_CONCURRENT=${SLURM_MAX_CONCURRENT:-${DEFAULT_SLURM_MAX_CONCURRENT}}
+SLURM_MAX_CONCURRENT=${SLURM_MAX_CONCURRENT:-8}
 SLURM_LOG_DIR=${SLURM_LOG_DIR:-logs}
 
 mkdir -p "${SLURM_LOG_DIR}"
@@ -48,8 +45,9 @@ PY
 SHARD_MANIFEST_DIR="${RUN_ROOT}/shard_manifests"
 SHARD_OUTPUT_ROOT="${RUN_ROOT}/shards"
 MERGED_DIR="${RUN_ROOT}/merged"
+MERGED_OUTPUT_DIR=${MERGED_OUTPUT_DIR:-${MERGED_DIR}}
 
-mkdir -p "${SHARD_MANIFEST_DIR}" "${SHARD_OUTPUT_ROOT}" "${MERGED_DIR}"
+mkdir -p "${SHARD_MANIFEST_DIR}" "${SHARD_OUTPUT_ROOT}" "${MERGED_DIR}" "${MERGED_OUTPUT_DIR}"
 
 N_SHARDS_RESOLVED=$(python - <<PY
 import json
@@ -97,6 +95,13 @@ fi
 
 ARRAY_MAX=$((N_SHARDS_RESOLVED - 1))
 
+WORKER_CMD="source /home/n.pitzalis/miniconda3/etc/profile.d/conda.sh && conda activate upeftg && python -m upeftguard.cli feature extract --manifest-json ${SHARD_MANIFEST_DIR}/shard_\${SLURM_ARRAY_TASK_ID}.json --dataset-root ${DATASET_ROOT} --extractor spectral --spectral-features ${FEATURES} --spectral-sv-top-k ${SV_TOP_K} --spectral-moment-source ${SPECTRAL_MOMENT_SOURCE} --spectral-qv-sum-mode ${SPECTRAL_QV_SUM_MODE} --stream-block-size ${STREAM_BLOCK_SIZE} --dtype ${DTYPE} --output-root ${SHARD_OUTPUT_ROOT} --run-id shard_\${SLURM_ARRAY_TASK_ID}"
+
+MERGE_CMD="source /home/n.pitzalis/miniconda3/etc/profile.d/conda.sh && conda activate upeftg && python -m upeftguard.utilities.merge_spectral_shards --manifest-json ${MANIFEST_JSON} --dataset-root ${DATASET_ROOT} --output-dir ${MERGED_OUTPUT_DIR} --shard-run-dir-glob '${SHARD_OUTPUT_ROOT}/feature_extract/shard_*'"
+if [[ "${MERGE_WITH_EXISTING}" == "1" ]]; then
+  MERGE_CMD="${MERGE_CMD} --merge-with-existing-output"
+fi
+
 WORKER_JOB_ID=$(sbatch \
   --parsable \
   --partition "${SLURM_PARTITION}" \
@@ -105,7 +110,7 @@ WORKER_JOB_ID=$(sbatch \
   --job-name "upeftguard_feature_spectral_worker_${RUN_ID}" \
   --output "${SLURM_LOG_DIR}/feature_spectral_worker_${RUN_ID}_%A_%a.out" \
   --error "${SLURM_LOG_DIR}/feature_spectral_worker_${RUN_ID}_%A_%a.err" \
-  --wrap "source /home/n.pitzalis/miniconda3/etc/profile.d/conda.sh && conda activate upeftg && python -m upeftguard.cli feature extract --manifest-json ${SHARD_MANIFEST_DIR}/shard_\${SLURM_ARRAY_TASK_ID}.json --dataset-root ${DATASET_ROOT} --extractor spectral --spectral-features ${FEATURES} --spectral-sv-top-k ${SV_TOP_K} --stream-block-size ${STREAM_BLOCK_SIZE} --dtype ${DTYPE} --output-root ${SHARD_OUTPUT_ROOT} --run-id shard_\${SLURM_ARRAY_TASK_ID}")
+  --wrap "${WORKER_CMD}")
 
 MERGE_JOB_ID=$(sbatch \
   --parsable \
@@ -115,12 +120,14 @@ MERGE_JOB_ID=$(sbatch \
   --job-name "upeftguard_feature_spectral_merge_${RUN_ID}" \
   --output "${SLURM_LOG_DIR}/feature_spectral_merge_${RUN_ID}_%j.out" \
   --error "${SLURM_LOG_DIR}/feature_spectral_merge_${RUN_ID}_%j.err" \
-  --wrap "source /home/n.pitzalis/miniconda3/etc/profile.d/conda.sh && conda activate upeftg && python -m upeftguard.utilities.merge_spectral_shards --manifest-json ${MANIFEST_JSON} --dataset-root ${DATASET_ROOT} --output-dir ${MERGED_DIR} --shard-run-dir-glob '${SHARD_OUTPUT_ROOT}/feature_extract/shard_*'")
+  --wrap "${MERGE_CMD}")
 
 echo "Run root: ${RUN_ROOT}"
 echo "Shard manifests: ${SHARD_MANIFEST_DIR}"
 echo "Shard output root: ${SHARD_OUTPUT_ROOT}"
-echo "Merged output dir: ${MERGED_DIR}"
+echo "Merged output dir: ${MERGED_OUTPUT_DIR}"
 echo "Shards: ${N_SHARDS_RESOLVED}"
+echo "Spectral q+v mode: ${SPECTRAL_QV_SUM_MODE}"
+echo "Merge with existing output: ${MERGE_WITH_EXISTING}"
 echo "Worker job id: ${WORKER_JOB_ID}"
 echo "Merge job id: ${MERGE_JOB_ID}"

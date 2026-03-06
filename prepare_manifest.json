@@ -3,35 +3,35 @@
     { "path": 
         "llama2_7b_imdb_insertsent_rank256_qv/llama2_7b_imdb_insertsent_rank256_qv_label0_",
       "indices": [
-        0,
-        10
+        201,
+        249
       ]},
     {
       "path": "llama2_7b_imdb_insertsent_rank256_qv/llama2_7b_imdb_insertsent_rank256_qv_label1_",
       "indices": [
-        0,
-        2
+        61,
+        150
       ]
     },
     {
       "path": "llama2_7b_imdb_RIPPLE_rank256_qv/llama2_7b_imdb_RIPPLE_rank256_qv_label1_",
       "indices": [
-        0,
-        2
+        61,
+        150
       ]
     },
     {
       "path": "llama2_7b_imdb_stybkd_rank256_qv/llama2_7b_imdb_stybkd_rank256_qv_label1_",
       "indices": [
-        0,
-        2
+        61,
+        150
       ]
     },
     {
       "path": "llama2_7b_imdb_syntactic_rank256_qv/llama2_7b_imdb_syntactic_rank256_qv_label1_",
       "indices": [
-        0,
-        2
+        61,
+        150
       ]
     }
   ]

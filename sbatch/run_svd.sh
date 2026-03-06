@@ -15,7 +15,9 @@ source /home/n.pitzalis/miniconda3/etc/profile.d/conda.sh
 conda activate upeftg
 
 MANIFEST_JSON=${MANIFEST_JSON:-prepare_manifest.json}
-DATASET_ROOT=${DATASET_ROOT:-data}
+CURRENT_USER=${USER:-$(id -un)}
+PROJECT_STORAGE_ROOT=${UPEFTGUARD_STORAGE_ROOT:-/models/${CURRENT_USER}/unsupervised-peftguard}
+DATASET_ROOT=${DATASET_ROOT:-${UPEFTGUARD_DATA_ROOT:-${PROJECT_STORAGE_ROOT}/data}}
 RUN_ID=${RUN_ID:-feature_svd_${SLURM_JOB_ID:-manual}}
 
 python -m upeftguard.cli feature extract \

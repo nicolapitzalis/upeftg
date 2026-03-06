@@ -87,6 +87,8 @@ def _compute_bundle(
                 if params.get("spectral_features") is not None
                 else None
             ),
+            spectral_qv_sum_mode=str(params.get("spectral_qv_sum_mode", "none")),
+            spectral_moment_source=str(params.get("spectral_moment_source", "sv")),
             sv_top_k=int(params.get("spectral_sv_top_k", 8)),
             block_size=int(params.get("block_size", 131072)),
             dtype=dtype,

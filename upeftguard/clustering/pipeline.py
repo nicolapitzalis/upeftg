@@ -30,10 +30,10 @@ from .reporting import (
     render_score_metrics_comparison,
     save_score_table,
 )
-from ..features.registry import extract_with_cache
-from ..utilities.manifest import parse_single_manifest_json
-from ..utilities.run_context import create_run_context
-from ..utilities.serialization import json_ready
+from ..features.registry import extract_features
+from ..utilities.core.manifest import parse_single_manifest_json, resolve_manifest_path
+from ..utilities.core.run_context import create_run_context
+from ..utilities.core.serialization import json_ready
 
 
 SCRIPT_VERSION = "1.0.0"
@@ -58,8 +58,10 @@ def run_clustering_pipeline(
     use_offline_label_metrics: bool,
     stability_seeds: list[int],
     score_percentiles: list[float],
-    force_recompute_features: bool,
 ) -> dict[str, Any]:
+    if manifest_json is not None:
+        manifest_json = resolve_manifest_path(manifest_json)
+
     ctx = create_run_context(
         pipeline="clustering",
         output_root=output_root,
@@ -92,7 +94,6 @@ def run_clustering_pipeline(
             "type": "external_feature_file",
             "shape": [int(z.shape[0]), int(z.shape[1])],
             "n_components": int(z.shape[1]),
-            "cache_hit": False,
         }
 
         run_feature_path = ctx.features_dir / "external_features.npy"
@@ -112,13 +113,11 @@ def run_clustering_pipeline(
             dataset_root=dataset_root,
             section_key="path",
         )
-        bundle, feature_artifacts, extractor_warnings = extract_with_cache(
+        bundle, feature_artifacts, extractor_warnings = extract_features(
             extractor_name=extractor_name,
             items=items,
             params=extractor_params,
-            cache_root=ctx.cache_root,
             run_features_dir=ctx.features_dir,
-            force_recompute=force_recompute_features,
         )
 
         z = bundle.features
@@ -129,8 +128,6 @@ def run_clustering_pipeline(
             "type": "extractor_output",
             "extractor": extractor_name,
             "extractor_metadata": bundle.metadata,
-            "cache_hit": feature_artifacts["cache_hit"],
-            "cache_key": feature_artifacts["cache_key"],
             "shape": [int(z.shape[0]), int(z.shape[1])],
             "n_components": int(z.shape[1]),
         }

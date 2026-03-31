@@ -60,22 +60,24 @@ def compute_offline_metrics(labels_true: np.ndarray | None, scores: np.ndarray) 
     return metrics
 
 
-def compute_infer_threshold_rows(
-    train_scores: np.ndarray,
+def _compute_infer_threshold_rows_from_reference(
+    *,
+    reference_scores: np.ndarray,
     infer_scores: np.ndarray,
     percentiles: list[float],
     infer_labels: np.ndarray | None,
+    percentile_key: str,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     n_infer = int(infer_scores.size)
 
     for pct in percentiles:
-        threshold = float(np.percentile(train_scores, pct))
+        threshold = float(np.percentile(reference_scores, pct))
         flagged = infer_scores >= threshold
         n_flagged = int(np.sum(flagged))
 
         row: dict[str, Any] = {
-            "percentile_from_train": float(pct),
+            percentile_key: float(pct),
             "threshold": threshold,
             "n_flagged_in_inference": n_flagged,
             "fraction_flagged_in_inference": float(n_flagged / max(1, n_infer)),
@@ -96,6 +98,36 @@ def compute_infer_threshold_rows(
         rows.append(row)
 
     return rows
+
+
+def compute_infer_threshold_rows(
+    train_scores: np.ndarray,
+    infer_scores: np.ndarray,
+    percentiles: list[float],
+    infer_labels: np.ndarray | None,
+) -> list[dict[str, Any]]:
+    return _compute_infer_threshold_rows_from_reference(
+        reference_scores=np.asarray(train_scores, dtype=np.float64),
+        infer_scores=np.asarray(infer_scores, dtype=np.float64),
+        percentiles=percentiles,
+        infer_labels=infer_labels,
+        percentile_key="percentile_from_train",
+    )
+
+
+def compute_infer_threshold_rows_from_inference(
+    infer_scores: np.ndarray,
+    percentiles: list[float],
+    infer_labels: np.ndarray | None,
+) -> list[dict[str, Any]]:
+    infer_scores_np = np.asarray(infer_scores, dtype=np.float64)
+    return _compute_infer_threshold_rows_from_reference(
+        reference_scores=infer_scores_np,
+        infer_scores=infer_scores_np,
+        percentiles=percentiles,
+        infer_labels=infer_labels,
+        percentile_key="percentile_from_inference",
+    )
 
 
 def save_score_csv(

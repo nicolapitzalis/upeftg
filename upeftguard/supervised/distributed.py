@@ -38,8 +38,17 @@ def resolve_slurm_max_concurrent(value: str, cpus_per_task: int) -> int:
     return 8
 
 
-def build_slurm_array_next_steps(*, run_dir: Path, n_tasks: int, max_concurrent: int) -> list[str]:
+def build_slurm_array_next_steps(
+    *,
+    run_dir: Path,
+    n_tasks: int,
+    max_concurrent: int,
+    skip_feature_importance: bool = False,
+) -> list[str]:
+    finalize_cmd = f"python -m upeftguard.cli run supervised --stage finalize --run-dir {run_dir}"
+    if skip_feature_importance:
+        finalize_cmd += " --skip-feature-importance"
     return [
         f"Submit array workers for task indices 0..{max(0, n_tasks - 1)} with max concurrency {max_concurrent}",
-        f"After workers complete, run: python -m upeftguard.cli run supervised --stage finalize --run-dir {run_dir}",
+        f"After workers complete, run: {finalize_cmd}",
     ]

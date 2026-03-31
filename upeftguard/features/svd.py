@@ -14,11 +14,11 @@ from sklearn.metrics import pairwise_distances
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 
 from .adapters import extract_layers_from_keys
-from .delta import check_consistency, discover_delta_pairs
-from ..utilities.manifest import ManifestItem
+from .delta import check_consistency, load_delta_block_schema, load_effective_block_factors
+from ..utilities.core.manifest import ManifestItem
 
 
-SVD_EXTRACTOR_VERSION = "2.0.0"
+SVD_EXTRACTOR_VERSION = "2.1.0"
 
 
 @dataclass(frozen=True)
@@ -27,8 +27,10 @@ class StreamingSVDBasis:
     singular_values: np.ndarray
     u: np.ndarray
     expected_pairs: tuple[tuple[str, str], ...]
+    expected_e_keys: tuple[str | None, ...]
     expected_a_shapes: tuple[tuple[int, ...], ...]
     expected_b_shapes: tuple[tuple[int, ...], ...]
+    expected_e_shapes: tuple[tuple[int, ...] | None, ...]
     layers: list[int]
     n_features: int
     resolved_component_grid: list[int]
@@ -89,16 +91,37 @@ def _delta_feature_dim(
 
 def _discover_delta_schema(
     adapter_path: Path,
-) -> tuple[tuple[tuple[str, str], ...], tuple[tuple[int, ...], ...], tuple[tuple[int, ...], ...], list[int], int]:
-    pairs, _, a_shapes, b_shapes = discover_delta_pairs(adapter_path)
-    expected_pairs = tuple((str(a_key), str(b_key)) for a_key, b_key in pairs)
-    expected_a_shapes = tuple(tuple(int(x) for x in s) for s in a_shapes)
-    expected_b_shapes = tuple(tuple(int(x) for x in s) for s in b_shapes)
+) -> tuple[
+    tuple[tuple[str, str], ...],
+    tuple[str | None, ...],
+    tuple[tuple[int, ...], ...],
+    tuple[tuple[int, ...], ...],
+    tuple[tuple[int, ...] | None, ...],
+    list[int],
+    int,
+]:
+    schema = load_delta_block_schema(adapter_path)
+    expected_pairs = tuple((str(a_key), str(b_key)) for a_key, b_key in schema.pairs)
+    expected_e_keys = tuple(str(key) if key is not None else None for key in schema.e_keys)
+    expected_a_shapes = tuple(tuple(int(x) for x in s) for s in schema.a_shapes)
+    expected_b_shapes = tuple(tuple(int(x) for x in s) for s in schema.b_shapes)
+    expected_e_shapes = tuple(
+        tuple(int(x) for x in s) if s is not None else None
+        for s in schema.e_shapes
+    )
 
     layer_keys = tuple(key for pair in expected_pairs for key in pair)
     layers = extract_layers_from_keys(layer_keys)
     n_features = _delta_feature_dim(a_shapes=expected_a_shapes, b_shapes=expected_b_shapes)
-    return expected_pairs, expected_a_shapes, expected_b_shapes, layers, n_features
+    return (
+        expected_pairs,
+        expected_e_keys,
+        expected_a_shapes,
+        expected_b_shapes,
+        expected_e_shapes,
+        layers,
+        n_features,
+    )
 
 
 def _load_block_factors(
@@ -106,10 +129,16 @@ def _load_block_factors(
     *,
     a_key: str,
     b_key: str,
+    e_key: str | None,
     dtype: np.dtype,
 ) -> tuple[np.ndarray, np.ndarray]:
-    first_a = np.asarray(readers[0].get_tensor(a_key), dtype=dtype)
-    first_b = np.asarray(readers[0].get_tensor(b_key), dtype=dtype)
+    first_a, first_b = load_effective_block_factors(
+        reader=readers[0],
+        a_key=a_key,
+        b_key=b_key,
+        e_key=e_key,
+        dtype=dtype,
+    )
 
     a_stack = np.empty((len(readers), *first_a.shape), dtype=dtype)
     b_stack = np.empty((len(readers), *first_b.shape), dtype=dtype)
@@ -117,8 +146,13 @@ def _load_block_factors(
     b_stack[0] = first_b
 
     for i in range(1, len(readers)):
-        a_stack[i] = np.asarray(readers[i].get_tensor(a_key), dtype=dtype)
-        b_stack[i] = np.asarray(readers[i].get_tensor(b_key), dtype=dtype)
+        a_stack[i], b_stack[i] = load_effective_block_factors(
+            reader=readers[i],
+            a_key=a_key,
+            b_key=b_key,
+            e_key=e_key,
+            dtype=dtype,
+        )
 
     return a_stack, b_stack
 
@@ -147,6 +181,7 @@ def compute_train_gram_from_delta_factors(
     adapter_paths: list[Path],
     *,
     expected_pairs: tuple[tuple[str, str], ...],
+    expected_e_keys: tuple[str | None, ...],
     dtype: np.dtype,
 ) -> np.ndarray:
     n_samples = len(adapter_paths)
@@ -157,11 +192,12 @@ def compute_train_gram_from_delta_factors(
     with ExitStack() as stack:
         readers = [stack.enter_context(safe_open(path, framework="numpy")) for path in adapter_paths]
 
-        for a_key, b_key in expected_pairs:
+        for (a_key, b_key), e_key in zip(expected_pairs, expected_e_keys):
             a_stack, b_stack = _load_block_factors(
                 readers=readers,
                 a_key=a_key,
                 b_key=b_key,
+                e_key=e_key,
                 dtype=dtype,
             )
             gram_raw += _delta_factor_cross_inner_products(
@@ -179,6 +215,7 @@ def compute_cross_gram_from_delta_factors(
     train_paths: list[Path],
     target_paths: list[Path],
     expected_pairs: tuple[tuple[str, str], ...],
+    expected_e_keys: tuple[str | None, ...],
     dtype: np.dtype,
 ) -> np.ndarray:
     n_train = len(train_paths)
@@ -191,17 +228,19 @@ def compute_cross_gram_from_delta_factors(
         train_readers = [stack.enter_context(safe_open(path, framework="numpy")) for path in train_paths]
         target_readers = [stack.enter_context(safe_open(path, framework="numpy")) for path in target_paths]
 
-        for a_key, b_key in expected_pairs:
+        for (a_key, b_key), e_key in zip(expected_pairs, expected_e_keys):
             train_a, train_b = _load_block_factors(
                 readers=train_readers,
                 a_key=a_key,
                 b_key=b_key,
+                e_key=e_key,
                 dtype=dtype,
             )
             target_a, target_b = _load_block_factors(
                 readers=target_readers,
                 a_key=a_key,
                 b_key=b_key,
+                e_key=e_key,
                 dtype=dtype,
             )
             cross_raw += _delta_factor_cross_inner_products(
@@ -320,7 +359,15 @@ def fit_dual_svd_basis_from_items(
         raise ValueError(f"block_size must be positive, got {block_size}")
 
     first_adapter_path = items[0].adapter_path
-    expected_pairs, expected_a_shapes, expected_b_shapes, layers, n_features = _discover_delta_schema(
+    (
+        expected_pairs,
+        expected_e_keys,
+        expected_a_shapes,
+        expected_b_shapes,
+        expected_e_shapes,
+        layers,
+        n_features,
+    ) = _discover_delta_schema(
         adapter_path=first_adapter_path,
     )
 
@@ -331,12 +378,15 @@ def fit_dual_svd_basis_from_items(
             expected_pairs=list(expected_pairs),
             expected_a_shapes=list(expected_a_shapes),
             expected_b_shapes=list(expected_b_shapes),
+            expected_e_keys=list(expected_e_keys),
+            expected_e_shapes=list(expected_e_shapes),
         )
 
     gram_start = perf_counter()
     gram_raw = compute_train_gram_from_delta_factors(
         adapter_paths=adapter_paths,
         expected_pairs=expected_pairs,
+        expected_e_keys=expected_e_keys,
         dtype=dtype,
     )
     gram_stream_time_seconds = float(perf_counter() - gram_start)
@@ -366,8 +416,10 @@ def fit_dual_svd_basis_from_items(
         singular_values=singular_values,
         u=u,
         expected_pairs=expected_pairs,
+        expected_e_keys=expected_e_keys,
         expected_a_shapes=expected_a_shapes,
         expected_b_shapes=expected_b_shapes,
+        expected_e_shapes=expected_e_shapes,
         layers=layers,
         n_features=n_features,
         resolved_component_grid=resolved_grid,
@@ -404,8 +456,10 @@ def project_items_with_dual_basis_streamed(
         raise ValueError(f"Requested rank={rank} exceeds available singular values={basis.singular_values.size}")
 
     expected_pairs = basis.expected_pairs
+    expected_e_keys = basis.expected_e_keys
     expected_a_shapes = basis.expected_a_shapes
     expected_b_shapes = basis.expected_b_shapes
+    expected_e_shapes = basis.expected_e_shapes
 
     for adapter_path in train_paths:
         check_consistency(
@@ -413,6 +467,8 @@ def project_items_with_dual_basis_streamed(
             expected_pairs=list(expected_pairs),
             expected_a_shapes=list(expected_a_shapes),
             expected_b_shapes=list(expected_b_shapes),
+            expected_e_keys=list(expected_e_keys),
+            expected_e_shapes=list(expected_e_shapes),
         )
     for adapter_path in target_paths:
         check_consistency(
@@ -420,12 +476,15 @@ def project_items_with_dual_basis_streamed(
             expected_pairs=list(expected_pairs),
             expected_a_shapes=list(expected_a_shapes),
             expected_b_shapes=list(expected_b_shapes),
+            expected_e_keys=list(expected_e_keys),
+            expected_e_shapes=list(expected_e_shapes),
         )
 
     cross_raw = compute_cross_gram_from_delta_factors(
         train_paths=train_paths,
         target_paths=target_paths,
         expected_pairs=expected_pairs,
+        expected_e_keys=expected_e_keys,
         dtype=dtype,
     )
     row_mean_target = cross_raw.mean(axis=1, dtype=np.float64)

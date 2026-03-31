@@ -5,22 +5,36 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
+from time import perf_counter
 from typing import Any
 
 from .clustering.pipeline import run_clustering_pipeline
-from .features.registry import extract_with_cache, supported_extractors
+from .features.registry import extract_features, supported_extractors
 from .features.spectral import (
+    DEFAULT_SPECTRAL_ENTRYWISE_DELTA_MODE,
     DEFAULT_SPECTRAL_FEATURES,
     DEFAULT_SPECTRAL_MOMENT_SOURCE,
     DEFAULT_SPECTRAL_QV_SUM_MODE,
+    SUPPORTED_SPECTRAL_ENTRYWISE_DELTA_MODES,
 )
 from .supervised.pipeline import run_supervised_pipeline
 from .supervised.registry import registered_models
+from .unsupervised.analysis import (
+    run_unsupervised_layer_scatter_pipeline,
+    run_unsupervised_tsne_pipeline,
+)
 from .unsupervised.gmm_train_inference import run_gmm_train_inference_pipeline
-from .utilities.manifest import parse_single_manifest_json
-from .utilities.paths import default_dataset_root, dataset_root_help
-from .utilities.run_context import create_run_context
-from .utilities.serialization import json_ready
+from .utilities.artifacts.dataset_references import (
+    build_dataset_reference_payload_from_items,
+    default_dataset_reference_report_path,
+    write_dataset_reference_report,
+)
+from .utilities.artifacts.export_feature_subset import export_feature_subset
+from .utilities.core.manifest import parse_single_manifest_json, resolve_manifest_path
+from .utilities.core.paths import default_dataset_root, dataset_root_help
+from .utilities.core.run_context import create_run_context
+from .utilities.core.serialization import json_ready
+from .utilities.merge.merge_feature_files import merge_feature_files
 
 
 def _execution_root() -> Path:
@@ -45,27 +59,35 @@ def _has_option(tokens: list[str], option: str) -> bool:
     return any(tok == option or tok.startswith(option + "=") for tok in tokens)
 
 
+def _parse_learning_rate(raw: str) -> str | float:
+    value = str(raw).strip()
+    if value.lower() == "auto":
+        return "auto"
+    return float(value)
+
+
 def _rewrite_download_local_dir(tokens: list[str]) -> list[str]:
     root = _execution_root()
-    safe_default = default_dataset_root()
+    default_download_root = default_dataset_root()
+    safe_local_root = (root / "data").resolve()
     out = list(tokens)
 
     if not _has_option(out, "--local-dir"):
-        return ["--local-dir", str(safe_default), *out]
+        return ["--local-dir", str(default_download_root), *out]
 
     for idx, tok in enumerate(out):
         if tok == "--local-dir" and idx + 1 < len(out):
             current = Path(out[idx + 1]).expanduser()
             resolved = (current if current.is_absolute() else root / current).resolve()
             if resolved == root or _is_filesystem_root(resolved):
-                out[idx + 1] = str(safe_default)
+                out[idx + 1] = str(safe_local_root)
             return out
         if tok.startswith("--local-dir="):
             raw = tok.split("=", 1)[1]
             current = Path(raw).expanduser()
             resolved = (current if current.is_absolute() else root / current).resolve()
             if resolved == root or _is_filesystem_root(resolved):
-                out[idx] = f"--local-dir={safe_default}"
+                out[idx] = f"--local-dir={safe_local_root}"
             return out
     return out
 
@@ -78,11 +100,27 @@ def _normalize_download_args(tokens: list[str]) -> list[str]:
 
 
 def _extractor_params_from_args(args: argparse.Namespace) -> dict[str, Any]:
-    svd_components_grid = getattr(args, "svd_components_grid", [20, 25, 30]) or [20, 25, 30]
+    extractor_name = str(getattr(args, "extractor", "svd"))
     spectral_features = getattr(args, "spectral_features", None)
     if spectral_features is not None:
         spectral_features = list(spectral_features)
 
+    if extractor_name == "spectral":
+        return {
+            "block_size": int(getattr(args, "stream_block_size", 131072)),
+            "dtype": str(getattr(args, "dtype", "float32")),
+            "spectral_features": spectral_features,
+            "spectral_sv_top_k": int(getattr(args, "spectral_sv_top_k", 8)),
+            "spectral_moment_source": str(
+                getattr(args, "spectral_moment_source", DEFAULT_SPECTRAL_MOMENT_SOURCE)
+            ),
+            "spectral_qv_sum_mode": str(getattr(args, "spectral_qv_sum_mode", DEFAULT_SPECTRAL_QV_SUM_MODE)),
+            "spectral_entrywise_delta_mode": str(
+                getattr(args, "spectral_entrywise_delta_mode", DEFAULT_SPECTRAL_ENTRYWISE_DELTA_MODE)
+            ),
+        }
+
+    svd_components_grid = getattr(args, "svd_components_grid", [20, 25, 30]) or [20, 25, 30]
     return {
         "component_grid": list(svd_components_grid),
         "n_components": getattr(args, "svd_n_components", None),
@@ -91,12 +129,6 @@ def _extractor_params_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "acceptance_spearman_threshold": float(getattr(args, "acceptance_spearman_threshold", 0.99)),
         "acceptance_variance_threshold": float(getattr(args, "acceptance_variance_threshold", 0.95)),
         "run_offline_label_diagnostics": bool(getattr(args, "run_offline_label_diagnostics", False)),
-        "spectral_features": spectral_features,
-        "spectral_sv_top_k": int(getattr(args, "spectral_sv_top_k", 8)),
-        "spectral_moment_source": str(
-            getattr(args, "spectral_moment_source", DEFAULT_SPECTRAL_MOMENT_SOURCE)
-        ),
-        "spectral_qv_sum_mode": str(getattr(args, "spectral_qv_sum_mode", DEFAULT_SPECTRAL_QV_SUM_MODE)),
     }
 
 
@@ -120,7 +152,6 @@ def _cmd_run_clustering(args: argparse.Namespace) -> int:
         use_offline_label_metrics=args.use_offline_label_metrics,
         stability_seeds=args.stability_seeds,
         score_percentiles=args.score_percentiles,
-        force_recompute_features=args.force_recompute_features,
     )
 
     print("Run complete")
@@ -147,7 +178,6 @@ def _cmd_run_gmm_train_inference(args: argparse.Namespace) -> int:
         dtype_name=args.dtype,
         reg_covar=args.reg_covar,
         n_init=args.n_init,
-        force_recompute_features=args.force_recompute_features,
     )
 
     print("Run complete")
@@ -155,6 +185,66 @@ def _cmd_run_gmm_train_inference(args: argparse.Namespace) -> int:
     print(f"Report: {result['report']}")
     print(f"Train scores: {result['train_scores_csv']}")
     print(f"Inference scores: {result['inference_scores_csv']}")
+    return 0
+
+
+def _cmd_run_unsupervised_tsne(args: argparse.Namespace) -> int:
+    output_root = _resolve_output_root(args.output_root, "run_unsupervised_tsne")
+    result = run_unsupervised_tsne_pipeline(
+        feature_file=args.feature_file,
+        output_root=output_root,
+        run_id=args.run_id,
+        feature_root=args.feature_root,
+        model_names_file=args.feature_model_names_file,
+        labels_file=args.feature_labels_file,
+        metadata_file=args.feature_metadata_file,
+        dataset_reference_report=args.dataset_reference_report,
+        over=args.over,
+        view=args.view,
+        perplexity=args.perplexity,
+        learning_rate=args.learning_rate,
+        max_iter=args.max_iter,
+        metric=args.metric,
+        init=args.init,
+        random_state=args.random_state,
+        perplexities=args.perplexities,
+        learning_rates=args.learning_rates,
+        max_iters=args.max_iters_grid,
+        metrics=args.metrics,
+        inits=args.inits,
+        random_states=args.random_states,
+        standardize=args.standardize,
+        point_size=args.point_size,
+        alpha=args.alpha,
+    )
+
+    print("Run complete")
+    print(f"Run dir: {result['run_dir']}")
+    print(f"Report: {result['report']}")
+    print(f"Plots: {result['plot_dir']}")
+    print(f"Embeddings: {result['embedding_dir']}")
+    return 0
+
+
+def _cmd_run_unsupervised_layer_scatter(args: argparse.Namespace) -> int:
+    output_root = _resolve_output_root(args.output_root, "run_unsupervised_layer_scatter")
+    result = run_unsupervised_layer_scatter_pipeline(
+        feature_file=args.feature_file,
+        output_root=output_root,
+        run_id=args.run_id,
+        feature_root=args.feature_root,
+        model_names_file=args.feature_model_names_file,
+        labels_file=args.feature_labels_file,
+        metadata_file=args.feature_metadata_file,
+        dataset_reference_report=args.dataset_reference_report,
+        point_size=args.point_size,
+        alpha=args.alpha,
+    )
+
+    print("Run complete")
+    print(f"Run dir: {result['run_dir']}")
+    print(f"Report: {result['report']}")
+    print(f"Plots: {result['plot_dir']}")
     return 0
 
 
@@ -166,28 +256,32 @@ def _cmd_run_supervised(args: argparse.Namespace) -> int:
         output_root=output_root,
         run_id=args.run_id,
         model_name=args.model,
-        spectral_features=list(args.features),
+        spectral_features=(list(args.features) if args.features is not None else None),
         spectral_sv_top_k=args.spectral_sv_top_k,
         spectral_moment_source=args.spectral_moment_source,
         spectral_qv_sum_mode=args.spectral_qv_sum_mode,
+        spectral_entrywise_delta_mode=args.spectral_entrywise_delta_mode,
         stream_block_size=args.stream_block_size,
         dtype_name=args.dtype,
         cv_folds=args.cv_folds,
         random_state=args.random_state,
+        train_split_percent=args.train_split,
+        calibration_split_percent=args.calibration_split,
+        accepted_fpr=args.accepted_fpr,
+        split_by_folder=args.split_by_folder,
         cv_random_states=args.cv_seeds,
         n_jobs=args.n_jobs,
         score_percentiles=args.score_percentiles,
-        force_recompute_features=args.force_recompute_features,
         tuning_executor=args.tuning_executor,
         slurm_partition=args.slurm_partition,
         slurm_max_concurrent=args.slurm_max_concurrent,
         slurm_cpus_per_task=args.slurm_cpus_per_task,
+        finalize_export_shards=args.finalize_export_shards,
         stage=args.stage,
         run_dir=args.run_dir,
         task_index=args.task_index,
+        skip_feature_importance=args.skip_feature_importance,
         feature_file=args.feature_file,
-        feature_model_names_file=args.feature_model_names_file,
-        feature_metadata_file=args.feature_metadata_file,
     )
 
     print("Run complete")
@@ -211,9 +305,11 @@ def _cmd_run_supervised(args: argparse.Namespace) -> int:
 
 
 def _cmd_feature_extract(args: argparse.Namespace) -> int:
+    start = perf_counter()
     output_root = _resolve_output_root(args.output_root, "feature_extract")
+    manifest_json = resolve_manifest_path(args.manifest_json)
     items = parse_single_manifest_json(
-        manifest_path=args.manifest_json,
+        manifest_path=manifest_json,
         dataset_root=args.dataset_root,
         section_key="path",
     )
@@ -224,26 +320,39 @@ def _cmd_feature_extract(args: argparse.Namespace) -> int:
         run_id=args.run_id,
     )
 
-    bundle, artifacts, warnings = extract_with_cache(
+    bundle, artifacts, warnings = extract_features(
         extractor_name=args.extractor,
         items=items,
         params=_extractor_params_from_args(args),
-        cache_root=ctx.cache_root,
         run_features_dir=ctx.features_dir,
-        force_recompute=args.force_recompute_features,
     )
+    kept_model_names = set(bundle.model_names)
+    kept_items = [item for item in items if item.model_name in kept_model_names]
+    elapsed_seconds = float(perf_counter() - start)
 
     report = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": elapsed_seconds,
         "extractor": args.extractor,
         "feature_shape": [int(bundle.features.shape[0]), int(bundle.features.shape[1])],
         "labels_available": bool(bundle.labels is not None),
         "model_count": len(bundle.model_names),
-        "cache_hit": artifacts["cache_hit"],
-        "cache_key": artifacts["cache_key"],
         "warnings": warnings,
         "metadata": bundle.metadata,
     }
+    dataset_reference_payload = build_dataset_reference_payload_from_items(
+        items=kept_items,
+        artifact_kind="feature_extract",
+        manifest_json=manifest_json,
+        dataset_root=args.dataset_root,
+        artifact_model_count=len(bundle.model_names),
+        source_artifacts=[str(manifest_json)],
+    )
+    dataset_reference_report_path = write_dataset_reference_report(
+        default_dataset_reference_report_path(ctx.reports_dir),
+        dataset_reference_payload,
+    )
+    report["dataset_reference_report_path"] = str(dataset_reference_report_path)
     report_path = ctx.reports_dir / "feature_extraction_report.json"
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(json_ready(report), f, indent=2)
@@ -252,17 +361,18 @@ def _cmd_feature_extract(args: argparse.Namespace) -> int:
     if artifacts.get("labels_path"):
         ctx.add_artifact("labels", Path(str(artifacts["labels_path"])))
     ctx.add_artifact("feature_metadata", Path(artifacts["metadata_path"]))
+    ctx.add_artifact("dataset_reference_report", dataset_reference_report_path)
     ctx.add_artifact("report", report_path)
+    ctx.add_timing("feature_extract_elapsed_seconds", elapsed_seconds)
 
     run_config = {
         "pipeline": "feature_extract",
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "manifest_json": str(args.manifest_json),
+        "elapsed_seconds": elapsed_seconds,
+        "manifest_json": str(manifest_json),
         "dataset_root": str(args.dataset_root),
         "extractor": args.extractor,
         "extractor_params": _extractor_params_from_args(args),
-        "cache_key": artifacts["cache_key"],
-        "cache_hit": artifacts["cache_hit"],
         "warnings": warnings,
     }
     ctx.finalize(run_config)
@@ -270,11 +380,12 @@ def _cmd_feature_extract(args: argparse.Namespace) -> int:
     print("Feature extraction complete")
     print(f"Run dir: {ctx.run_dir}")
     print(f"Report: {report_path}")
+    print(f"Dataset references: {dataset_reference_report_path}")
     return 0
 
 
 def _cmd_download_dataset(args: argparse.Namespace) -> int:
-    from .utilities import dataset_download
+    from .utilities.data import dataset_download
 
     passthrough = _normalize_download_args(list(args.download_args))
     passthrough = _rewrite_download_local_dir(passthrough)
@@ -284,6 +395,48 @@ def _cmd_download_dataset(args: argparse.Namespace) -> int:
         dataset_download.main()
     finally:
         sys.argv = old_argv
+    return 0
+
+
+def _cmd_util_merge_features(args: argparse.Namespace) -> int:
+    outputs = merge_feature_files(
+        feature_paths=list(args.merge),
+        output_filename=args.output_filename,
+        feature_root=args.feature_root,
+    )
+
+    print("Feature merge complete")
+    print(f"Feature file: {outputs['feature_path']}")
+    print(f"Model names: {outputs['model_names_path']}")
+    if outputs["labels_path"] is not None:
+        print(f"Labels: {outputs['labels_path']}")
+    print(f"Metadata: {outputs['metadata_path']}")
+    print(f"Dataset references: {outputs['dataset_reference_report_path']}")
+    print(f"Merge report: {outputs['merge_report_path']}")
+    return 0
+
+
+def _cmd_util_export_feature_subset(args: argparse.Namespace) -> int:
+    outputs = export_feature_subset(
+        feature_file=args.feature_file,
+        output_filename=args.output_filename,
+        feature_root=args.feature_root,
+        dataset_names=args.dataset_names,
+        subset_names=args.subset_names,
+        model_families=args.model_families,
+        attack_names=args.attack_names,
+        model_names=args.model_names,
+        features=args.features,
+    )
+
+    print("Feature subset export complete")
+    print(f"Feature file: {outputs['feature_path']}")
+    print(f"Model names: {outputs['model_names_path']}")
+    if outputs["labels_path"] is not None:
+        print(f"Labels: {outputs['labels_path']}")
+    print(f"Metadata: {outputs['metadata_path']}")
+    print(f"Dataset references: {outputs['dataset_reference_report_path']}")
+    print(f"Subset report: {outputs['subset_report_path']}")
     return 0
 
 
@@ -306,8 +459,6 @@ def build_parser() -> argparse.ArgumentParser:
     clustering.add_argument("--extractor", choices=supported_extractors(), default="svd", help="Feature extractor")
     clustering.add_argument("--output-root", type=Path, default=Path("runs"), help="Output root for run artifacts")
     clustering.add_argument("--run-id", type=str, default=None, help="Optional fixed run id")
-    clustering.add_argument("--force-recompute-features", action="store_true", help="Ignore feature cache")
-
     clustering.add_argument("--svd-components-grid", nargs="+", type=int, default=[20, 25, 30])
     clustering.add_argument("--svd-n-components", type=int, default=None)
     clustering.add_argument("--spectral-features", nargs="+", default=list(DEFAULT_SPECTRAL_FEATURES))
@@ -321,6 +472,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--spectral-qv-sum-mode",
         choices=["none", "append", "only"],
         default=DEFAULT_SPECTRAL_QV_SUM_MODE,
+    )
+    clustering.add_argument(
+        "--spectral-entrywise-delta-mode",
+        choices=list(SUPPORTED_SPECTRAL_ENTRYWISE_DELTA_MODES),
+        default=DEFAULT_SPECTRAL_ENTRYWISE_DELTA_MODE,
     )
     clustering.add_argument("--stream-block-size", type=int, default=131072)
     clustering.add_argument("--dtype", choices=["float32", "float64"], default="float32")
@@ -353,7 +509,6 @@ def build_parser() -> argparse.ArgumentParser:
     gmm.add_argument("--dataset-root", type=Path, default=default_dataset_root(), help=dataset_root_help())
     gmm.add_argument("--output-root", type=Path, default=Path("runs"))
     gmm.add_argument("--run-id", type=str, default=None)
-    gmm.add_argument("--force-recompute-features", action="store_true")
     gmm.add_argument("--svd-components-grid", nargs="+", type=int, default=[20, 25, 30])
     gmm.add_argument("--gmm-components", nargs="+", type=int, default=[1, 2, 3, 4, 5])
     gmm.add_argument(
@@ -369,6 +524,153 @@ def build_parser() -> argparse.ArgumentParser:
     gmm.add_argument("--n-init", type=int, default=1)
     gmm.set_defaults(func=_cmd_run_gmm_train_inference)
 
+    unsupervised_tsne = run_sub.add_parser(
+        "unsupervised-tsne",
+        help="Run t-SNE over a feature bundle, grouped by rank",
+    )
+    unsupervised_tsne.add_argument(
+        "--feature-file",
+        type=Path,
+        required=True,
+        help="Input feature run name or explicit spectral feature .npy file",
+    )
+    unsupervised_tsne.add_argument("--output-root", type=Path, default=Path("runs"))
+    unsupervised_tsne.add_argument("--run-id", type=str, default=None)
+    unsupervised_tsne.add_argument(
+        "--feature-root",
+        type=Path,
+        default=Path("runs") / "feature_extract",
+        help="Base directory used to resolve bare feature run names (default: runs/feature_extract)",
+    )
+    unsupervised_tsne.add_argument(
+        "--feature-model-names-file",
+        type=Path,
+        default=None,
+        help="Optional model-names JSON for --feature-file (defaults to the sibling companion file)",
+    )
+    unsupervised_tsne.add_argument(
+        "--feature-labels-file",
+        type=Path,
+        default=None,
+        help="Optional labels .npy for --feature-file (defaults to the sibling companion file)",
+    )
+    unsupervised_tsne.add_argument(
+        "--feature-metadata-file",
+        type=Path,
+        default=None,
+        help="Optional metadata JSON for --feature-file (defaults to the sibling companion file)",
+    )
+    unsupervised_tsne.add_argument(
+        "--dataset-reference-report",
+        type=Path,
+        default=None,
+        help="Optional dataset_reference_report.json path for rank/label provenance",
+    )
+    unsupervised_tsne.add_argument("--over", choices=["rank"], default="rank")
+    unsupervised_tsne.add_argument("--view", choices=["full", "per_layer"], default="full")
+    unsupervised_tsne.add_argument("--perplexity", type=float, default=30.0)
+    unsupervised_tsne.add_argument("--learning-rate", type=_parse_learning_rate, default="auto")
+    unsupervised_tsne.add_argument("--max-iter", type=int, default=1000)
+    unsupervised_tsne.add_argument("--metric", type=str, default="euclidean")
+    unsupervised_tsne.add_argument("--init", choices=["pca", "random"], default="pca")
+    unsupervised_tsne.add_argument("--random-state", type=int, default=42)
+    unsupervised_tsne.add_argument(
+        "--perplexities",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Optional sweep grid for perplexity; overrides the single --perplexity value when provided",
+    )
+    unsupervised_tsne.add_argument(
+        "--learning-rates",
+        nargs="+",
+        type=_parse_learning_rate,
+        default=None,
+        help="Optional sweep grid for learning rate; overrides the single --learning-rate value when provided",
+    )
+    unsupervised_tsne.add_argument(
+        "--max-iters-grid",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Optional sweep grid for max_iter; overrides the single --max-iter value when provided",
+    )
+    unsupervised_tsne.add_argument(
+        "--metrics",
+        nargs="+",
+        default=None,
+        help="Optional sweep grid for distance metric; overrides the single --metric value when provided",
+    )
+    unsupervised_tsne.add_argument(
+        "--inits",
+        nargs="+",
+        choices=["pca", "random"],
+        default=None,
+        help="Optional sweep grid for initialization; overrides the single --init value when provided",
+    )
+    unsupervised_tsne.add_argument(
+        "--random-states",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Optional sweep grid for random_state; overrides the single --random-state value when provided",
+    )
+    unsupervised_tsne.add_argument("--point-size", type=float, default=28.0)
+    unsupervised_tsne.add_argument("--alpha", type=float, default=0.85)
+    unsupervised_tsne.add_argument(
+        "--no-standardize",
+        action="store_false",
+        dest="standardize",
+        help="Disable feature standardization before t-SNE",
+    )
+    unsupervised_tsne.set_defaults(func=_cmd_run_unsupervised_tsne, standardize=True)
+
+    unsupervised_layer_scatter = run_sub.add_parser(
+        "unsupervised-layer-scatter",
+        help="Save per-feature layer-vs-value scatter and box plots for a feature bundle",
+    )
+    unsupervised_layer_scatter.add_argument(
+        "--feature-file",
+        type=Path,
+        required=True,
+        help="Input feature run name or explicit spectral feature .npy file",
+    )
+    unsupervised_layer_scatter.add_argument("--output-root", type=Path, default=Path("runs"))
+    unsupervised_layer_scatter.add_argument("--run-id", type=str, default=None)
+    unsupervised_layer_scatter.add_argument(
+        "--feature-root",
+        type=Path,
+        default=Path("runs") / "feature_extract",
+        help="Base directory used to resolve bare feature run names (default: runs/feature_extract)",
+    )
+    unsupervised_layer_scatter.add_argument(
+        "--feature-model-names-file",
+        type=Path,
+        default=None,
+        help="Optional model-names JSON for --feature-file (defaults to the sibling companion file)",
+    )
+    unsupervised_layer_scatter.add_argument(
+        "--feature-labels-file",
+        type=Path,
+        default=None,
+        help="Optional labels .npy for --feature-file (defaults to the sibling companion file)",
+    )
+    unsupervised_layer_scatter.add_argument(
+        "--feature-metadata-file",
+        type=Path,
+        default=None,
+        help="Optional metadata JSON for --feature-file (defaults to the sibling companion file)",
+    )
+    unsupervised_layer_scatter.add_argument(
+        "--dataset-reference-report",
+        type=Path,
+        default=None,
+        help="Optional dataset_reference_report.json path for rank/label provenance",
+    )
+    unsupervised_layer_scatter.add_argument("--point-size", type=float, default=6.0)
+    unsupervised_layer_scatter.add_argument("--alpha", type=float, default=0.18)
+    unsupervised_layer_scatter.set_defaults(func=_cmd_run_unsupervised_layer_scatter)
+
     supervised = run_sub.add_parser("supervised", help="Run supervised spectral feature pipeline")
     supervised.add_argument("--manifest-json", type=Path, default=None)
     supervised.add_argument(
@@ -380,7 +682,12 @@ def build_parser() -> argparse.ArgumentParser:
     supervised.add_argument("--output-root", type=Path, default=Path("runs"))
     supervised.add_argument("--run-id", type=str, default=None)
     supervised.add_argument("--model", choices=["all", *registered_models()], default="logistic_regression")
-    supervised.add_argument("--features", nargs="+", default=list(DEFAULT_SPECTRAL_FEATURES))
+    supervised.add_argument(
+        "--features",
+        nargs="+",
+        default=None,
+        help="Required for stage=prepare/all. Selects feature groups from the extracted spectral bundle.",
+    )
     supervised.add_argument("--spectral-sv-top-k", type=int, default=8)
     supervised.add_argument(
         "--spectral-moment-source",
@@ -392,37 +699,107 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["none", "append", "only"],
         default=DEFAULT_SPECTRAL_QV_SUM_MODE,
     )
+    supervised.add_argument(
+        "--spectral-entrywise-delta-mode",
+        choices=list(SUPPORTED_SPECTRAL_ENTRYWISE_DELTA_MODES),
+        default=DEFAULT_SPECTRAL_ENTRYWISE_DELTA_MODE,
+    )
     supervised.add_argument("--stream-block-size", type=int, default=131072)
     supervised.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     supervised.add_argument("--cv-folds", type=int, default=5)
     supervised.add_argument("--random-state", type=int, default=42)
+    supervised.add_argument(
+        "--train-split",
+        "--train_split",
+        dest="train_split",
+        type=int,
+        default=100,
+        help=(
+            "For single manifests only, take this percentage of each split bucket as training data "
+            "(globally by class unless --split-by-folder is set)."
+        ),
+    )
+    supervised.add_argument(
+        "--split-by-folder",
+        action="store_true",
+        help=(
+            "Apply folder/label-aware splitting instead of global label stratification. "
+            "For single manifests this affects both the outer train/inference split and, when enabled, "
+            "the train/calibration split; for joint manifests it applies to calibration only."
+        ),
+    )
+    supervised.add_argument(
+        "--calibration-split",
+        "--calibration_split",
+        dest="calibration_split",
+        type=int,
+        default=None,
+        help=(
+            "Take this percentage of the training partition as a calibration set for threshold selection. "
+            "Must be provided together with --accepted-fpr."
+        ),
+    )
+    supervised.add_argument(
+        "--accepted-fpr",
+        "--accepted_fpr",
+        dest="accepted_fpr",
+        type=float,
+        nargs="+",
+        default=None,
+        help=(
+            "Select one or more calibration thresholds by maximizing recall subject to "
+            "false_positive_rate <= each provided value. Must be provided together with "
+            "--calibration-split."
+        ),
+    )
     supervised.add_argument("--cv-seeds", nargs="+", type=int, default=None)
     supervised.add_argument("--n-jobs", type=int, default=-1)
     supervised.add_argument("--score-percentiles", nargs="+", type=float, default=None)
-    supervised.add_argument("--force-recompute-features", action="store_true")
-    supervised.add_argument("--tuning-executor", choices=["local", "slurm_array"], default="local")
+    supervised.add_argument(
+        "--tuning-executor",
+        choices=["local", "slurm_array"],
+        default="local",
+        help=(
+            "Where tuning tasks run. 'local' executes them in the current process; "
+            "'slurm_array' prepares the run for distributed Slurm array workers."
+        ),
+    )
     supervised.add_argument("--slurm-partition", type=str, default="extra")
     supervised.add_argument("--slurm-max-concurrent", type=str, default="auto")
     supervised.add_argument("--slurm-cpus-per-task", type=str, default="auto")
     supervised.add_argument(
+        "--finalize-export-shards",
+        type=int,
+        default=1,
+        help="Number of distributed finalize shards for winner feature-weight export.",
+    )
+    supervised.add_argument(
+        "--skip-feature-importance",
+        action="store_true",
+        help="Skip winner feature-importance export during finalize.",
+    )
+    supervised.add_argument(
         "--feature-file",
         type=Path,
         default=None,
-        help="Optional precomputed spectral feature matrix (.npy) for stage=prepare/all",
+        help=(
+            "Required for stage=prepare/all. Feature bundle selector: feature run name, "
+            "feature output directory, or spectral_features.npy path."
+        ),
     )
     supervised.add_argument(
-        "--feature-model-names-file",
-        type=Path,
-        default=None,
-        help="Optional model-names JSON for --feature-file (defaults to sibling spectral_model_names.json)",
+        "--stage",
+        choices=[
+            "all",
+            "prepare",
+            "worker",
+            "finalize",
+            "finalize_prepare",
+            "finalize_worker",
+            "finalize_merge",
+        ],
+        default="all",
     )
-    supervised.add_argument(
-        "--feature-metadata-file",
-        type=Path,
-        default=None,
-        help="Optional metadata JSON for --feature-file (defaults to sibling spectral_metadata.json when present)",
-    )
-    supervised.add_argument("--stage", choices=["all", "prepare", "worker", "finalize"], default="all")
     supervised.add_argument("--run-dir", type=Path, default=None)
     supervised.add_argument("--task-index", type=int, default=None)
     supervised.set_defaults(func=_cmd_run_supervised)
@@ -430,7 +807,7 @@ def build_parser() -> argparse.ArgumentParser:
     feature_parser = sub.add_parser("feature", help="Feature extraction commands")
     feature_sub = feature_parser.add_subparsers(dest="feature_command", required=True)
 
-    extract = feature_sub.add_parser("extract", help="Extract and cache features")
+    extract = feature_sub.add_parser("extract", help="Extract features")
     extract.add_argument("--manifest-json", type=Path, required=True)
     extract.add_argument(
         "--dataset-root",
@@ -441,7 +818,6 @@ def build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--extractor", choices=supported_extractors(), default="svd")
     extract.add_argument("--output-root", type=Path, default=Path("runs"))
     extract.add_argument("--run-id", type=str, default=None)
-    extract.add_argument("--force-recompute-features", action="store_true")
     extract.add_argument("--svd-components-grid", nargs="+", type=int, default=[20, 25, 30])
     extract.add_argument("--svd-n-components", type=int, default=None)
     extract.add_argument("--spectral-features", nargs="+", default=list(DEFAULT_SPECTRAL_FEATURES))
@@ -456,6 +832,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["none", "append", "only"],
         default=DEFAULT_SPECTRAL_QV_SUM_MODE,
     )
+    extract.add_argument(
+        "--spectral-entrywise-delta-mode",
+        choices=list(SUPPORTED_SPECTRAL_ENTRYWISE_DELTA_MODES),
+        default=DEFAULT_SPECTRAL_ENTRYWISE_DELTA_MODE,
+    )
     extract.add_argument("--stream-block-size", type=int, default=131072)
     extract.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     extract.add_argument("--acceptance-spearman-threshold", type=float, default=0.99)
@@ -465,6 +846,72 @@ def build_parser() -> argparse.ArgumentParser:
 
     util_parser = sub.add_parser("util", help="Utility commands")
     util_sub = util_parser.add_subparsers(dest="util_command", required=True)
+
+    merge_features = util_sub.add_parser(
+        "merge-features",
+        help="Merge two spectral feature files and their companion artifacts",
+    )
+    merge_features.add_argument(
+        "--merge",
+        type=Path,
+        nargs=2,
+        metavar=("FILE1", "FILE2"),
+        required=True,
+        help="Two run names or explicit spectral feature .npy files to merge",
+    )
+    merge_features.add_argument(
+        "--output-filename",
+        type=Path,
+        required=True,
+        help="Output run name or explicit output feature matrix path (.npy)",
+    )
+    merge_features.add_argument(
+        "--feature-root",
+        type=Path,
+        default=Path("runs") / "feature_extract",
+        help="Base directory used to resolve bare run names (default: runs/feature_extract)",
+    )
+    merge_features.set_defaults(func=_cmd_util_merge_features)
+
+    export_feature_subset = util_sub.add_parser(
+        "export-feature-subset",
+        help="Export a provenance-backed subset of a spectral feature file",
+    )
+    export_feature_subset.add_argument(
+        "--feature-file",
+        type=Path,
+        required=True,
+        help="Input run name or explicit spectral feature .npy file",
+    )
+    export_feature_subset.add_argument(
+        "--output-filename",
+        type=Path,
+        required=True,
+        help="Output run name or explicit output feature matrix path (.npy)",
+    )
+    export_feature_subset.add_argument(
+        "--feature-root",
+        type=Path,
+        default=Path("runs") / "feature_extract",
+        help="Base directory used to resolve bare feature run names (default: runs/feature_extract)",
+    )
+    export_feature_subset.add_argument("--dataset-name", dest="dataset_names", nargs="+", default=None)
+    export_feature_subset.add_argument("--subset-name", dest="subset_names", nargs="+", default=None)
+    export_feature_subset.add_argument("--model-family", dest="model_families", nargs="+", default=None)
+    export_feature_subset.add_argument("--attack-name", dest="attack_names", nargs="+", default=None)
+    export_feature_subset.add_argument("--model-name", dest="model_names", nargs="+", default=None)
+    export_feature_subset.add_argument(
+        "--features",
+        "--columns",
+        dest="features",
+        nargs="+",
+        default=None,
+        help=(
+            "Spectral feature groups to keep after provenance selection across all matched blocks/layers; "
+            "omit or pass 'all' to keep every available feature family"
+        ),
+    )
+    export_feature_subset.set_defaults(func=_cmd_util_export_feature_subset)
 
     download = util_sub.add_parser("download-dataset", help="Download PADBench subsets")
     download.add_argument("download_args", nargs=argparse.REMAINDER)

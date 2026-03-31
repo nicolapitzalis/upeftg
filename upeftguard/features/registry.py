@@ -7,11 +7,14 @@ from typing import Any
 
 import numpy as np
 
-from .spectral import SPECTRAL_EXTRACTOR_VERSION, extract_spectral_features
+from .spectral import SPECTRAL_EXTRACTOR_VERSION, extract_spectral_features, spectral_extractor_params
 from .svd import SVD_EXTRACTOR_VERSION, extract_svd_embeddings
-from ..utilities.hashing import compute_dataset_signature, compute_feature_cache_key
-from ..utilities.manifest import ManifestItem
-from ..utilities.serialization import json_ready
+from ..utilities.artifacts.spectral_metadata import (
+    dataset_layouts_from_source,
+    write_spectral_metadata,
+)
+from ..utilities.core.manifest import ManifestItem
+from ..utilities.core.serialization import json_ready
 
 
 @dataclass
@@ -28,34 +31,42 @@ _EXTRACTOR_VERSIONS = {
 }
 
 
-def _dataset_signature(items: list[ManifestItem]) -> str:
-    model_names = [item.model_name for item in items]
-    extra = {
-        "adapter_paths": [str(item.adapter_path.resolve()) for item in items],
+def _warning_messages_from_skipped_spectral_models(metadata: dict[str, Any]) -> list[str]:
+    raw_skipped = metadata.get("skipped_models")
+    if not isinstance(raw_skipped, list) or not raw_skipped:
+        return []
+
+    warnings = [f"Skipped {len(raw_skipped)} spectral adapter(s) due to read/consistency errors"]
+    for entry in raw_skipped:
+        if not isinstance(entry, dict):
+            continue
+        model_name = str(entry.get("model_name") or "unknown")
+        exc_type = str(entry.get("exception_type") or "Error")
+        exc_message = str(entry.get("exception_message") or "").strip()
+        if exc_message:
+            warnings.append(f"Skipped spectral adapter '{model_name}': {exc_type}: {exc_message}")
+        else:
+            warnings.append(f"Skipped spectral adapter '{model_name}': {exc_type}")
+    return warnings
+
+
+def _extractor_params_for_metadata(
+    *,
+    extractor_name: str,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    if extractor_name == "spectral":
+        return spectral_extractor_params(params)
+
+    return {
+        "component_grid": list(params.get("component_grid", [20, 25, 30])),
+        "n_components": params.get("n_components"),
+        "block_size": int(params.get("block_size", 131072)),
+        "dtype": str(params.get("dtype", "float32")),
+        "acceptance_spearman_threshold": float(params.get("acceptance_spearman_threshold", 0.99)),
+        "acceptance_variance_threshold": float(params.get("acceptance_variance_threshold", 0.95)),
+        "run_offline_label_diagnostics": bool(params.get("run_offline_label_diagnostics", False)),
     }
-    return compute_dataset_signature(model_names=model_names, extra=extra)
-
-
-def _write_bundle(cache_dir: Path, bundle: FeatureBundle) -> None:
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    np.save(cache_dir / "features.npy", bundle.features)
-    if bundle.labels is not None:
-        np.save(cache_dir / "labels.npy", bundle.labels)
-    with open(cache_dir / "model_names.json", "w", encoding="utf-8") as f:
-        json.dump(bundle.model_names, f, indent=2)
-    with open(cache_dir / "metadata.json", "w", encoding="utf-8") as f:
-        json.dump(json_ready(bundle.metadata), f, indent=2)
-
-
-def _load_bundle(cache_dir: Path) -> FeatureBundle:
-    features = np.load(cache_dir / "features.npy")
-    labels_path = cache_dir / "labels.npy"
-    labels = np.load(labels_path) if labels_path.exists() else None
-    with open(cache_dir / "model_names.json", "r", encoding="utf-8") as f:
-        model_names = json.load(f)
-    with open(cache_dir / "metadata.json", "r", encoding="utf-8") as f:
-        metadata = json.load(f)
-    return FeatureBundle(features=features, labels=labels, model_names=model_names, metadata=metadata)
 
 
 def _compute_bundle(
@@ -89,61 +100,51 @@ def _compute_bundle(
             ),
             spectral_qv_sum_mode=str(params.get("spectral_qv_sum_mode", "none")),
             spectral_moment_source=str(params.get("spectral_moment_source", "sv")),
+            spectral_entrywise_delta_mode=str(params.get("spectral_entrywise_delta_mode", "auto")),
             sv_top_k=int(params.get("spectral_sv_top_k", 8)),
             block_size=int(params.get("block_size", 131072)),
             dtype=dtype,
         )
-        return FeatureBundle(features=features, labels=labels, model_names=model_names, metadata=metadata), []
+        return (
+            FeatureBundle(features=features, labels=labels, model_names=model_names, metadata=metadata),
+            _warning_messages_from_skipped_spectral_models(metadata),
+        )
 
     raise ValueError(
         f"Unknown extractor '{extractor_name}'. Supported: {sorted(_EXTRACTOR_VERSIONS.keys())}"
     )
 
 
-def extract_with_cache(
+def extract_features(
     *,
     extractor_name: str,
     items: list[ManifestItem],
     params: dict[str, Any],
-    cache_root: Path,
     run_features_dir: Path,
-    force_recompute: bool = False,
 ) -> tuple[FeatureBundle, dict[str, Any], list[str]]:
     if extractor_name not in _EXTRACTOR_VERSIONS:
         raise ValueError(
             f"Unknown extractor '{extractor_name}'. Supported: {sorted(_EXTRACTOR_VERSIONS.keys())}"
         )
 
-    dataset_signature = _dataset_signature(items)
-    dtype = str(params.get("dtype", "float32"))
-    cache_key = compute_feature_cache_key(
-        dataset_signature=dataset_signature,
+    bundle, warnings = _compute_bundle(
         extractor_name=extractor_name,
-        extractor_params=json_ready(params),
-        extractor_version=_EXTRACTOR_VERSIONS[extractor_name],
-        dtype=dtype,
+        items=items,
+        params=params,
     )
-
-    cache_dir = cache_root / cache_key
-    cache_hit = cache_dir.exists() and (cache_dir / "features.npy").exists()
-
-    warnings: list[str] = []
-    if cache_hit and not force_recompute:
-        bundle = _load_bundle(cache_dir)
-    else:
-        bundle, warnings = _compute_bundle(
-            extractor_name=extractor_name,
-            items=items,
-            params=params,
-        )
-        bundle.metadata = {
-            **bundle.metadata,
-            "dataset_signature": dataset_signature,
-            "extractor_name": extractor_name,
-            "extractor_version": _EXTRACTOR_VERSIONS[extractor_name],
-            "extractor_params": json_ready(params),
-        }
-        _write_bundle(cache_dir, bundle)
+    bundle.metadata = {
+        **bundle.metadata,
+        "extractor_name": extractor_name,
+        "extractor_version": _EXTRACTOR_VERSIONS[extractor_name],
+        "extractor_params": json_ready(
+            _extractor_params_for_metadata(
+                extractor_name=extractor_name,
+                params=params,
+            )
+        ),
+    }
+    kept_model_names = set(bundle.model_names)
+    kept_items = [item for item in items if item.model_name in kept_model_names]
 
     run_features_dir.mkdir(parents=True, exist_ok=True)
     run_feature_path = run_features_dir / f"{extractor_name}_features.npy"
@@ -159,29 +160,38 @@ def extract_with_cache(
         json.dump(bundle.model_names, f, indent=2)
 
     run_metadata_path = run_features_dir / f"{extractor_name}_metadata.json"
-    with open(run_metadata_path, "w", encoding="utf-8") as f:
-        json.dump(
-            json_ready(
+    if extractor_name == "spectral":
+        dataset_counts: dict[str, int] = {}
+        for item in kept_items:
+            dataset_name = str(item.model_dir.parent.name or "unknown")
+            dataset_counts[dataset_name] = int(dataset_counts.get(dataset_name, 0)) + 1
+        dataset_reference_payload = {
+            "dataset_groups": [
                 {
-                    **bundle.metadata,
-                    "cache_key": cache_key,
-                    "cache_hit": bool(cache_hit and not force_recompute),
-                    "cache_dir": str(cache_dir),
+                    "dataset_name": dataset_name,
+                    "sample_count": int(sample_count),
                 }
-            ),
-            f,
-            indent=2,
+                for dataset_name, sample_count in sorted(dataset_counts.items())
+            ]
+        }
+        dataset_layouts = dataset_layouts_from_source(
+            metadata=bundle.metadata,
+            dataset_reference_payload=dataset_reference_payload,
         )
+        write_spectral_metadata(
+            run_metadata_path,
+            internal_metadata=bundle.metadata,
+            dataset_layouts=dataset_layouts,
+        )
+    else:
+        with open(run_metadata_path, "w", encoding="utf-8") as f:
+            json.dump(json_ready(bundle.metadata), f, indent=2)
 
     artifact_info = {
-        "cache_key": cache_key,
-        "cache_hit": bool(cache_hit and not force_recompute),
-        "cache_dir": str(cache_dir),
         "feature_path": str(run_feature_path),
         "labels_path": str(run_labels_path) if run_labels_path is not None else None,
         "model_names_path": str(run_names_path),
         "metadata_path": str(run_metadata_path),
-        "dataset_signature": dataset_signature,
     }
     return bundle, artifact_info, warnings
 

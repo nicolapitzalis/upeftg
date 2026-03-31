@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from typing import Iterator
 
 import numpy as np
+
+
+DEFAULT_ENTRYWISE_DELTA_MODE = "auto"
+SUPPORTED_ENTRYWISE_DELTA_MODES = ("auto", "dense", "stream")
+_AUTO_DENSE_MEMORY_FRACTION = 0.25
+_DENSE_MOMENT_WORKING_SET_BYTES_PER_ENTRY = 24
 
 
 @dataclass(frozen=True)
@@ -33,12 +40,13 @@ class _MomentAccumulator:
         if vals.size == 0:
             return
 
-        abs_vals = np.abs(vals)
         self.count += int(vals.size)
         self.sum_x += float(np.sum(vals, dtype=np.float64))
-        self.sum_x2 += float(np.sum(np.square(vals), dtype=np.float64))
-        self.sum_x3 += float(np.sum(np.power(vals, 3), dtype=np.float64))
-        self.sum_x4 += float(np.sum(np.power(vals, 4), dtype=np.float64))
+        sq = np.square(vals, dtype=np.float64)
+        self.sum_x2 += float(np.sum(sq, dtype=np.float64))
+        self.sum_x3 += float(np.dot(sq, vals))
+        self.sum_x4 += float(np.dot(sq, sq))
+        abs_vals = np.abs(vals)
         self.sum_abs += float(np.sum(abs_vals, dtype=np.float64))
         self.max_abs = max(self.max_abs, float(np.max(abs_vals)))
 
@@ -80,6 +88,80 @@ class _MomentAccumulator:
         )
 
 
+def resolve_entrywise_delta_mode(mode: str | None) -> str:
+    resolved = DEFAULT_ENTRYWISE_DELTA_MODE if mode is None else str(mode).strip().lower()
+    if resolved not in SUPPORTED_ENTRYWISE_DELTA_MODES:
+        raise ValueError(
+            f"Unknown entrywise_delta_mode '{mode}'. "
+            f"Supported: {list(SUPPORTED_ENTRYWISE_DELTA_MODES)}"
+        )
+    return resolved
+
+
+def _validate_lora_factors(a: np.ndarray, b: np.ndarray) -> None:
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError(f"Expected rank-2 arrays for LoRA factors, got A{a.shape}, B{b.shape}")
+    if int(a.shape[0]) != int(b.shape[1]):
+        raise ValueError(f"LoRA rank mismatch for factors A{a.shape}, B{b.shape}")
+
+
+def _available_memory_bytes() -> int | None:
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.startswith("MemAvailable:"):
+                    continue
+                parts = line.split()
+                if len(parts) >= 2:
+                    return int(parts[1]) * 1024
+                break
+    except OSError:
+        pass
+
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        avail_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        if page_size > 0 and avail_pages > 0:
+            return page_size * avail_pages
+    except (AttributeError, OSError, ValueError):
+        pass
+
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        total_pages = int(os.sysconf("SC_PHYS_PAGES"))
+        if page_size > 0 and total_pages > 0:
+            return page_size * total_pages
+    except (AttributeError, OSError, ValueError):
+        return None
+    return None
+
+
+def _estimate_dense_moment_working_set_bytes(a: np.ndarray, b: np.ndarray) -> int:
+    n_entries = int(b.shape[0]) * int(a.shape[1])
+    return n_entries * _DENSE_MOMENT_WORKING_SET_BYTES_PER_ENTRY
+
+
+def _resolve_runtime_entrywise_delta_mode(
+    *,
+    a: np.ndarray,
+    b: np.ndarray,
+    requested_mode: str,
+    available_memory_bytes: int | None,
+) -> str:
+    if requested_mode != "auto":
+        return requested_mode
+
+    available = _available_memory_bytes() if available_memory_bytes is None else int(available_memory_bytes)
+    if available is None or available <= 0:
+        return "stream"
+
+    estimated = _estimate_dense_moment_working_set_bytes(a=a, b=b)
+    dense_budget = int(float(available) * _AUTO_DENSE_MEMORY_FRACTION)
+    if estimated <= 0 or dense_budget <= 0:
+        return "stream"
+    return "dense" if estimated <= dense_budget else "stream"
+
+
 def iter_delta_matrix_chunks(
     *,
     a: np.ndarray,
@@ -89,10 +171,7 @@ def iter_delta_matrix_chunks(
 ) -> Iterator[np.ndarray]:
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}")
-    if a.ndim != 2 or b.ndim != 2:
-        raise ValueError(f"Expected rank-2 arrays for LoRA factors, got A{a.shape}, B{b.shape}")
-    if int(a.shape[0]) != int(b.shape[1]):
-        raise ValueError(f"LoRA rank mismatch for factors A{a.shape}, B{b.shape}")
+    _validate_lora_factors(a=a, b=b)
 
     out_dim = int(b.shape[0])
     in_dim = int(a.shape[1])
@@ -111,8 +190,22 @@ def block_moments_from_factors(
     b: np.ndarray,
     block_size: int,
     dtype: np.dtype,
-) -> BlockMomentSummary:
+    entrywise_delta_mode: str = DEFAULT_ENTRYWISE_DELTA_MODE,
+    available_memory_bytes: int | None = None,
+) -> tuple[BlockMomentSummary, str]:
+    requested_mode = resolve_entrywise_delta_mode(entrywise_delta_mode)
+    _validate_lora_factors(a=a, b=b)
+    runtime_mode = _resolve_runtime_entrywise_delta_mode(
+        a=a,
+        b=b,
+        requested_mode=requested_mode,
+        available_memory_bytes=available_memory_bytes,
+    )
     acc = _MomentAccumulator()
+    if runtime_mode == "dense":
+        acc.update(np.asarray(b @ a, dtype=dtype))
+        return acc.finalize(), runtime_mode
+
     for chunk in iter_delta_matrix_chunks(
         a=a,
         b=b,
@@ -120,7 +213,7 @@ def block_moments_from_factors(
         dtype=dtype,
     ):
         acc.update(chunk)
-    return acc.finalize()
+    return acc.finalize(), runtime_mode
 
 
 def summarize_array_moments(values: np.ndarray) -> BlockMomentSummary:

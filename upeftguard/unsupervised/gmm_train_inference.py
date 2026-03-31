@@ -10,12 +10,12 @@ from sklearn.mixture import GaussianMixture
 
 from ..clustering.metrics import sanitize_gmm_components
 from ..features.svd import fit_dual_svd_basis_from_items, project_items_with_dual_basis_streamed
-from ..utilities.hashing import compute_dataset_signature, compute_feature_cache_key
-from ..utilities.manifest import parse_joint_manifest_json
-from ..utilities.run_context import create_run_context
-from ..utilities.serialization import json_ready
+from ..utilities.core.manifest import parse_joint_manifest_json, resolve_manifest_path
+from ..utilities.core.run_context import create_run_context
+from ..utilities.core.serialization import json_ready
 from .reporting import (
     compute_infer_threshold_rows,
+    compute_infer_threshold_rows_from_inference,
     compute_offline_metrics,
     save_score_csv,
     summarize_scores,
@@ -23,33 +23,6 @@ from .reporting import (
 
 
 SCRIPT_VERSION = "1.0.0"
-
-
-def _svd_cache_key(
-    *,
-    train_names: list[str],
-    infer_names: list[str],
-    component_grid: list[int],
-    block_size: int,
-    dtype: str,
-) -> str:
-    signature = compute_dataset_signature(
-        model_names=train_names + ["--infer--"] + infer_names,
-        extra={
-            "train_count": len(train_names),
-            "infer_count": len(infer_names),
-        },
-    )
-    return compute_feature_cache_key(
-        dataset_signature=signature,
-        extractor_name="svd_train_infer",
-        extractor_params={
-            "component_grid": component_grid,
-            "block_size": block_size,
-        },
-        extractor_version=SCRIPT_VERSION,
-        dtype=dtype,
-    )
 
 
 def run_gmm_train_inference_pipeline(
@@ -67,8 +40,8 @@ def run_gmm_train_inference_pipeline(
     dtype_name: str,
     reg_covar: float,
     n_init: int,
-    force_recompute_features: bool,
 ) -> dict[str, Any]:
+    manifest_json = resolve_manifest_path(manifest_json)
     dtype = np.float32 if dtype_name == "float32" else np.float64
 
     if stream_block_size <= 0:
@@ -105,67 +78,28 @@ def run_gmm_train_inference_pipeline(
     train_names = [item.model_name for item in train_items]
     infer_names = [item.model_name for item in infer_items]
 
-    svd_cache_key = _svd_cache_key(
-        train_names=train_names,
-        infer_names=infer_names,
+    basis, component_warnings = fit_dual_svd_basis_from_items(
+        items=train_items,
         component_grid=svd_components_grid,
         block_size=stream_block_size,
-        dtype=dtype_name,
+        dtype=dtype,
     )
-    svd_cache_dir = ctx.cache_root / svd_cache_key
-    svd_cache_hit = svd_cache_dir.exists() and (svd_cache_dir / "z_train_max.npy").exists()
 
-    if svd_cache_hit and not force_recompute_features:
-        z_train_max = np.load(svd_cache_dir / "z_train_max.npy")
-        z_infer_max = np.load(svd_cache_dir / "z_infer_max.npy")
-        with open(svd_cache_dir / "metadata.json", "r", encoding="utf-8") as f:
-            svd_meta = json.load(f)
-        resolved_component_grid = [int(x) for x in svd_meta["resolved_component_grid"]]
-        max_rank = int(svd_meta["max_rank"])
-        layers = [int(x) for x in svd_meta["layers"]]
-        n_params = int(svd_meta["n_features_raw"])
-        component_warnings = [str(x) for x in svd_meta.get("warnings", [])]
-    else:
-        basis, component_warnings = fit_dual_svd_basis_from_items(
-            items=train_items,
-            component_grid=svd_components_grid,
-            block_size=stream_block_size,
-            dtype=dtype,
-        )
+    resolved_component_grid = basis.resolved_component_grid
+    max_rank = basis.max_rank
+    layers = basis.layers
+    n_params = basis.n_features
 
-        resolved_component_grid = basis.resolved_component_grid
-        max_rank = basis.max_rank
-        layers = basis.layers
-        n_params = basis.n_features
-
-        rank = max(resolved_component_grid)
-        z_train_max = basis.z_train_max[:, :rank]
-        z_infer_max = project_items_with_dual_basis_streamed(
-            train_items=train_items,
-            target_items=infer_items,
-            basis=basis,
-            rank=rank,
-            block_size=stream_block_size,
-            dtype=dtype,
-        )
-
-        svd_cache_dir.mkdir(parents=True, exist_ok=True)
-        np.save(svd_cache_dir / "z_train_max.npy", z_train_max)
-        np.save(svd_cache_dir / "z_infer_max.npy", z_infer_max)
-        with open(svd_cache_dir / "metadata.json", "w", encoding="utf-8") as f:
-            json.dump(
-                json_ready(
-                    {
-                        "resolved_component_grid": resolved_component_grid,
-                        "max_rank": max_rank,
-                        "layers": layers,
-                        "n_features_raw": n_params,
-                        "warnings": component_warnings,
-                    }
-                ),
-                f,
-                indent=2,
-            )
+    rank = max(resolved_component_grid)
+    z_train_max = basis.z_train_max[:, :rank]
+    z_infer_max = project_items_with_dual_basis_streamed(
+        train_items=train_items,
+        target_items=infer_items,
+        basis=basis,
+        rank=rank,
+        block_size=stream_block_size,
+        dtype=dtype,
+    )
 
     warnings.extend(component_warnings)
 
@@ -337,6 +271,11 @@ def run_gmm_train_inference_pipeline(
         percentiles=score_percentiles,
         infer_labels=infer_labels_np,
     )
+    threshold_rows_from_inference = compute_infer_threshold_rows_from_inference(
+        infer_scores=infer_scores,
+        percentiles=score_percentiles,
+        infer_labels=infer_labels_np,
+    )
     offline_metrics = compute_offline_metrics(infer_labels_np, infer_scores)
 
     infer_clean_scores = np.asarray(
@@ -378,8 +317,6 @@ def run_gmm_train_inference_pipeline(
             "svd_components_grid_resolved": resolved_component_grid,
             "chosen_k": k_star,
             "max_available_rank": int(max_rank),
-            "svd_cache_key": svd_cache_key,
-            "svd_cache_hit": bool(svd_cache_hit and not force_recompute_features),
         },
         "gmm_selection": {
             "criterion": "mean_bic_on_train",
@@ -417,6 +354,7 @@ def run_gmm_train_inference_pipeline(
                 summarize_scores(infer_backdoor_scores) if infer_backdoor_scores.size > 0 else None
             ),
             "threshold_evaluation": threshold_rows,
+            "threshold_evaluation_from_inference": threshold_rows_from_inference,
             "offline_metrics": offline_metrics,
         },
         "warnings": warnings,
@@ -471,8 +409,6 @@ def run_gmm_train_inference_pipeline(
         "dtype": dtype_name,
         "reg_covar": reg_covar,
         "n_init": n_init,
-        "svd_cache_key": svd_cache_key,
-        "svd_cache_hit": bool(svd_cache_hit and not force_recompute_features),
         "warnings": warnings,
     }
     ctx.finalize(run_config)

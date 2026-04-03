@@ -287,6 +287,28 @@ def _resolve_provenance_feature_names(
     root_feature_names: list[str],
     selected_model_names: list[str],
 ) -> tuple[list[str], list[Path]]:
+    owned_feature_names_by_model, matched_leaf_paths = _resolve_model_owned_feature_names(
+        root_feature_path=root_feature_path,
+        root_feature_names=root_feature_names,
+        selected_model_names=selected_model_names,
+    )
+    required_feature_names = {
+        feature_name
+        for owned_feature_names in owned_feature_names_by_model.values()
+        for feature_name in owned_feature_names
+    }
+    available_feature_names = [name for name in root_feature_names if name in required_feature_names]
+    if not available_feature_names:
+        raise ValueError("No provenance-backed columns were available for the selected rows")
+    return available_feature_names, matched_leaf_paths
+
+
+def _resolve_model_owned_feature_names(
+    *,
+    root_feature_path: Path,
+    root_feature_names: list[str],
+    selected_model_names: list[str],
+) -> tuple[dict[str, list[str]], list[Path]]:
     _unique_index_by_name(root_feature_names, context=str(root_feature_path), entity="feature names")
 
     leaf_sources = _collect_leaf_feature_sources(
@@ -295,7 +317,7 @@ def _resolve_provenance_feature_names(
         active=set(),
     )
     selected_model_name_set = set(selected_model_names)
-    required_feature_names: set[str] = set()
+    model_owned_feature_names: dict[str, set[str]] = {}
     covered_model_names: set[str] = set()
     matched_leaf_paths: list[Path] = []
 
@@ -306,7 +328,9 @@ def _resolve_provenance_feature_names(
             continue
         matched_leaf_paths.append(leaf.feature_path)
         covered_model_names.update(overlap)
-        required_feature_names.update(str(name) for name in leaf.feature_names)
+        owned_feature_names = {str(name) for name in leaf.feature_names}
+        for model_name in overlap:
+            model_owned_feature_names.setdefault(str(model_name), set()).update(owned_feature_names)
 
     uncovered = sorted(selected_model_name_set - covered_model_names)
     if uncovered:
@@ -316,22 +340,33 @@ def _resolve_provenance_feature_names(
             f"{len(uncovered)} selected model(s). Examples: {preview}"
         )
 
-    if not required_feature_names:
-        raise ValueError("Resolved provenance leaf sources but no feature names were discovered")
-
     root_feature_name_set = set(root_feature_names)
-    missing_in_root = sorted(name for name in required_feature_names if name not in root_feature_name_set)
-    if missing_in_root:
-        preview = ", ".join(missing_in_root[:5])
-        raise ValueError(
-            "Provenance source feature names are not present in the requested feature bundle. "
-            f"Examples: {preview}"
-        )
+    ordered_feature_names_by_model: dict[str, list[str]] = {}
+    for model_name in selected_model_names:
+        owned_feature_name_set = model_owned_feature_names.get(str(model_name), set())
+        if not owned_feature_name_set:
+            raise ValueError(
+                "Resolved provenance leaf sources but no feature names were discovered for "
+                f"model '{model_name}'"
+            )
+        missing_in_root = sorted(name for name in owned_feature_name_set if name not in root_feature_name_set)
+        if missing_in_root:
+            preview = ", ".join(missing_in_root[:5])
+            raise ValueError(
+                "Provenance source feature names are not present in the requested feature bundle. "
+                f"Examples: {preview}"
+            )
+        ordered_owned_feature_names = [
+            name for name in root_feature_names if name in owned_feature_name_set
+        ]
+        if not ordered_owned_feature_names:
+            raise ValueError(
+                "No provenance-backed columns were available for "
+                f"model '{model_name}'"
+            )
+        ordered_feature_names_by_model[str(model_name)] = ordered_owned_feature_names
 
-    available_feature_names = [name for name in root_feature_names if name in required_feature_names]
-    if not available_feature_names:
-        raise ValueError("No provenance-backed columns were available for the selected rows")
-    return available_feature_names, matched_leaf_paths
+    return ordered_feature_names_by_model, matched_leaf_paths
 
 
 def _resolve_output_feature_names(

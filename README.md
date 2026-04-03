@@ -208,6 +208,7 @@ Useful options:
 - `--model all` to tune across all registered classifiers.
 - `--feature-file` is required for `stage=prepare` and `stage=all`.
 - `--feature-file` can be a feature run name, a feature output directory, or an explicit `spectral_features.npy` path.
+- `--feature-file` may point to either a raw spectral bundle or an architecture-independent aggregated bundle created by `util aggregate-features`.
 - separate `--feature-model-names-file` / `--feature-metadata-file` flags are not supported; sibling companion files are resolved automatically from `--feature-file`
 - `--features` is required for `stage=prepare` and `stage=all`.
 - sibling `model_names` and `metadata` files are resolved automatically from the same feature bundle.
@@ -317,6 +318,38 @@ python -m upeftguard.cli util export-feature-subset \
 Bare run names resolve under `runs/feature_extract/<NAME>/merged/spectral_features.npy` by default. The exported bundle includes filtered `model_names`, optional `labels`, filtered metadata, and a filtered dataset-reference report.
 
 The older manifest-plus-zero-pruning subset path has been removed. Use the provenance-backed subset utility instead.
+
+### 10. Architecture-independent feature aggregation utility
+
+```bash
+python -m upeftguard.cli util aggregate-features \
+  --feature-file <RUN_ID_OR_PATH> \
+  --output-filename <RUN_OUT> \
+  --operator avg \
+  --features energy stable_rank \
+  --spectral-qv-sum-mode append
+```
+
+This utility converts a spectral feature bundle into an architecture-independent bundle by:
+- walking merge provenance down to the leaf source feature bundles that originally produced each row
+- grouping owned columns by `role bucket x feature family`
+- aggregating each group with `min`, `max`, or `avg`
+
+`avg` is not a flat mean over every owned column. It first averages within higher-level structural groups such as `decoder.block0` or `layer7`, then averages those group means with equal weight. `min` and `max` still use the global extreme over the owned columns in the group.
+
+Synthetic role buckets are emitted as normal block names so downstream tooling can keep using the standard bundle contract:
+- `role.q`
+- `role.v`
+- `role.qv_sum`
+- `role.other`
+
+The aggregated output still writes the usual companion artifacts under `runs/feature_extract/<RUN_OUT>/merged/`:
+- `spectral_features.npy`
+- `spectral_model_names.json`
+- optional `spectral_labels.npy`
+- `spectral_metadata.json`
+
+Use `--spectral-qv-sum-mode none|append|only` to exclude, include, or isolate q+v-sum columns before aggregation. After that, point `run supervised --feature-file ...` at the aggregated bundle directly.
 
 ## Maintenance Scripts
 

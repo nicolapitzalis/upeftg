@@ -656,6 +656,282 @@ def build_tiny_provenance_merge_bundle(tmp_path: Path) -> dict[str, Any]:
     }
 
 
+def _test_feature_group_for_feature_name(feature_name: str) -> str | None:
+    suffix = str(feature_name).rpartition(".")[2]
+    if not suffix:
+        return None
+    if suffix.startswith("sv_") and suffix[3:].isdigit():
+        return "sv_topk"
+    if suffix == "sv_kurtosis":
+        return "kurtosis"
+    if suffix == "sv_l1_norm":
+        return "l1_norm"
+    if suffix == "sv_linf_norm":
+        return "linf_norm"
+    if suffix == "sv_mean_abs":
+        return "mean_abs"
+    if suffix in {
+        "energy",
+        "kurtosis",
+        "l1_norm",
+        "l2_norm",
+        "linf_norm",
+        "mean_abs",
+        "concentration_of_energy",
+        "stable_rank",
+        "spectral_entropy",
+        "effective_rank",
+    }:
+        return suffix
+    return None
+
+
+def _test_role_bucket_for_feature_name(feature_name: str) -> str:
+    block_name = str(feature_name).rpartition(".")[0]
+    if block_name.endswith(".qv_sum"):
+        return "qv_sum"
+    module_name = block_name.rsplit(".", 1)[-1].strip().lower()
+    if module_name in {"q", "q_proj", "query"}:
+        return "q"
+    if module_name in {"v", "v_proj", "value"}:
+        return "v"
+    return "other"
+
+
+def _test_indexed_part_span(parts: list[str], *, prefix: str) -> tuple[int, int] | None:
+    prefix_text = str(prefix).strip().lower()
+    for idx, raw_part in enumerate(parts):
+        part = str(raw_part).strip().lower()
+        if part.startswith(prefix_text) and part[len(prefix_text) :].isdigit():
+            return idx, idx + 1
+        if part == prefix_text and idx + 1 < len(parts) and str(parts[idx + 1]).strip().isdigit():
+            return idx, idx + 2
+    return None
+
+
+def _test_structural_group_for_feature_name(feature_name: str) -> str:
+    block_name = str(feature_name).rpartition(".")[0]
+    parts = [part for part in block_name.split(".") if part]
+    if not parts:
+        return block_name
+
+    block_span = _test_indexed_part_span(parts, prefix="block")
+    if block_span is not None:
+        _, end_idx = block_span
+        return ".".join(parts[:end_idx]).strip() or block_name
+
+    layer_span = _test_indexed_part_span(parts, prefix="layer")
+    if layer_span is not None:
+        _, end_idx = layer_span
+        return ".".join(parts[:end_idx]).strip() or block_name
+
+    if len(parts) <= 2:
+        return block_name
+    prefix = ".".join(parts[:-2]).strip()
+    return prefix or block_name
+
+
+def _locally_aggregate_feature_row(
+    *,
+    values: np.ndarray,
+    feature_names: list[str],
+    operator: str,
+    requested_features: list[str] | None = None,
+    spectral_qv_sum_mode: str = "append",
+    output_feature_names: list[str] | None = None,
+) -> tuple[np.ndarray, list[str]]:
+    requested_feature_set = set(requested_features) if requested_features is not None else None
+    selected: list[tuple[int, str, str, str, str]] = []
+    for col_idx, feature_name in enumerate(feature_names):
+        role_bucket = _test_role_bucket_for_feature_name(feature_name)
+        if spectral_qv_sum_mode == "none" and role_bucket == "qv_sum":
+            continue
+        if spectral_qv_sum_mode == "only" and role_bucket != "qv_sum":
+            continue
+        feature_group = _test_feature_group_for_feature_name(feature_name)
+        if requested_feature_set is not None and feature_group not in requested_feature_set:
+            continue
+        selected.append(
+            (
+                int(col_idx),
+                str(feature_name),
+                role_bucket,
+                str(feature_name).rpartition(".")[2],
+                _test_structural_group_for_feature_name(feature_name),
+            )
+        )
+
+    resolved_output_feature_names = list(output_feature_names or [])
+    if not resolved_output_feature_names:
+        role_buckets = [role for role in ("q", "v", "qv_sum", "other") if any(item[2] == role for item in selected)]
+        emitted_features: list[str] = []
+        seen_emitted: set[str] = set()
+        for _col_idx, _feature_name, _role_bucket, emitted_feature, _structural_group in selected:
+            if emitted_feature in seen_emitted:
+                continue
+            seen_emitted.add(emitted_feature)
+            emitted_features.append(emitted_feature)
+        resolved_output_feature_names = [
+            f"role.{role_bucket}.{emitted_feature}"
+            for role_bucket in role_buckets
+            for emitted_feature in emitted_features
+        ]
+
+    aggregated_values: list[float] = []
+    for output_feature_name_value in resolved_output_feature_names:
+        role_bucket = _test_role_bucket_for_feature_name(output_feature_name_value)
+        emitted_feature = str(output_feature_name_value).rpartition(".")[2]
+        matching_groups: dict[str, list[int]] = {}
+        for col_idx, _feature_name, candidate_role, candidate_emitted, structural_group in selected:
+            if candidate_role != role_bucket or candidate_emitted != emitted_feature:
+                continue
+            matching_groups.setdefault(structural_group, []).append(col_idx)
+
+        if not matching_groups:
+            aggregated_values.append(0.0)
+            continue
+        if operator == "avg":
+            group_means = [
+                float(np.mean(values[np.asarray(column_indices, dtype=np.int64)], dtype=np.float64))
+                for column_indices in matching_groups.values()
+            ]
+            aggregated_values.append(float(np.mean(np.asarray(group_means, dtype=np.float64), dtype=np.float64)))
+        elif operator == "min":
+            matching_values = np.concatenate(
+                [
+                    np.asarray(values[np.asarray(column_indices, dtype=np.int64)], dtype=np.float32).reshape(-1)
+                    for column_indices in matching_groups.values()
+                ],
+                axis=0,
+            )
+            aggregated_values.append(float(np.min(matching_values)))
+        elif operator == "max":
+            matching_values = np.concatenate(
+                [
+                    np.asarray(values[np.asarray(column_indices, dtype=np.int64)], dtype=np.float32).reshape(-1)
+                    for column_indices in matching_groups.values()
+                ],
+                axis=0,
+            )
+            aggregated_values.append(float(np.max(matching_values)))
+        else:
+            raise ValueError(f"Unsupported operator for local aggregation test: {operator}")
+
+    return np.asarray(aggregated_values, dtype=np.float32), resolved_output_feature_names
+
+
+def build_tiny_multi_arch_provenance_merge_bundle(tmp_path: Path) -> dict[str, Any]:
+    feature_root = tmp_path / "runs" / "feature_extract"
+    manifest_entries: list[str] = []
+    per_model_leaf_rows: dict[str, dict[str, Any]] = {}
+
+    arch_entries = [
+        (
+            "llama",
+            make_tiny_adapter_dataset(tmp_path, v_out_dim=4),
+            ["tiny_label0_0", "tiny_label1_0"],
+            "append",
+        ),
+        (
+            "t5",
+            make_tiny_t5_adapter_dataset(tmp_path, out_dim=4),
+            ["tiny_t5_label0_0", "tiny_t5_label1_0"],
+            "append",
+        ),
+        (
+            "roberta",
+            make_tiny_roberta_adapter_dataset(tmp_path, out_dim=4),
+            ["tiny_roberta_label0_0", "tiny_roberta_label1_0"],
+            "append",
+        ),
+        (
+            "chatglm",
+            make_tiny_chatglm_adapter_dataset(tmp_path),
+            ["tiny_chatglm_label0_0", "tiny_chatglm_label1_0"],
+            "none",
+        ),
+    ]
+
+    run_feature_paths: list[Path] = []
+    for run_name, data_dir, model_names, spectral_qv_sum_mode in arch_entries:
+        manifest_path = tmp_path / f"{run_name}_manifest.json"
+        entries = [str((data_dir / model_name).resolve()) for model_name in model_names]
+        manifest_entries.extend(entries)
+        write_path_manifest(manifest_path, entries)
+
+        items = parse_single_manifest_json(
+            manifest_path=manifest_path,
+            dataset_root=tmp_path,
+            section_key="path",
+        )
+        features, labels, resolved_model_names, metadata = extract_spectral_features(
+            items=items,
+            spectral_features=["energy", "stable_rank"],
+            spectral_qv_sum_mode=spectral_qv_sum_mode,
+            sv_top_k=1,
+            block_size=64,
+            dtype=np.float32,
+        )
+
+        merged_dir = feature_root / f"run_{run_name}" / "merged"
+        write_merged_feature_artifacts(
+            merged_dir,
+            features=features,
+            labels=labels,
+            model_names=resolved_model_names,
+            metadata=metadata,
+        )
+        write_dataset_reference_report(
+            default_dataset_reference_report_path(merged_dir),
+            build_dataset_reference_payload_from_items(
+                items=items,
+                artifact_kind="merge_spectral_shards",
+                manifest_json=manifest_path,
+                dataset_root=tmp_path,
+                artifact_model_count=len(resolved_model_names),
+                source_artifacts=[str(manifest_path)],
+            ),
+        )
+
+        feature_names = [str(x) for x in metadata["feature_names"]]
+        for row_idx, model_name in enumerate(resolved_model_names):
+            per_model_leaf_rows[str(model_name)] = {
+                "values": np.asarray(features[row_idx], dtype=np.float32),
+                "feature_names": feature_names,
+                "label": None if labels is None else int(labels[row_idx]),
+            }
+
+        run_feature_paths.append(merged_dir / "spectral_features.npy")
+
+    merged_ab_path = feature_root / "merged_ab" / "merged" / "spectral_features.npy"
+    merged_cd_path = feature_root / "merged_cd" / "merged" / "spectral_features.npy"
+    merged_all_path = feature_root / "merged_all" / "merged" / "spectral_features.npy"
+
+    merge_feature_files(
+        feature_paths=[run_feature_paths[0], run_feature_paths[1]],
+        output_filename=merged_ab_path,
+        feature_root=feature_root,
+    )
+    merge_feature_files(
+        feature_paths=[run_feature_paths[2], run_feature_paths[3]],
+        output_filename=merged_cd_path,
+        feature_root=feature_root,
+    )
+    merge_feature_files(
+        feature_paths=[merged_ab_path, merged_cd_path],
+        output_filename=merged_all_path,
+        feature_root=feature_root,
+    )
+
+    return {
+        "feature_root": feature_root,
+        "merged_dir": merged_all_path.parent,
+        "merged_feature_path": merged_all_path,
+        "manifest_entries": manifest_entries,
+        "per_model_leaf_rows": per_model_leaf_rows,
+    }
+
+
 class TestCliAndPipeline(unittest.TestCase):
     def _run_supervised_local_smoke(
         self,
@@ -2219,6 +2495,447 @@ class TestCliAndPipeline(unittest.TestCase):
             expected = bundle["t5_features"][:, [source_index[name] for name in expected_feature_names]]
             np.testing.assert_allclose(exported_features, expected, rtol=1e-6, atol=1e-6)
             self.assertEqual([str(x) for x in exported_metadata["feature_names"]], expected_feature_names)
+
+    def test_util_aggregate_features_matches_single_schema_exact_operators(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = make_tiny_adapter_dataset(tmp_path, v_out_dim=4)
+            manifest = tmp_path / "single_schema_manifest.json"
+            entries = [
+                str((data_dir / "tiny_label0_0").resolve()),
+                str((data_dir / "tiny_label0_1").resolve()),
+                str((data_dir / "tiny_label1_0").resolve()),
+                str((data_dir / "tiny_label1_1").resolve()),
+            ]
+            write_path_manifest(manifest, entries)
+
+            items = parse_single_manifest_json(
+                manifest_path=manifest,
+                dataset_root=tmp_path,
+                section_key="path",
+            )
+            features, labels, model_names, metadata = extract_spectral_features(
+                items=items,
+                spectral_features=["energy", "stable_rank"],
+                spectral_qv_sum_mode="append",
+                sv_top_k=1,
+                block_size=64,
+                dtype=np.float32,
+            )
+
+            feature_root = tmp_path / "runs" / "feature_extract"
+            source_dir = feature_root / "single_schema_source" / "merged"
+            write_merged_feature_artifacts(
+                source_dir,
+                features=features,
+                labels=labels,
+                model_names=model_names,
+                metadata=metadata,
+            )
+            write_dataset_reference_report(
+                default_dataset_reference_report_path(source_dir),
+                build_dataset_reference_payload_from_items(
+                    items=items,
+                    artifact_kind="merge_spectral_shards",
+                    manifest_json=manifest,
+                    dataset_root=tmp_path,
+                    artifact_model_count=len(model_names),
+                    source_artifacts=[str(manifest)],
+                ),
+            )
+
+            source_feature_names = [str(x) for x in metadata["feature_names"]]
+            for operator in ["avg", "min", "max"]:
+                output_dir = feature_root / f"single_schema_{operator}" / "merged"
+                proc = run_cli(
+                    [
+                        "util",
+                        "aggregate-features",
+                        "--feature-file",
+                        "single_schema_source",
+                        "--output-filename",
+                        f"single_schema_{operator}",
+                        "--feature-root",
+                        str(feature_root),
+                        "--operator",
+                        operator,
+                        "--features",
+                        "energy",
+                        "stable_rank",
+                        "--spectral-qv-sum-mode",
+                        "append",
+                    ],
+                    cwd=REPO_ROOT,
+                )
+                if proc.returncode != 0:
+                    self.fail(proc.stderr + proc.stdout)
+
+                aggregated_features = np.asarray(np.load(output_dir / "spectral_features.npy"), dtype=np.float32)
+                public_metadata, internal_metadata = load_public_and_internal_spectral_metadata(
+                    output_dir / "spectral_metadata.json"
+                )
+                with open(output_dir / "spectral_aggregation_report.json", "r", encoding="utf-8") as f:
+                    aggregation_report = json.load(f)
+                with open(output_dir / "dataset_reference_report.json", "r", encoding="utf-8") as f:
+                    dataset_report = json.load(f)
+
+                expected_rows: list[np.ndarray] = []
+                expected_feature_names: list[str] | None = None
+                for row_idx in range(features.shape[0]):
+                    expected_row, expected_names = _locally_aggregate_feature_row(
+                        values=np.asarray(features[row_idx], dtype=np.float32),
+                        feature_names=source_feature_names,
+                        operator=operator,
+                        requested_features=["energy", "stable_rank"],
+                        spectral_qv_sum_mode="append",
+                    )
+                    expected_rows.append(expected_row)
+                    expected_feature_names = list(expected_names)
+
+                expected_matrix = np.vstack(expected_rows)
+                np.testing.assert_allclose(aggregated_features, expected_matrix, rtol=1e-6, atol=1e-6)
+                self.assertEqual(
+                    [str(x) for x in internal_metadata["feature_names"]],
+                    expected_feature_names,
+                )
+                self.assertEqual(public_metadata["representation_kind"], "architecture_independent_aggregation")
+                self.assertEqual(public_metadata["aggregation_operator"], operator)
+                self.assertEqual(public_metadata["aggregation_grouping"], "role_feature")
+                self.assertEqual(
+                    [str(x) for x in internal_metadata["block_names"]],
+                    ["role.q", "role.v", "role.qv_sum"],
+                )
+                self.assertEqual(aggregation_report["aggregation_operator"], operator)
+                self.assertEqual(dataset_report["artifact_kind"], "aggregate_features")
+                self.assertEqual(int(dataset_report["artifact_model_count"]), len(model_names))
+
+    def test_util_aggregate_features_avg_equal_weights_structural_groups(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = make_tiny_t5_encoder_decoder_adapter_dataset(tmp_path, out_dim=4)
+            manifest = tmp_path / "encdec_manifest.json"
+            entries = [str((data_dir / "tiny_t5_encdec_label0_0").resolve())]
+            write_path_manifest(manifest, entries)
+
+            items = parse_single_manifest_json(
+                manifest_path=manifest,
+                dataset_root=tmp_path,
+                section_key="path",
+            )
+            features, labels, model_names, metadata = extract_spectral_features(
+                items=items,
+                spectral_features=["energy"],
+                spectral_qv_sum_mode="append",
+                sv_top_k=1,
+                block_size=64,
+                dtype=np.float32,
+            )
+
+            source_feature_names = [str(x) for x in metadata["feature_names"]]
+            q_energy_indices = [
+                idx
+                for idx, feature_name in enumerate(source_feature_names)
+                if feature_name.endswith(".energy") and _test_role_bucket_for_feature_name(feature_name) == "q"
+            ]
+            self.assertEqual(len(q_energy_indices), 3)
+
+            crafted_features = np.zeros_like(features, dtype=np.float32)
+            for col_idx, feature_name in enumerate(source_feature_names):
+                if feature_name == "encoder.block0.layer0.SelfAttention.q.energy":
+                    crafted_features[0, col_idx] = np.float32(1.0)
+                elif feature_name == "decoder.block0.layer0.SelfAttention.q.energy":
+                    crafted_features[0, col_idx] = np.float32(10.0)
+                elif feature_name == "decoder.block0.layer1.EncDecAttention.q.energy":
+                    crafted_features[0, col_idx] = np.float32(100.0)
+
+            feature_root = tmp_path / "runs" / "feature_extract"
+            source_dir = feature_root / "encdec_source" / "merged"
+            write_merged_feature_artifacts(
+                source_dir,
+                features=crafted_features,
+                labels=labels,
+                model_names=model_names,
+                metadata=metadata,
+            )
+            write_dataset_reference_report(
+                default_dataset_reference_report_path(source_dir),
+                build_dataset_reference_payload_from_items(
+                    items=items,
+                    artifact_kind="merge_spectral_shards",
+                    manifest_json=manifest,
+                    dataset_root=tmp_path,
+                    artifact_model_count=len(model_names),
+                    source_artifacts=[str(manifest)],
+                ),
+            )
+
+            output_dir = feature_root / "encdec_avg" / "merged"
+            proc = run_cli(
+                [
+                    "util",
+                    "aggregate-features",
+                    "--feature-file",
+                    "encdec_source",
+                    "--output-filename",
+                    "encdec_avg",
+                    "--feature-root",
+                    str(feature_root),
+                    "--operator",
+                    "avg",
+                    "--features",
+                    "energy",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr + proc.stdout)
+
+            aggregated_features = np.asarray(np.load(output_dir / "spectral_features.npy"), dtype=np.float32)
+            public_metadata, internal_metadata = load_public_and_internal_spectral_metadata(
+                output_dir / "spectral_metadata.json"
+            )
+            with open(output_dir / "spectral_aggregation_report.json", "r", encoding="utf-8") as f:
+                aggregation_report = json.load(f)
+
+            expected_row, expected_feature_names = _locally_aggregate_feature_row(
+                values=np.asarray(crafted_features[0], dtype=np.float32),
+                feature_names=source_feature_names,
+                operator="avg",
+                requested_features=["energy"],
+                spectral_qv_sum_mode="append",
+            )
+            np.testing.assert_allclose(aggregated_features[0], expected_row, rtol=1e-6, atol=1e-6)
+            self.assertEqual([str(x) for x in internal_metadata["feature_names"]], expected_feature_names)
+            self.assertEqual(public_metadata["aggregation_avg_semantics"], "mean_of_structural_group_means")
+            self.assertEqual(aggregation_report["aggregation_avg_semantics"], "mean_of_structural_group_means")
+
+            q_energy_output_idx = expected_feature_names.index("role.q.energy")
+            structural_group_avg = float(aggregated_features[0, q_energy_output_idx])
+            flat_average = float(np.mean(crafted_features[0, np.asarray(q_energy_indices, dtype=np.int64)]))
+            self.assertAlmostEqual(structural_group_avg, 28.0, places=6)
+            self.assertAlmostEqual(flat_average, 37.0, places=6)
+            self.assertNotAlmostEqual(structural_group_avg, flat_average, places=6)
+
+    def test_util_aggregate_features_is_provenance_aware_on_mixed_architecture_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle = build_tiny_multi_arch_provenance_merge_bundle(tmp_path)
+            feature_root = bundle["feature_root"]
+            output_dir = feature_root / "mixed_arch_aggregated" / "merged"
+
+            proc = run_cli(
+                [
+                    "util",
+                    "aggregate-features",
+                    "--feature-file",
+                    "merged_all",
+                    "--output-filename",
+                    "mixed_arch_aggregated",
+                    "--feature-root",
+                    str(feature_root),
+                    "--operator",
+                    "avg",
+                    "--features",
+                    "energy",
+                    "stable_rank",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr + proc.stdout)
+
+            aggregated_features = np.asarray(np.load(output_dir / "spectral_features.npy"), dtype=np.float32)
+            with open(output_dir / "spectral_model_names.json", "r", encoding="utf-8") as f:
+                aggregated_model_names = [str(x) for x in json.load(f)]
+            _, aggregated_metadata = load_public_and_internal_spectral_metadata(
+                output_dir / "spectral_metadata.json"
+            )
+            with open(output_dir / "spectral_aggregation_report.json", "r", encoding="utf-8") as f:
+                aggregation_report = json.load(f)
+
+            expected_rows: list[np.ndarray] = []
+            expected_feature_names: list[str] | None = None
+            aggregated_feature_names = [str(x) for x in aggregated_metadata["feature_names"]]
+            for model_name in aggregated_model_names:
+                leaf_row = bundle["per_model_leaf_rows"][model_name]
+                expected_row, expected_names = _locally_aggregate_feature_row(
+                    values=np.asarray(leaf_row["values"], dtype=np.float32),
+                    feature_names=[str(x) for x in leaf_row["feature_names"]],
+                    operator="avg",
+                    requested_features=["energy", "stable_rank"],
+                    spectral_qv_sum_mode="append",
+                    output_feature_names=aggregated_feature_names,
+                )
+                expected_rows.append(expected_row)
+                expected_feature_names = list(expected_names)
+
+            expected_matrix = np.vstack(expected_rows)
+            np.testing.assert_allclose(aggregated_features, expected_matrix, rtol=1e-6, atol=1e-6)
+            self.assertEqual([str(x) for x in aggregated_metadata["feature_names"]], expected_feature_names)
+            self.assertEqual(
+                [str(x) for x in aggregated_metadata["block_names"]],
+                ["role.q", "role.v", "role.qv_sum", "role.other"],
+            )
+            self.assertIn("role.other.energy", [str(x) for x in aggregated_metadata["feature_names"]])
+            self.assertGreater(int(aggregation_report["stats"]["empty_fill_total"]), 0)
+            self.assertEqual(
+                aggregation_report["selection"]["role_buckets"],
+                ["q", "v", "qv_sum", "other"],
+            )
+            self.assertEqual(len(aggregation_report["selection"]["selected_source_feature_files"]), 4)
+
+            qv_only_dir = feature_root / "mixed_arch_qv_only" / "merged"
+            qv_only_proc = run_cli(
+                [
+                    "util",
+                    "aggregate-features",
+                    "--feature-file",
+                    "merged_all",
+                    "--output-filename",
+                    "mixed_arch_qv_only",
+                    "--feature-root",
+                    str(feature_root),
+                    "--operator",
+                    "avg",
+                    "--features",
+                    "energy",
+                    "--spectral-qv-sum-mode",
+                    "only",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if qv_only_proc.returncode != 0:
+                self.fail(qv_only_proc.stderr + qv_only_proc.stdout)
+
+            qv_only_features = np.asarray(np.load(qv_only_dir / "spectral_features.npy"), dtype=np.float32)
+            with open(qv_only_dir / "spectral_model_names.json", "r", encoding="utf-8") as f:
+                qv_only_model_names = [str(x) for x in json.load(f)]
+            _, qv_only_metadata = load_public_and_internal_spectral_metadata(
+                qv_only_dir / "spectral_metadata.json"
+            )
+
+            expected_qv_rows: list[np.ndarray] = []
+            expected_qv_feature_names: list[str] | None = None
+            qv_only_output_feature_names = [str(x) for x in qv_only_metadata["feature_names"]]
+            for model_name in qv_only_model_names:
+                leaf_row = bundle["per_model_leaf_rows"][model_name]
+                expected_row, expected_names = _locally_aggregate_feature_row(
+                    values=np.asarray(leaf_row["values"], dtype=np.float32),
+                    feature_names=[str(x) for x in leaf_row["feature_names"]],
+                    operator="avg",
+                    requested_features=["energy"],
+                    spectral_qv_sum_mode="only",
+                    output_feature_names=qv_only_output_feature_names,
+                )
+                expected_qv_rows.append(expected_row)
+                expected_qv_feature_names = list(expected_names)
+
+            np.testing.assert_allclose(
+                qv_only_features,
+                np.vstack(expected_qv_rows),
+                rtol=1e-6,
+                atol=1e-6,
+            )
+            self.assertEqual(
+                [str(x) for x in qv_only_metadata["feature_names"]],
+                expected_qv_feature_names,
+            )
+            self.assertEqual([str(x) for x in qv_only_metadata["block_names"]], ["role.qv_sum"])
+
+    def test_supervised_runs_on_aggregated_mixed_architecture_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle = build_tiny_multi_arch_provenance_merge_bundle(tmp_path)
+            feature_root = bundle["feature_root"]
+            aggregated_output_dir = feature_root / "mixed_arch_supervised_ready" / "merged"
+
+            aggregate_proc = run_cli(
+                [
+                    "util",
+                    "aggregate-features",
+                    "--feature-file",
+                    "merged_all",
+                    "--output-filename",
+                    "mixed_arch_supervised_ready",
+                    "--feature-root",
+                    str(feature_root),
+                    "--operator",
+                    "avg",
+                    "--features",
+                    "energy",
+                    "stable_rank",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if aggregate_proc.returncode != 0:
+                self.fail(aggregate_proc.stderr + aggregate_proc.stdout)
+
+            manifest = tmp_path / "mixed_arch_supervised_manifest.json"
+            write_path_manifest(manifest, [str(entry) for entry in bundle["manifest_entries"]])
+
+            runs_root = tmp_path / "runs"
+            run_id = "supervised_aggregated_mixed_arch"
+            proc = run_cli(
+                [
+                    "run",
+                    "supervised",
+                    "--manifest-json",
+                    str(manifest),
+                    "--dataset-root",
+                    str(tmp_path),
+                    "--output-root",
+                    str(runs_root),
+                    "--run-id",
+                    run_id,
+                    "--model",
+                    "logistic_regression",
+                    "--features",
+                    "energy",
+                    "stable_rank",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                    "--feature-file",
+                    str(aggregated_output_dir / "spectral_features.npy"),
+                    "--cv-folds",
+                    "2",
+                    "--n-jobs",
+                    "1",
+                    "--tuning-executor",
+                    "local",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr + proc.stdout)
+
+            run_dir = runs_root / "supervised" / run_id
+            report_path = run_dir / "reports" / "supervised_report.json"
+            tuning_manifest_path = run_dir / "reports" / "tuning_manifest.json"
+            self.assertTrue(report_path.exists())
+            self.assertTrue(tuning_manifest_path.exists())
+            self.assertFalse((run_dir / "features" / "spectral_features.npy").exists())
+
+            with open(report_path, "r", encoding="utf-8") as f:
+                report = json.load(f)
+            with open(tuning_manifest_path, "r", encoding="utf-8") as f:
+                tuning_manifest = json.load(f)
+
+            self.assertEqual(
+                report["representation"]["extractor_metadata"]["representation_kind"],
+                "architecture_independent_aggregation",
+            )
+            self.assertTrue(bool(report["representation"]["extractor_metadata"]["loaded_external_features"]))
+            self.assertEqual(tuning_manifest["data"]["feature_loading_mode"], "external_source")
+            self.assertEqual(
+                tuning_manifest["extractor"]["metadata"]["representation_kind"],
+                "architecture_independent_aggregation",
+            )
 
     def test_spectral_rejects_removed_frobenius_feature(self):
         with tempfile.TemporaryDirectory() as tmp:

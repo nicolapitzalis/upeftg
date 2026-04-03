@@ -9,7 +9,17 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -n "${REPO_ROOT:-}" ]]; then
+  REPO_ROOT="$(cd "${REPO_ROOT}" && pwd -P)"
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/upeftguard/cli.py" ]]; then
+  REPO_ROOT="$(cd "${SLURM_SUBMIT_DIR}" && pwd -P)"
+else
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+fi
+if [[ ! -f "${REPO_ROOT}/upeftguard/cli.py" ]]; then
+  echo "Could not resolve repository root: ${REPO_ROOT}" >&2
+  exit 1
+fi
 cd "${REPO_ROOT}"
 
 CONDA_SH=${CONDA_SH:-/home/n.pitzalis/miniconda3/etc/profile.d/conda.sh}
@@ -30,7 +40,7 @@ PY
 )
 RUN_ID=${RUN_ID:-$(basename "${RUN_DIR}")}
 SLURM_PARTITION=${SLURM_PARTITION:-extra}
-SLURM_LOG_DIR=${SLURM_LOG_DIR:-logs}
+SLURM_LOG_DIR=${SLURM_LOG_DIR:-${REPO_ROOT}/logs}
 SCORE_PERCENTILES=${SCORE_PERCENTILES:-}
 
 mkdir -p "${SLURM_LOG_DIR}"

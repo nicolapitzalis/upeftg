@@ -9,7 +9,17 @@
 
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -n "${REPO_ROOT:-}" ]]; then
+  REPO_ROOT="$(cd "${REPO_ROOT}" && pwd -P)"
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/upeftguard/cli.py" ]]; then
+  REPO_ROOT="$(cd "${SLURM_SUBMIT_DIR}" && pwd -P)"
+else
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+fi
+if [[ ! -f "${REPO_ROOT}/upeftguard/cli.py" ]]; then
+  echo "Could not resolve repository root: ${REPO_ROOT}" >&2
+  exit 1
+fi
 cd "${REPO_ROOT}"
 
 CONDA_SH=${CONDA_SH:-/home/n.pitzalis/miniconda3/etc/profile.d/conda.sh}
@@ -40,7 +50,7 @@ PIPELINE_START_EPOCH_SECONDS=${PIPELINE_START_EPOCH_SECONDS:-$(date -u +%s)}
 SLURM_PARTITION=${SLURM_PARTITION:-extra}
 SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-8}
 SLURM_MAX_CONCURRENT=${SLURM_MAX_CONCURRENT:-8}
-SLURM_LOG_DIR=${SLURM_LOG_DIR:-logs}
+SLURM_LOG_DIR=${SLURM_LOG_DIR:-${REPO_ROOT}/logs}
 
 read -r -a FEATURE_VALUES <<< "${FEATURES}"
 if [[ "${#FEATURE_VALUES[@]}" -eq 0 ]]; then

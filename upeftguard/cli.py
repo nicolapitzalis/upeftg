@@ -29,6 +29,7 @@ from .utilities.artifacts.dataset_references import (
     default_dataset_reference_report_path,
     write_dataset_reference_report,
 )
+from .utilities.artifacts.aggregate_features import aggregate_features
 from .utilities.artifacts.export_feature_subset import export_feature_subset
 from .utilities.core.manifest import parse_single_manifest_json, resolve_manifest_path
 from .utilities.core.paths import default_dataset_root, dataset_root_help
@@ -301,6 +302,27 @@ def _cmd_run_supervised(args: argparse.Namespace) -> int:
         print("Next steps:")
         for step in result["next_steps"]:
             print(f"- {step}")
+    return 0
+
+
+def _cmd_util_aggregate_features(args: argparse.Namespace) -> int:
+    outputs = aggregate_features(
+        feature_file=args.feature_file,
+        output_filename=args.output_filename,
+        feature_root=args.feature_root,
+        operator=args.operator,
+        features=args.features,
+        spectral_qv_sum_mode=args.spectral_qv_sum_mode,
+    )
+
+    print("Feature aggregation complete")
+    print(f"Feature file: {outputs['feature_path']}")
+    print(f"Model names: {outputs['model_names_path']}")
+    if outputs["labels_path"] is not None:
+        print(f"Labels: {outputs['labels_path']}")
+    print(f"Metadata: {outputs['metadata_path']}")
+    print(f"Dataset references: {outputs['dataset_reference_report_path']}")
+    print(f"Aggregation report: {outputs['aggregation_report_path']}")
     return 0
 
 
@@ -912,6 +934,53 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     export_feature_subset.set_defaults(func=_cmd_util_export_feature_subset)
+
+    aggregate_feature_bundle = util_sub.add_parser(
+        "aggregate-features",
+        help="Aggregate a spectral feature file into an architecture-independent bundle",
+    )
+    aggregate_feature_bundle.add_argument(
+        "--feature-file",
+        type=Path,
+        required=True,
+        help="Input run name or explicit spectral feature .npy file",
+    )
+    aggregate_feature_bundle.add_argument(
+        "--output-filename",
+        type=Path,
+        required=True,
+        help="Output run name or explicit output feature matrix path (.npy)",
+    )
+    aggregate_feature_bundle.add_argument(
+        "--operator",
+        choices=["avg", "max", "min"],
+        required=True,
+        help="Aggregation operator applied over each role-feature group",
+    )
+    aggregate_feature_bundle.add_argument(
+        "--feature-root",
+        type=Path,
+        default=Path("runs") / "feature_extract",
+        help="Base directory used to resolve bare feature run names (default: runs/feature_extract)",
+    )
+    aggregate_feature_bundle.add_argument(
+        "--features",
+        "--columns",
+        dest="features",
+        nargs="+",
+        default=None,
+        help=(
+            "Spectral feature groups to keep before aggregation; "
+            "omit or pass 'all' to aggregate every available feature family"
+        ),
+    )
+    aggregate_feature_bundle.add_argument(
+        "--spectral-qv-sum-mode",
+        choices=["none", "append", "only"],
+        default="append",
+        help="Which q+v-sum columns to keep before aggregation",
+    )
+    aggregate_feature_bundle.set_defaults(func=_cmd_util_aggregate_features)
 
     download = util_sub.add_parser("download-dataset", help="Download PADBench subsets")
     download.add_argument("download_args", nargs=argparse.REMAINDER)

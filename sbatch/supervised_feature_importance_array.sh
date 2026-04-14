@@ -101,6 +101,25 @@ python -m upeftguard.cli run supervised \
 
 WINNER_EXPORT_MANIFEST="${RUN_DIR}/reports/winner_feature_weights_manifest.json"
 if [[ ! -f "${WINNER_EXPORT_MANIFEST}" ]]; then
+  RUN_CONFIG_PATH="${RUN_DIR}/run_config.json"
+  RUN_WINNER_EXPORT_MODE=""
+  if [[ -f "${RUN_CONFIG_PATH}" ]]; then
+    RUN_WINNER_EXPORT_MODE=$(python - <<PY
+import json
+from pathlib import Path
+
+payload = json.loads(Path("${RUN_CONFIG_PATH}").read_text(encoding="utf-8"))
+print(str(payload.get("winner_feature_weights_mode", "")))
+PY
+)
+  fi
+  if [[ "${RUN_WINNER_EXPORT_MODE}" == "skipped" || "${RUN_WINNER_EXPORT_MODE}" == "unsupported_for_backend" ]]; then
+    echo "Run dir: ${RUN_DIR}"
+    echo "Run id: ${RUN_ID}"
+    echo "Winner feature export mode: ${RUN_WINNER_EXPORT_MODE}"
+    echo "Finalize merge: completed in launcher job"
+    exit 0
+  fi
   echo "Missing winner feature export manifest: ${WINNER_EXPORT_MANIFEST}" >&2
   exit 1
 fi

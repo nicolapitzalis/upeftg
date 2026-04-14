@@ -11,6 +11,7 @@ data
 logs/
 runs/
 *.log
+manifests/
 
 # Generated artifacts
 *_results*/

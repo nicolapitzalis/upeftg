@@ -37,6 +37,20 @@ class SummarySuite:
     winner_summary_filename_template: str
     universal_filename: str
     required: bool = False
+    run_subdir: tuple[str, ...] = ()
+    summary_subdir: tuple[str, ...] = ("summaries",)
+
+
+@dataclass(frozen=True)
+class ZeroShotMarkdownSpec:
+    title: str
+    family_slug: str
+    summary_subdir: tuple[str, ...]
+
+
+LEAVE_ONE_OUT_MANIFEST_GLOB = "holdout_*.json"
+LEAVE_ONE_OUT_MANIFEST_PREFIX = "holdout_"
+LEAVE_ONE_OUT_DATASET_LABEL = "all eligible datasets leave-one-out cnn"
 
 
 RUN_SPECS = [
@@ -74,100 +88,238 @@ LLAMA2_7B_TBH_PEFT_METHOD_RUN_SPECS = [
 ]
 
 LLAMA2_7B_TBH_ZERO_SHOT_RANK_RUN_SPECS = [
-    RunSpec("llama2_7b tbh zero-shot from rank 256", "rank 8", "llama2_7b_tbh_zero_shot_r256_to_rank8"),
-    RunSpec("llama2_7b tbh zero-shot from rank 256", "rank 16", "llama2_7b_tbh_zero_shot_r256_to_rank16"),
-    RunSpec("llama2_7b tbh zero-shot from rank 256", "rank 32", "llama2_7b_tbh_zero_shot_r256_to_rank32"),
-    RunSpec("llama2_7b tbh zero-shot from rank 256", "rank 64", "llama2_7b_tbh_zero_shot_r256_to_rank64"),
-    RunSpec("llama2_7b tbh zero-shot from rank 256", "rank 128", "llama2_7b_tbh_zero_shot_r256_to_rank128"),
-    RunSpec("llama2_7b tbh zero-shot from rank 256", "rank 512", "llama2_7b_tbh_zero_shot_r256_to_rank512"),
-    RunSpec("llama2_7b tbh zero-shot from rank 256", "rank 1024", "llama2_7b_tbh_zero_shot_r256_to_rank1024"),
-    RunSpec("llama2_7b tbh zero-shot from rank 256", "rank 2048", "llama2_7b_tbh_zero_shot_r256_to_rank2048"),
+    RunSpec(
+        "llama2_7b tbh zero-shot legacy from rank 256",
+        "rank 8",
+        "llama2_7b_tbh_zero_shot_legacy_r256_to_rank8",
+    ),
+    RunSpec(
+        "llama2_7b tbh zero-shot legacy from rank 256",
+        "rank 16",
+        "llama2_7b_tbh_zero_shot_legacy_r256_to_rank16",
+    ),
+    RunSpec(
+        "llama2_7b tbh zero-shot legacy from rank 256",
+        "rank 32",
+        "llama2_7b_tbh_zero_shot_legacy_r256_to_rank32",
+    ),
+    RunSpec(
+        "llama2_7b tbh zero-shot legacy from rank 256",
+        "rank 64",
+        "llama2_7b_tbh_zero_shot_legacy_r256_to_rank64",
+    ),
+    RunSpec(
+        "llama2_7b tbh zero-shot legacy from rank 256",
+        "rank 128",
+        "llama2_7b_tbh_zero_shot_legacy_r256_to_rank128",
+    ),
+    RunSpec(
+        "llama2_7b tbh zero-shot legacy from rank 256",
+        "rank 512",
+        "llama2_7b_tbh_zero_shot_legacy_r256_to_rank512",
+    ),
+    RunSpec(
+        "llama2_7b tbh zero-shot legacy from rank 256",
+        "rank 1024",
+        "llama2_7b_tbh_zero_shot_legacy_r256_to_rank1024",
+    ),
+    RunSpec(
+        "llama2_7b tbh zero-shot legacy from rank 256",
+        "rank 2048",
+        "llama2_7b_tbh_zero_shot_legacy_r256_to_rank2048",
+    ),
+]
+
+LLAMA2_7B_TBH_ZERO_SHOT_CNN_RANK_RUN_SPECS = [
+    RunSpec("llama2_7b tbh zero-shot cnn from rank 256", "rank 8", "llama2_7b_tbh_zero_shot_cnn_r256_to_rank8"),
+    RunSpec("llama2_7b tbh zero-shot cnn from rank 256", "rank 16", "llama2_7b_tbh_zero_shot_cnn_r256_to_rank16"),
+    RunSpec("llama2_7b tbh zero-shot cnn from rank 256", "rank 32", "llama2_7b_tbh_zero_shot_cnn_r256_to_rank32"),
+    RunSpec("llama2_7b tbh zero-shot cnn from rank 256", "rank 64", "llama2_7b_tbh_zero_shot_cnn_r256_to_rank64"),
+    RunSpec("llama2_7b tbh zero-shot cnn from rank 256", "rank 128", "llama2_7b_tbh_zero_shot_cnn_r256_to_rank128"),
+    RunSpec("llama2_7b tbh zero-shot cnn from rank 256", "rank 512", "llama2_7b_tbh_zero_shot_cnn_r256_to_rank512"),
+    RunSpec("llama2_7b tbh zero-shot cnn from rank 256", "rank 1024", "llama2_7b_tbh_zero_shot_cnn_r256_to_rank1024"),
+    RunSpec("llama2_7b tbh zero-shot cnn from rank 256", "rank 2048", "llama2_7b_tbh_zero_shot_cnn_r256_to_rank2048"),
 ]
 
 LLAMA2_7B_TBH_ZERO_SHOT_ADAPTER_RUN_SPECS = [
-    RunSpec("llama2_7b tbh zero-shot from lora", "dora", "llama2_7b_tbh_zero_shot_lora_to_dora"),
     RunSpec(
-        "llama2_7b tbh zero-shot from lora",
-        "lora+",
-        "llama2_7b_tbh_zero_shot_lora_to_lora_plus",
+        "llama2_7b tbh zero-shot legacy from lora",
+        "dora",
+        "llama2_7b_tbh_zero_shot_legacy_lora_to_dora",
     ),
-    RunSpec("llama2_7b tbh zero-shot from lora", "qlora", "llama2_7b_tbh_zero_shot_lora_to_qlora"),
     RunSpec(
-        "llama2_7b tbh zero-shot from lora",
+        "llama2_7b tbh zero-shot legacy from lora",
+        "lora+",
+        "llama2_7b_tbh_zero_shot_legacy_lora_to_lora_plus",
+    ),
+    RunSpec(
+        "llama2_7b tbh zero-shot legacy from lora",
+        "qlora",
+        "llama2_7b_tbh_zero_shot_legacy_lora_to_qlora",
+    ),
+    RunSpec(
+        "llama2_7b tbh zero-shot legacy from lora",
         "adalora",
-        "llama2_7b_tbh_zero_shot_lora_to_adalora",
+        "llama2_7b_tbh_zero_shot_legacy_lora_to_adalora",
+    ),
+]
+
+LLAMA2_7B_TBH_ZERO_SHOT_CNN_ADAPTER_RUN_SPECS = [
+    RunSpec("llama2_7b tbh zero-shot cnn from lora", "dora", "llama2_7b_tbh_zero_shot_cnn_lora_to_dora"),
+    RunSpec(
+        "llama2_7b tbh zero-shot cnn from lora",
+        "lora+",
+        "llama2_7b_tbh_zero_shot_cnn_lora_to_lora_plus",
+    ),
+    RunSpec("llama2_7b tbh zero-shot cnn from lora", "qlora", "llama2_7b_tbh_zero_shot_cnn_lora_to_qlora"),
+    RunSpec(
+        "llama2_7b tbh zero-shot cnn from lora",
+        "adalora",
+        "llama2_7b_tbh_zero_shot_cnn_lora_to_adalora",
     ),
 ]
 
 LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_INSERTSENT_RUN_SPECS = [
     RunSpec(
-        "llama2_7b ag_news/imdb zero-shot from insertsent",
+        "llama2_7b ag_news/imdb zero-shot legacy from insertsent",
         "ripple",
-        "llama2_7b_ag_news_imdb_zero_shot_insertsent_to_ripple",
+        "llama2_7b_ag_news_imdb_zero_shot_legacy_insertsent_to_ripple",
     ),
     RunSpec(
-        "llama2_7b ag_news/imdb zero-shot from insertsent",
+        "llama2_7b ag_news/imdb zero-shot legacy from insertsent",
         "stybkd",
-        "llama2_7b_ag_news_imdb_zero_shot_insertsent_to_stybkd",
+        "llama2_7b_ag_news_imdb_zero_shot_legacy_insertsent_to_stybkd",
     ),
     RunSpec(
-        "llama2_7b ag_news/imdb zero-shot from insertsent",
+        "llama2_7b ag_news/imdb zero-shot legacy from insertsent",
         "syntactic",
-        "llama2_7b_ag_news_imdb_zero_shot_insertsent_to_syntactic",
+        "llama2_7b_ag_news_imdb_zero_shot_legacy_insertsent_to_syntactic",
+    ),
+]
+
+LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_CNN_INSERTSENT_RUN_SPECS = [
+    RunSpec(
+        "llama2_7b ag_news/imdb zero-shot cnn from insertsent",
+        "ripple",
+        "llama2_7b_ag_news_imdb_zero_shot_cnn_insertsent_to_ripple",
+    ),
+    RunSpec(
+        "llama2_7b ag_news/imdb zero-shot cnn from insertsent",
+        "stybkd",
+        "llama2_7b_ag_news_imdb_zero_shot_cnn_insertsent_to_stybkd",
+    ),
+    RunSpec(
+        "llama2_7b ag_news/imdb zero-shot cnn from insertsent",
+        "syntactic",
+        "llama2_7b_ag_news_imdb_zero_shot_cnn_insertsent_to_syntactic",
     ),
 ]
 
 LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_RIPPLE_RUN_SPECS = [
     RunSpec(
-        "llama2_7b ag_news/imdb zero-shot from ripple",
+        "llama2_7b ag_news/imdb zero-shot legacy from ripple",
         "insertsent",
-        "llama2_7b_ag_news_imdb_zero_shot_ripple_to_insertsent",
+        "llama2_7b_ag_news_imdb_zero_shot_legacy_ripple_to_insertsent",
     ),
     RunSpec(
-        "llama2_7b ag_news/imdb zero-shot from ripple",
+        "llama2_7b ag_news/imdb zero-shot legacy from ripple",
         "stybkd",
-        "llama2_7b_ag_news_imdb_zero_shot_ripple_to_stybkd",
+        "llama2_7b_ag_news_imdb_zero_shot_legacy_ripple_to_stybkd",
     ),
     RunSpec(
-        "llama2_7b ag_news/imdb zero-shot from ripple",
+        "llama2_7b ag_news/imdb zero-shot legacy from ripple",
         "syntactic",
-        "llama2_7b_ag_news_imdb_zero_shot_ripple_to_syntactic",
+        "llama2_7b_ag_news_imdb_zero_shot_legacy_ripple_to_syntactic",
+    ),
+]
+
+LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_CNN_RIPPLE_RUN_SPECS = [
+    RunSpec(
+        "llama2_7b ag_news/imdb zero-shot cnn from ripple",
+        "insertsent",
+        "llama2_7b_ag_news_imdb_zero_shot_cnn_ripple_to_insertsent",
+    ),
+    RunSpec(
+        "llama2_7b ag_news/imdb zero-shot cnn from ripple",
+        "stybkd",
+        "llama2_7b_ag_news_imdb_zero_shot_cnn_ripple_to_stybkd",
+    ),
+    RunSpec(
+        "llama2_7b ag_news/imdb zero-shot cnn from ripple",
+        "syntactic",
+        "llama2_7b_ag_news_imdb_zero_shot_cnn_ripple_to_syntactic",
     ),
 ]
 
 LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_STYBKD_RUN_SPECS = [
     RunSpec(
-        "llama2_7b ag_news/imdb zero-shot from stybkd",
+        "llama2_7b ag_news/imdb zero-shot legacy from stybkd",
         "insertsent",
-        "llama2_7b_ag_news_imdb_zero_shot_stybkd_to_insertsent",
+        "llama2_7b_ag_news_imdb_zero_shot_legacy_stybkd_to_insertsent",
     ),
     RunSpec(
-        "llama2_7b ag_news/imdb zero-shot from stybkd",
+        "llama2_7b ag_news/imdb zero-shot legacy from stybkd",
         "ripple",
-        "llama2_7b_ag_news_imdb_zero_shot_stybkd_to_ripple",
+        "llama2_7b_ag_news_imdb_zero_shot_legacy_stybkd_to_ripple",
     ),
     RunSpec(
-        "llama2_7b ag_news/imdb zero-shot from stybkd",
+        "llama2_7b ag_news/imdb zero-shot legacy from stybkd",
         "syntactic",
-        "llama2_7b_ag_news_imdb_zero_shot_stybkd_to_syntactic",
+        "llama2_7b_ag_news_imdb_zero_shot_legacy_stybkd_to_syntactic",
+    ),
+]
+
+LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_CNN_STYBKD_RUN_SPECS = [
+    RunSpec(
+        "llama2_7b ag_news/imdb zero-shot cnn from stybkd",
+        "insertsent",
+        "llama2_7b_ag_news_imdb_zero_shot_cnn_stybkd_to_insertsent",
+    ),
+    RunSpec(
+        "llama2_7b ag_news/imdb zero-shot cnn from stybkd",
+        "ripple",
+        "llama2_7b_ag_news_imdb_zero_shot_cnn_stybkd_to_ripple",
+    ),
+    RunSpec(
+        "llama2_7b ag_news/imdb zero-shot cnn from stybkd",
+        "syntactic",
+        "llama2_7b_ag_news_imdb_zero_shot_cnn_stybkd_to_syntactic",
     ),
 ]
 
 LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_SYNTACTIC_RUN_SPECS = [
     RunSpec(
-        "llama2_7b ag_news/imdb zero-shot from syntactic",
+        "llama2_7b ag_news/imdb zero-shot legacy from syntactic",
         "insertsent",
-        "llama2_7b_ag_news_imdb_zero_shot_syntactic_to_insertsent",
+        "llama2_7b_ag_news_imdb_zero_shot_legacy_syntactic_to_insertsent",
     ),
     RunSpec(
-        "llama2_7b ag_news/imdb zero-shot from syntactic",
+        "llama2_7b ag_news/imdb zero-shot legacy from syntactic",
         "ripple",
-        "llama2_7b_ag_news_imdb_zero_shot_syntactic_to_ripple",
+        "llama2_7b_ag_news_imdb_zero_shot_legacy_syntactic_to_ripple",
     ),
     RunSpec(
-        "llama2_7b ag_news/imdb zero-shot from syntactic",
+        "llama2_7b ag_news/imdb zero-shot legacy from syntactic",
         "stybkd",
-        "llama2_7b_ag_news_imdb_zero_shot_syntactic_to_stybkd",
+        "llama2_7b_ag_news_imdb_zero_shot_legacy_syntactic_to_stybkd",
+    ),
+]
+
+LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_CNN_SYNTACTIC_RUN_SPECS = [
+    RunSpec(
+        "llama2_7b ag_news/imdb zero-shot cnn from syntactic",
+        "insertsent",
+        "llama2_7b_ag_news_imdb_zero_shot_cnn_syntactic_to_insertsent",
+    ),
+    RunSpec(
+        "llama2_7b ag_news/imdb zero-shot cnn from syntactic",
+        "ripple",
+        "llama2_7b_ag_news_imdb_zero_shot_cnn_syntactic_to_ripple",
+    ),
+    RunSpec(
+        "llama2_7b ag_news/imdb zero-shot cnn from syntactic",
+        "stybkd",
+        "llama2_7b_ag_news_imdb_zero_shot_cnn_syntactic_to_stybkd",
     ),
 ]
 
@@ -179,6 +331,29 @@ ARCHITECTURE_RUN_SPECS = [
     RunSpec("imdb insertsent rank 16", "roberta_base", "roberta_base_architecture"),
     RunSpec("toxic backdoors hard rank 256", "llama2_7b", "llama2_7b_tbh_rank256"),
 ]
+
+
+def discover_leave_one_out_run_specs(repo_root: Path | None = None) -> tuple[RunSpec, ...]:
+    resolved_repo_root = (repo_root or Path(__file__).resolve().parents[1]).resolve()
+    manifest_dir = resolved_repo_root / "manifests" / "leave_one_out"
+    if not manifest_dir.exists():
+        return ()
+
+    run_specs: list[RunSpec] = []
+    for manifest_path in sorted(manifest_dir.glob(LEAVE_ONE_OUT_MANIFEST_GLOB)):
+        stem = manifest_path.stem
+        held_out_dataset = stem.removeprefix(LEAVE_ONE_OUT_MANIFEST_PREFIX)
+        run_specs.append(
+            RunSpec(
+                LEAVE_ONE_OUT_DATASET_LABEL,
+                held_out_dataset,
+                stem,
+            )
+        )
+    return tuple(run_specs)
+
+
+LEAVE_ONE_OUT_RUN_SPECS = discover_leave_one_out_run_specs()
 
 SUMMARY_SUITES = (
     SummarySuite(
@@ -207,60 +382,162 @@ SUMMARY_SUITES = (
         universal_filename="universal_config_tbh_peft_method_ranking_cv.csv",
     ),
     SummarySuite(
-        key="llama2_7b_tbh_zero_shot_ranks",
-        description="llama2_7b toxic backdoors hard zero-shot rank sweep from rank 256",
+        key="llama2_7b_tbh_zero_shot_legacy_ranks",
+        description="llama2_7b toxic backdoors hard zero-shot legacy rank sweep from rank 256",
         run_specs=tuple(LLAMA2_7B_TBH_ZERO_SHOT_RANK_RUN_SPECS),
-        summary_filename_template="backdoor_detection_tbh_zero_shot_rank_summary_fpr_{fpr_slug}.csv",
-        winner_summary_filename_template="backdoor_detection_tbh_zero_shot_rank_winner_summary_fpr_{fpr_slug}.csv",
-        universal_filename="universal_config_tbh_zero_shot_rank_ranking_cv.csv",
+        summary_filename_template="backdoor_detection_tbh_zero_shot_legacy_rank_summary_fpr_{fpr_slug}.csv",
+        winner_summary_filename_template=(
+            "backdoor_detection_tbh_zero_shot_legacy_rank_winner_summary_fpr_{fpr_slug}.csv"
+        ),
+        universal_filename="universal_config_tbh_zero_shot_legacy_rank_ranking_cv.csv",
+        run_subdir=("zero_shot_legacy",),
+        summary_subdir=("zero_shot_legacy", "summaries"),
     ),
     SummarySuite(
-        key="llama2_7b_tbh_zero_shot_adapters",
-        description="llama2_7b toxic backdoors hard zero-shot adapter sweep from lora",
+        key="llama2_7b_tbh_zero_shot_legacy_adapters",
+        description="llama2_7b toxic backdoors hard zero-shot legacy adapter sweep from lora",
         run_specs=tuple(LLAMA2_7B_TBH_ZERO_SHOT_ADAPTER_RUN_SPECS),
-        summary_filename_template="backdoor_detection_tbh_zero_shot_adapter_summary_fpr_{fpr_slug}.csv",
-        winner_summary_filename_template="backdoor_detection_tbh_zero_shot_adapter_winner_summary_fpr_{fpr_slug}.csv",
-        universal_filename="universal_config_tbh_zero_shot_adapter_ranking_cv.csv",
+        summary_filename_template="backdoor_detection_tbh_zero_shot_legacy_adapter_summary_fpr_{fpr_slug}.csv",
+        winner_summary_filename_template=(
+            "backdoor_detection_tbh_zero_shot_legacy_adapter_winner_summary_fpr_{fpr_slug}.csv"
+        ),
+        universal_filename="universal_config_tbh_zero_shot_legacy_adapter_ranking_cv.csv",
+        run_subdir=("zero_shot_legacy",),
+        summary_subdir=("zero_shot_legacy", "summaries"),
     ),
     SummarySuite(
-        key="llama2_7b_ag_news_imdb_zero_shot_insertsent",
-        description="llama2_7b ag_news/imdb zero-shot attack transfer sweep from insertsent",
+        key="llama2_7b_tbh_zero_shot_cnn_ranks",
+        description="llama2_7b toxic backdoors hard zero-shot cnn rank sweep from rank 256",
+        run_specs=tuple(LLAMA2_7B_TBH_ZERO_SHOT_CNN_RANK_RUN_SPECS),
+        summary_filename_template="backdoor_detection_tbh_zero_shot_cnn_rank_summary_fpr_{fpr_slug}.csv",
+        winner_summary_filename_template="backdoor_detection_tbh_zero_shot_cnn_rank_winner_summary_fpr_{fpr_slug}.csv",
+        universal_filename="universal_config_tbh_zero_shot_cnn_rank_ranking_cv.csv",
+        run_subdir=("zero_shot_cnn",),
+        summary_subdir=("zero_shot_cnn", "summaries"),
+    ),
+    SummarySuite(
+        key="llama2_7b_tbh_zero_shot_cnn_adapters",
+        description="llama2_7b toxic backdoors hard zero-shot cnn adapter sweep from lora",
+        run_specs=tuple(LLAMA2_7B_TBH_ZERO_SHOT_CNN_ADAPTER_RUN_SPECS),
+        summary_filename_template="backdoor_detection_tbh_zero_shot_cnn_adapter_summary_fpr_{fpr_slug}.csv",
+        winner_summary_filename_template="backdoor_detection_tbh_zero_shot_cnn_adapter_winner_summary_fpr_{fpr_slug}.csv",
+        universal_filename="universal_config_tbh_zero_shot_cnn_adapter_ranking_cv.csv",
+        run_subdir=("zero_shot_cnn",),
+        summary_subdir=("zero_shot_cnn", "summaries"),
+    ),
+    SummarySuite(
+        key="llama2_7b_ag_news_imdb_zero_shot_legacy_insertsent",
+        description="llama2_7b ag_news/imdb zero-shot legacy attack transfer sweep from insertsent",
         run_specs=tuple(LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_INSERTSENT_RUN_SPECS),
-        summary_filename_template="backdoor_detection_ag_news_imdb_zero_shot_insertsent_summary_fpr_{fpr_slug}.csv",
-        winner_summary_filename_template=(
-            "backdoor_detection_ag_news_imdb_zero_shot_insertsent_winner_summary_fpr_{fpr_slug}.csv"
+        summary_filename_template=(
+            "backdoor_detection_ag_news_imdb_zero_shot_legacy_insertsent_summary_fpr_{fpr_slug}.csv"
         ),
-        universal_filename="universal_config_ag_news_imdb_zero_shot_insertsent_ranking_cv.csv",
+        winner_summary_filename_template=(
+            "backdoor_detection_ag_news_imdb_zero_shot_legacy_insertsent_winner_summary_fpr_{fpr_slug}.csv"
+        ),
+        universal_filename="universal_config_ag_news_imdb_zero_shot_legacy_insertsent_ranking_cv.csv",
+        run_subdir=("zero_shot_legacy",),
+        summary_subdir=("zero_shot_legacy", "summaries"),
     ),
     SummarySuite(
-        key="llama2_7b_ag_news_imdb_zero_shot_ripple",
-        description="llama2_7b ag_news/imdb zero-shot attack transfer sweep from ripple",
+        key="llama2_7b_ag_news_imdb_zero_shot_legacy_ripple",
+        description="llama2_7b ag_news/imdb zero-shot legacy attack transfer sweep from ripple",
         run_specs=tuple(LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_RIPPLE_RUN_SPECS),
-        summary_filename_template="backdoor_detection_ag_news_imdb_zero_shot_ripple_summary_fpr_{fpr_slug}.csv",
-        winner_summary_filename_template=(
-            "backdoor_detection_ag_news_imdb_zero_shot_ripple_winner_summary_fpr_{fpr_slug}.csv"
+        summary_filename_template=(
+            "backdoor_detection_ag_news_imdb_zero_shot_legacy_ripple_summary_fpr_{fpr_slug}.csv"
         ),
-        universal_filename="universal_config_ag_news_imdb_zero_shot_ripple_ranking_cv.csv",
+        winner_summary_filename_template=(
+            "backdoor_detection_ag_news_imdb_zero_shot_legacy_ripple_winner_summary_fpr_{fpr_slug}.csv"
+        ),
+        universal_filename="universal_config_ag_news_imdb_zero_shot_legacy_ripple_ranking_cv.csv",
+        run_subdir=("zero_shot_legacy",),
+        summary_subdir=("zero_shot_legacy", "summaries"),
     ),
     SummarySuite(
-        key="llama2_7b_ag_news_imdb_zero_shot_stybkd",
-        description="llama2_7b ag_news/imdb zero-shot attack transfer sweep from stybkd",
+        key="llama2_7b_ag_news_imdb_zero_shot_legacy_stybkd",
+        description="llama2_7b ag_news/imdb zero-shot legacy attack transfer sweep from stybkd",
         run_specs=tuple(LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_STYBKD_RUN_SPECS),
-        summary_filename_template="backdoor_detection_ag_news_imdb_zero_shot_stybkd_summary_fpr_{fpr_slug}.csv",
-        winner_summary_filename_template=(
-            "backdoor_detection_ag_news_imdb_zero_shot_stybkd_winner_summary_fpr_{fpr_slug}.csv"
+        summary_filename_template=(
+            "backdoor_detection_ag_news_imdb_zero_shot_legacy_stybkd_summary_fpr_{fpr_slug}.csv"
         ),
-        universal_filename="universal_config_ag_news_imdb_zero_shot_stybkd_ranking_cv.csv",
+        winner_summary_filename_template=(
+            "backdoor_detection_ag_news_imdb_zero_shot_legacy_stybkd_winner_summary_fpr_{fpr_slug}.csv"
+        ),
+        universal_filename="universal_config_ag_news_imdb_zero_shot_legacy_stybkd_ranking_cv.csv",
+        run_subdir=("zero_shot_legacy",),
+        summary_subdir=("zero_shot_legacy", "summaries"),
     ),
     SummarySuite(
-        key="llama2_7b_ag_news_imdb_zero_shot_syntactic",
-        description="llama2_7b ag_news/imdb zero-shot attack transfer sweep from syntactic",
+        key="llama2_7b_ag_news_imdb_zero_shot_legacy_syntactic",
+        description="llama2_7b ag_news/imdb zero-shot legacy attack transfer sweep from syntactic",
         run_specs=tuple(LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_SYNTACTIC_RUN_SPECS),
-        summary_filename_template="backdoor_detection_ag_news_imdb_zero_shot_syntactic_summary_fpr_{fpr_slug}.csv",
-        winner_summary_filename_template=(
-            "backdoor_detection_ag_news_imdb_zero_shot_syntactic_winner_summary_fpr_{fpr_slug}.csv"
+        summary_filename_template=(
+            "backdoor_detection_ag_news_imdb_zero_shot_legacy_syntactic_summary_fpr_{fpr_slug}.csv"
         ),
-        universal_filename="universal_config_ag_news_imdb_zero_shot_syntactic_ranking_cv.csv",
+        winner_summary_filename_template=(
+            "backdoor_detection_ag_news_imdb_zero_shot_legacy_syntactic_winner_summary_fpr_{fpr_slug}.csv"
+        ),
+        universal_filename="universal_config_ag_news_imdb_zero_shot_legacy_syntactic_ranking_cv.csv",
+        run_subdir=("zero_shot_legacy",),
+        summary_subdir=("zero_shot_legacy", "summaries"),
+    ),
+    SummarySuite(
+        key="llama2_7b_ag_news_imdb_zero_shot_cnn_insertsent",
+        description="llama2_7b ag_news/imdb zero-shot cnn attack transfer sweep from insertsent",
+        run_specs=tuple(LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_CNN_INSERTSENT_RUN_SPECS),
+        summary_filename_template="backdoor_detection_ag_news_imdb_zero_shot_cnn_insertsent_summary_fpr_{fpr_slug}.csv",
+        winner_summary_filename_template=(
+            "backdoor_detection_ag_news_imdb_zero_shot_cnn_insertsent_winner_summary_fpr_{fpr_slug}.csv"
+        ),
+        universal_filename="universal_config_ag_news_imdb_zero_shot_cnn_insertsent_ranking_cv.csv",
+        run_subdir=("zero_shot_cnn",),
+        summary_subdir=("zero_shot_cnn", "summaries"),
+    ),
+    SummarySuite(
+        key="llama2_7b_ag_news_imdb_zero_shot_cnn_ripple",
+        description="llama2_7b ag_news/imdb zero-shot cnn attack transfer sweep from ripple",
+        run_specs=tuple(LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_CNN_RIPPLE_RUN_SPECS),
+        summary_filename_template="backdoor_detection_ag_news_imdb_zero_shot_cnn_ripple_summary_fpr_{fpr_slug}.csv",
+        winner_summary_filename_template=(
+            "backdoor_detection_ag_news_imdb_zero_shot_cnn_ripple_winner_summary_fpr_{fpr_slug}.csv"
+        ),
+        universal_filename="universal_config_ag_news_imdb_zero_shot_cnn_ripple_ranking_cv.csv",
+        run_subdir=("zero_shot_cnn",),
+        summary_subdir=("zero_shot_cnn", "summaries"),
+    ),
+    SummarySuite(
+        key="llama2_7b_ag_news_imdb_zero_shot_cnn_stybkd",
+        description="llama2_7b ag_news/imdb zero-shot cnn attack transfer sweep from stybkd",
+        run_specs=tuple(LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_CNN_STYBKD_RUN_SPECS),
+        summary_filename_template="backdoor_detection_ag_news_imdb_zero_shot_cnn_stybkd_summary_fpr_{fpr_slug}.csv",
+        winner_summary_filename_template=(
+            "backdoor_detection_ag_news_imdb_zero_shot_cnn_stybkd_winner_summary_fpr_{fpr_slug}.csv"
+        ),
+        universal_filename="universal_config_ag_news_imdb_zero_shot_cnn_stybkd_ranking_cv.csv",
+        run_subdir=("zero_shot_cnn",),
+        summary_subdir=("zero_shot_cnn", "summaries"),
+    ),
+    SummarySuite(
+        key="llama2_7b_ag_news_imdb_zero_shot_cnn_syntactic",
+        description="llama2_7b ag_news/imdb zero-shot cnn attack transfer sweep from syntactic",
+        run_specs=tuple(LLAMA2_7B_AG_NEWS_IMDB_ZERO_SHOT_CNN_SYNTACTIC_RUN_SPECS),
+        summary_filename_template="backdoor_detection_ag_news_imdb_zero_shot_cnn_syntactic_summary_fpr_{fpr_slug}.csv",
+        winner_summary_filename_template=(
+            "backdoor_detection_ag_news_imdb_zero_shot_cnn_syntactic_winner_summary_fpr_{fpr_slug}.csv"
+        ),
+        universal_filename="universal_config_ag_news_imdb_zero_shot_cnn_syntactic_ranking_cv.csv",
+        run_subdir=("zero_shot_cnn",),
+        summary_subdir=("zero_shot_cnn", "summaries"),
+    ),
+    SummarySuite(
+        key="leave_one_out_cnn_all_datasets",
+        description="leave-one-out cnn sweep across eligible top-level datasets",
+        run_specs=tuple(LEAVE_ONE_OUT_RUN_SPECS),
+        summary_filename_template="backdoor_detection_leave_one_out_cnn_summary_fpr_{fpr_slug}.csv",
+        winner_summary_filename_template="backdoor_detection_leave_one_out_cnn_winner_summary_fpr_{fpr_slug}.csv",
+        universal_filename="universal_config_leave_one_out_cnn_ranking_cv.csv",
+        run_subdir=("leave_one_out_cnn",),
+        summary_subdir=("leave_one_out_cnn", "summaries"),
     ),
     SummarySuite(
         key="architecture_comparison",
@@ -273,6 +550,34 @@ SUMMARY_SUITES = (
 )
 
 DEFAULT_FPRS = (0.01, 0.05, 0.10)
+ZERO_SHOT_ATTACK_ORDER = ("insertsent", "ripple", "syntactic", "stybkd")
+ZERO_SHOT_ATTACK_LABELS = {
+    "insertsent": "InsertSent",
+    "ripple": "RIPPLES",
+    "syntactic": "Syntactic",
+    "stybkd": "StyleBkd",
+}
+ZERO_SHOT_RANK_ORDER = ("8", "16", "32", "64", "128", "512", "1024", "2048")
+ZERO_SHOT_ADAPTER_ORDER = ("lora", "qlora", "lora+", "dora", "adalora")
+ZERO_SHOT_ADAPTER_LABELS = {
+    "lora": "LoRA",
+    "qlora": "QLoRA",
+    "lora+": "LoRA+",
+    "dora": "DoRA",
+    "adalora": "AdaLoRA",
+}
+ZERO_SHOT_MARKDOWN_SPECS = (
+    ZeroShotMarkdownSpec(
+        title="Zero-Shot Legacy",
+        family_slug="legacy",
+        summary_subdir=("zero_shot_legacy", "summaries"),
+    ),
+    ZeroShotMarkdownSpec(
+        title="Zero-Shot CNN",
+        family_slug="cnn",
+        summary_subdir=("zero_shot_cnn", "summaries"),
+    ),
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -293,9 +598,66 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="Directory where the CSV files will be written. Defaults to runs/supervised.",
+        help=(
+            "Base directory where the CSV files will be written. Defaults to "
+            "runs/supervised, with zero-shot suites written under "
+            "zero_shot_{cnn,legacy}/summaries."
+        ),
     )
     return parser.parse_args()
+
+
+def resolve_run_base_dir(repo_root: Path, run_subdir: Sequence[str] = ()) -> Path:
+    base = repo_root / "runs" / "supervised"
+    for part in run_subdir:
+        base /= part
+    return base
+
+
+def resolve_output_dir(output_root: Path, summary_subdir: Sequence[str]) -> Path:
+    path = output_root
+    for part in summary_subdir:
+        path /= part
+    return path
+
+
+def load_csv_rows(path: Path) -> list[dict[str, str]]:
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def format_fpr_heading(value: float) -> str:
+    return f"{value * 100:.0f}%"
+
+
+def format_detection_accuracy(row: dict[str, str]) -> str:
+    balanced_accuracy = (
+        float(row["backdoor detection acc"]) + float(row["clean detection acc"])
+    ) / 2.0
+    return f"{balanced_accuracy:.4f}"
+
+
+def format_detection_auc(row: dict[str, str]) -> str:
+    return f"{float(row['detection auc']):.3f}"
+
+
+def format_transfer_cell(row: dict[str, str] | None) -> str:
+    if row is None:
+        return "- / -"
+    return f"{format_detection_accuracy(row)} / {format_detection_auc(row)}"
+
+
+def normalize_zero_shot_key(value: str) -> str:
+    return str(value).strip().lower()
+
+
+def markdown_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * len(headers)) + " |",
+    ]
+    lines.extend("| " + " | ".join(row) + " |" for row in rows)
+    return "\n".join(lines)
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -635,9 +997,10 @@ def build_rows(
     accepted_fpr: float,
     *,
     run_specs: Sequence[RunSpec],
+    run_subdir: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    base = repo_root / "runs" / "supervised"
+    base = resolve_run_base_dir(repo_root, run_subdir)
 
     for spec in run_specs:
         run_dir = base / spec.run_id
@@ -677,9 +1040,10 @@ def build_universal_config_entries(
     repo_root: Path,
     *,
     run_specs: Sequence[RunSpec],
+    run_subdir: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
     grouped_rows: dict[tuple[str, str, str], dict[str, Any]] = {}
-    base = repo_root / "runs" / "supervised"
+    base = resolve_run_base_dir(repo_root, run_subdir)
     ordered_dataset_labels = [dataset_label(spec) for spec in run_specs]
     best_auc_by_dataset: dict[str, float] = {}
 
@@ -802,6 +1166,7 @@ def build_universal_config_rows(
     repo_root: Path,
     *,
     run_specs: Sequence[RunSpec],
+    run_subdir: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
     return [
         {
@@ -817,7 +1182,11 @@ def build_universal_config_rows(
             "n_dataset_cv_wins": row["n_dataset_cv_wins"],
             "cv_win_datasets": row["cv_win_datasets"],
         }
-        for row in build_universal_config_entries(repo_root, run_specs=run_specs)
+        for row in build_universal_config_entries(
+            repo_root,
+            run_specs=run_specs,
+            run_subdir=run_subdir,
+        )
     ]
 
 
@@ -825,13 +1194,55 @@ def build_universal_top_threshold_rows(
     repo_root: Path,
     *,
     run_specs: Sequence[RunSpec],
+    run_subdir: Sequence[str] = (),
 ) -> list[dict[str, Any]]:
-    universal_entries = build_universal_config_entries(repo_root, run_specs=run_specs)
+    universal_entries = build_universal_config_entries(
+        repo_root,
+        run_specs=run_specs,
+        run_subdir=run_subdir,
+    )
     if not universal_entries:
         raise ValueError("No universal config entries available")
     top_entry = universal_entries[0]
 
-    base = repo_root / "runs" / "supervised"
+    base = resolve_run_base_dir(repo_root, run_subdir)
+
+    # The zero-shot CNN suites are fixed to a single preselected cnn_1d candidate per run.
+    # For those suites, the saved threshold files already represent the only possible
+    # "winner summary" and we can reuse them directly instead of refitting a model here.
+    if str(top_entry["model"]) == "cnn_1d":
+        rows: list[dict[str, Any]] = []
+        for spec in run_specs:
+            run_dir = base / spec.run_id
+            report = load_json(run_dir / "reports" / "supervised_report.json")
+            threshold = load_json(run_dir / "reports" / "selected_threshold.json")
+            run_config = load_json(run_dir / "run_config.json")
+            candidates = [
+                candidate
+                for candidate in report["tuning"]["candidates"]
+                if candidate.get("status") == "ok" and candidate.get("roc_auc_mean") is not None
+            ]
+            if len(candidates) != 1 or str(candidates[0].get("model_name")) != "cnn_1d":
+                raise ValueError(
+                    "cnn_1d winner summaries expect a single fixed candidate per run; "
+                    f"found {len(candidates)} candidate(s) in {run_dir}"
+                )
+
+            for selection in threshold["selections"]:
+                inference_metrics = selection["inference_metrics"]
+                rows.append(
+                    {
+                        "dataset": spec.dataset,
+                        "type of attack": spec.attack_type,
+                        "accepted_fpr": float(selection["accepted_fpr"]),
+                        "backdoor detection acc": float(inference_metrics["recall"]),
+                        "clean detection acc": float(inference_metrics["specificity"]),
+                        "detection auc": float(report["fit_assessment"]["offline_metrics"]["auroc"]),
+                        "note": format_note(run_config["winner"]),
+                    }
+                )
+        return rows
+
     external_feature_cache: dict[str, Any] = {}
     external_model_names_cache: dict[str, list[str]] = {}
     external_index_cache: dict[str, dict[str, int]] = {}
@@ -906,7 +1317,7 @@ def build_universal_top_threshold_rows(
 
 
 def suite_required_paths(repo_root: Path, suite: SummarySuite) -> list[Path]:
-    base = repo_root / "runs" / "supervised"
+    base = resolve_run_base_dir(repo_root, suite.run_subdir)
     required_rel_paths = (
         Path("reports") / "supervised_report.json",
         Path("reports") / "selected_threshold.json",
@@ -921,6 +1332,13 @@ def suite_required_paths(repo_root: Path, suite: SummarySuite) -> list[Path]:
 
 
 def suite_is_ready(repo_root: Path, suite: SummarySuite) -> bool:
+    if not suite.run_specs:
+        message = f"Summary suite '{suite.key}' has no discovered run specs."
+        if suite.required:
+            raise FileNotFoundError(message)
+        print(f"Skipping {suite.key}: {message}", file=sys.stderr)
+        return False
+
     missing_paths = [path for path in suite_required_paths(repo_root, suite) if not path.exists()]
     if not missing_paths:
         return True
@@ -939,18 +1357,22 @@ def suite_is_ready(repo_root: Path, suite: SummarySuite) -> bool:
 def generate_suite_csvs(
     *,
     repo_root: Path,
-    output_dir: Path,
+    output_root: Path,
     suite: SummarySuite,
     accepted_fprs: Sequence[float],
 ) -> None:
     if not suite_is_ready(repo_root, suite):
         return
 
+    output_dir = resolve_output_dir(output_root, suite.summary_subdir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     for accepted_fpr in accepted_fprs:
         rows = build_rows(
             repo_root=repo_root,
             accepted_fpr=float(accepted_fpr),
             run_specs=suite.run_specs,
+            run_subdir=suite.run_subdir,
         )
         filename = suite.summary_filename_template.format(
             fpr_slug=format_fpr_for_filename(float(accepted_fpr))
@@ -961,6 +1383,7 @@ def generate_suite_csvs(
     universal_rows = build_universal_config_rows(
         repo_root=repo_root,
         run_specs=suite.run_specs,
+        run_subdir=suite.run_subdir,
     )
     write_csv(output_dir / suite.universal_filename, universal_rows)
     print(f"Wrote {output_dir / suite.universal_filename}")
@@ -968,6 +1391,7 @@ def generate_suite_csvs(
     universal_top_threshold_rows = build_universal_top_threshold_rows(
         repo_root=repo_root,
         run_specs=suite.run_specs,
+        run_subdir=suite.run_subdir,
     )
     for accepted_fpr in accepted_fprs:
         winner_rows = [
@@ -1001,19 +1425,205 @@ def write_csv(
         writer.writerows(rows)
 
 
+def zero_shot_transfer_summary_path(
+    summary_dir: Path,
+    *,
+    family_slug: str,
+    training_attack: str,
+    fpr_slug: str,
+) -> Path:
+    return (
+        summary_dir
+        / f"backdoor_detection_ag_news_imdb_zero_shot_{family_slug}_{training_attack}_summary_fpr_{fpr_slug}.csv"
+    )
+
+
+def zero_shot_rank_summary_path(
+    summary_dir: Path,
+    *,
+    family_slug: str,
+    fpr_slug: str,
+) -> Path:
+    return summary_dir / f"backdoor_detection_tbh_zero_shot_{family_slug}_rank_summary_fpr_{fpr_slug}.csv"
+
+
+def zero_shot_adapter_summary_path(
+    summary_dir: Path,
+    *,
+    family_slug: str,
+    fpr_slug: str,
+) -> Path:
+    return summary_dir / f"backdoor_detection_tbh_zero_shot_{family_slug}_adapter_summary_fpr_{fpr_slug}.csv"
+
+
+def build_zero_shot_transfer_markdown_table(
+    summary_dir: Path,
+    *,
+    family_slug: str,
+    fpr_slug: str,
+) -> str:
+    transfer_rows_by_train: dict[str, dict[str, dict[str, str]]] = {}
+    for training_attack in ZERO_SHOT_ATTACK_ORDER:
+        csv_path = zero_shot_transfer_summary_path(
+            summary_dir,
+            family_slug=family_slug,
+            training_attack=training_attack,
+            fpr_slug=fpr_slug,
+        )
+        rows = load_csv_rows(csv_path)
+        transfer_rows_by_train[training_attack] = {
+            normalize_zero_shot_key(row["type of attack"]): row for row in rows
+        }
+
+    headers = ["Transfer Dataset", *[ZERO_SHOT_ATTACK_LABELS[key] for key in ZERO_SHOT_ATTACK_ORDER]]
+    markdown_rows: list[list[str]] = []
+    for transfer_attack in ZERO_SHOT_ATTACK_ORDER:
+        row = [ZERO_SHOT_ATTACK_LABELS[transfer_attack]]
+        for training_attack in ZERO_SHOT_ATTACK_ORDER:
+            if transfer_attack == training_attack:
+                row.append("- / -")
+                continue
+            row.append(format_transfer_cell(transfer_rows_by_train[training_attack].get(transfer_attack)))
+        markdown_rows.append(row)
+    return markdown_table(headers, markdown_rows)
+
+
+def build_zero_shot_rank_markdown_table(
+    summary_dir: Path,
+    *,
+    family_slug: str,
+    fpr_slug: str,
+) -> str:
+    rows = load_csv_rows(
+        zero_shot_rank_summary_path(summary_dir, family_slug=family_slug, fpr_slug=fpr_slug)
+    )
+    by_rank = {
+        normalize_zero_shot_key(row["type of attack"]).removeprefix("rank "): row for row in rows
+    }
+    markdown_rows = [["256", "-", "-"]]
+    for rank in ZERO_SHOT_RANK_ORDER:
+        row = by_rank.get(rank)
+        markdown_rows.append(
+            [
+                rank,
+                "-" if row is None else format_detection_accuracy(row),
+                "-" if row is None else format_detection_auc(row),
+            ]
+        )
+    return markdown_table(["LoRA Rank", "Detection Acc.", "Detection AUC"], markdown_rows)
+
+
+def build_zero_shot_adapter_markdown_table(
+    summary_dir: Path,
+    *,
+    family_slug: str,
+    fpr_slug: str,
+) -> str:
+    rows = load_csv_rows(
+        zero_shot_adapter_summary_path(summary_dir, family_slug=family_slug, fpr_slug=fpr_slug)
+    )
+    by_adapter = {normalize_zero_shot_key(row["type of attack"]): row for row in rows}
+    markdown_rows = [[ZERO_SHOT_ADAPTER_LABELS["lora"], "-", "-"]]
+    for adapter in ZERO_SHOT_ADAPTER_ORDER[1:]:
+        row = by_adapter.get(adapter)
+        markdown_rows.append(
+            [
+                ZERO_SHOT_ADAPTER_LABELS[adapter],
+                "-" if row is None else format_detection_accuracy(row),
+                "-" if row is None else format_detection_auc(row),
+            ]
+        )
+    return markdown_table(["Method", "Detection Acc.", "Detection AUC"], markdown_rows)
+
+
+def generate_zero_shot_markdown_report(
+    *,
+    output_root: Path,
+    spec: ZeroShotMarkdownSpec,
+    accepted_fprs: Sequence[float],
+) -> None:
+    summary_dir = resolve_output_dir(output_root, spec.summary_subdir)
+    if not summary_dir.exists():
+        return
+
+    lines = [
+        f"# {spec.title} Summary Tables",
+        "",
+        "Detection Acc. is balanced accuracy = (backdoor detection acc + clean detection acc) / 2.",
+        "Each attack-transfer cell is formatted as `Detection Acc. / Detection AUC`.",
+        "",
+    ]
+
+    for accepted_fpr in accepted_fprs:
+        fpr_slug = format_fpr_for_filename(float(accepted_fpr))
+        lines.extend(
+            [
+                f"## Accepted FPR = {format_fpr_heading(float(accepted_fpr))}",
+                "",
+                "### Attack Transfer",
+                "",
+                "Training dataset columns are InsertSent, RIPPLES, Syntactic, and StyleBkd.",
+                "",
+                build_zero_shot_transfer_markdown_table(
+                    summary_dir,
+                    family_slug=spec.family_slug,
+                    fpr_slug=fpr_slug,
+                ),
+                "",
+                "### Rank Sweep",
+                "",
+                build_zero_shot_rank_markdown_table(
+                    summary_dir,
+                    family_slug=spec.family_slug,
+                    fpr_slug=fpr_slug,
+                ),
+                "",
+                "### Adapter Sweep",
+                "",
+                build_zero_shot_adapter_markdown_table(
+                    summary_dir,
+                    family_slug=spec.family_slug,
+                    fpr_slug=fpr_slug,
+                ),
+                "",
+            ]
+        )
+
+    markdown_path = summary_dir / "summary_tables.md"
+    markdown_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    print(f"Wrote {markdown_path}")
+
+
+def generate_zero_shot_markdown_reports(
+    *,
+    output_root: Path,
+    accepted_fprs: Sequence[float],
+) -> None:
+    for spec in ZERO_SHOT_MARKDOWN_SPECS:
+        generate_zero_shot_markdown_report(
+            output_root=output_root,
+            spec=spec,
+            accepted_fprs=accepted_fprs,
+        )
+
+
 def main() -> None:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
-    output_dir = args.output_dir or (repo_root / "runs" / "supervised" / "summaries")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_root = args.output_dir or (repo_root / "runs" / "supervised")
 
     for suite in SUMMARY_SUITES:
         generate_suite_csvs(
             repo_root=repo_root,
-            output_dir=output_dir,
+            output_root=output_root,
             suite=suite,
             accepted_fprs=args.fprs,
         )
+
+    generate_zero_shot_markdown_reports(
+        output_root=output_root,
+        accepted_fprs=args.fprs,
+    )
 
 
 if __name__ == "__main__":

@@ -15,11 +15,28 @@ import numpy as np
 from safetensors.numpy import load_file, save_file
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+
+try:
+    import torch  # noqa: F401
+except Exception:
+    torch = None
+
 import upeftguard.cli as cli_mod
 from upeftguard.features.delta import block_delta_singular_values, load_delta_block_schema, top_k_singular_values
 from upeftguard.features.norms import summarize_array_moments
 from upeftguard.features.spectral import extract_spectral_features
 from upeftguard.features.svd import extract_svd_embeddings
+from upeftguard.supervised.cnn import (
+    CNNNormalizationStats,
+    build_per_layer_vectors,
+    masked_max_pool,
+    masked_mean_pool,
+    pad_layer_sequence_batch,
+)
+from upeftguard.supervised.interfaces import (
+    ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,
+    SupervisedFeatureBundle,
+)
 from upeftguard.supervised.pipeline import _load_features_for_tuning_manifest, run_supervised_pipeline
 from upeftguard.supervised.registry import candidate_params, create, normalization_policy, registered_models
 from upeftguard.utilities.artifacts.dataset_references import (
@@ -456,6 +473,9 @@ def write_merged_feature_artifacts(
     labels: np.ndarray | None,
     model_names: list[str],
     metadata: dict[str, Any],
+    group_mask: np.ndarray | None = None,
+    value_mask: np.ndarray | None = None,
+    group_names: list[list[str]] | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     np.save(output_dir / "spectral_features.npy", np.asarray(features, dtype=np.float32))
@@ -463,6 +483,13 @@ def write_merged_feature_artifacts(
         json.dump(list(model_names), f, indent=2)
     if labels is not None:
         np.save(output_dir / "spectral_labels.npy", np.asarray(labels, dtype=np.int32))
+    if group_mask is not None:
+        np.save(output_dir / "spectral_group_mask.npy", np.asarray(group_mask, dtype=bool))
+    if value_mask is not None:
+        np.save(output_dir / "spectral_value_mask.npy", np.asarray(value_mask, dtype=bool))
+    if group_names is not None:
+        with open(output_dir / "spectral_group_names.json", "w", encoding="utf-8") as f:
+            json.dump([list(names) for names in group_names], f, indent=2)
     write_spectral_metadata(
         output_dir / "spectral_metadata.json",
         internal_metadata=metadata,
@@ -731,6 +758,160 @@ def _test_structural_group_for_feature_name(feature_name: str) -> str:
     return prefix or block_name
 
 
+def _test_relative_block_name_for_feature_name(feature_name: str) -> str:
+    block_name = str(feature_name).rpartition(".")[0]
+    structural_group = _test_structural_group_for_feature_name(feature_name)
+    prefix = f"{structural_group}."
+    if block_name.startswith(prefix):
+        relative = block_name[len(prefix) :].strip()
+        if relative:
+            return relative
+    return "__self__"
+
+
+_TEST_ARCHITECTURE_BLOCK_ORDER = ("encoder", "decoder")
+_TEST_ATTENTION_KIND_ORDER = ("self", "cross", "other")
+_TEST_ADAPTER_BLOCK_ORDER = ("q", "v", "qv_sum", "other")
+
+
+def _test_architecture_block_for_feature_name(feature_name: str) -> str:
+    block_name = str(feature_name).rpartition(".")[0]
+    parts = [str(part).strip().lower() for part in block_name.split(".") if str(part).strip()]
+    if "encoder" in parts:
+        return "encoder"
+    if "decoder" in parts:
+        return "decoder"
+    if "roberta" in parts:
+        return "encoder"
+    return "decoder"
+
+
+def _test_indexed_value_for_parts(parts: list[str], *, prefixes: tuple[str, ...]) -> int | None:
+    lowered_prefixes = tuple(str(prefix).strip().lower() for prefix in prefixes)
+    for idx, raw_part in enumerate(parts):
+        part = str(raw_part).strip().lower()
+        for prefix in lowered_prefixes:
+            if part.startswith(prefix) and part[len(prefix) :].isdigit():
+                return int(part[len(prefix) :])
+            if part == prefix and idx + 1 < len(parts) and str(parts[idx + 1]).strip().isdigit():
+                return int(str(parts[idx + 1]).strip())
+    return None
+
+
+def _test_layer_index_for_feature_name(feature_name: str) -> int:
+    block_name = str(feature_name).rpartition(".")[0]
+    parts = [part for part in block_name.split(".") if part]
+    lowered = [str(part).strip().lower() for part in parts]
+    if "encoder" in lowered or "decoder" in lowered:
+        block_idx = _test_indexed_value_for_parts(parts, prefixes=("block",))
+        if block_idx is not None:
+            return int(block_idx)
+    layer_idx = _test_indexed_value_for_parts(parts, prefixes=("layer", "layers"))
+    if layer_idx is not None:
+        return int(layer_idx)
+    block_idx = _test_indexed_value_for_parts(parts, prefixes=("block",))
+    if block_idx is not None:
+        return int(block_idx)
+    raise ValueError(f"Could not determine canonical layer index for feature: {feature_name}")
+
+
+def _test_attention_kind_for_feature_name(feature_name: str) -> str:
+    block_name = str(feature_name).rpartition(".")[0].strip().lower()
+    if "encdecattention" in block_name or "crossattention" in block_name or ".cross." in block_name:
+        return "cross"
+    if (
+        "selfattention" in block_name
+        or "self_attn" in block_name
+        or "self_attention" in block_name
+        or ".attention.self." in block_name
+        or ".self." in block_name
+    ):
+        return "self"
+    return "other"
+
+
+def _test_adapter_block_for_feature_name(feature_name: str) -> str:
+    block_name = str(feature_name).rpartition(".")[0]
+    if block_name.endswith(".qv_sum"):
+        return "qv_sum"
+    module_name = block_name.rsplit(".", 1)[-1].strip().lower()
+    if module_name in {"q", "q_proj", "query"}:
+        return "q"
+    if module_name in {"v", "v_proj", "value"}:
+        return "v"
+    return "other"
+
+
+def _test_canonical_depth_label_for_feature_name(feature_name: str) -> str:
+    architecture_block = _test_architecture_block_for_feature_name(feature_name)
+    layer_idx = _test_layer_index_for_feature_name(feature_name)
+    return f"{architecture_block}.layer{layer_idx}"
+
+
+def _test_canonical_slot_name_for_feature_name(feature_name: str) -> str:
+    attention_kind = _test_attention_kind_for_feature_name(feature_name)
+    adapter_block = _test_adapter_block_for_feature_name(feature_name)
+    return f"{attention_kind}.{adapter_block}"
+
+
+def _test_architecture_sort_key(name: str) -> tuple[int, str]:
+    try:
+        return (_TEST_ARCHITECTURE_BLOCK_ORDER.index(str(name)), "")
+    except ValueError:
+        return (len(_TEST_ARCHITECTURE_BLOCK_ORDER), str(name))
+
+
+def _test_attention_kind_sort_key(name: str) -> tuple[int, str]:
+    try:
+        return (_TEST_ATTENTION_KIND_ORDER.index(str(name)), "")
+    except ValueError:
+        return (len(_TEST_ATTENTION_KIND_ORDER), str(name))
+
+
+def _test_adapter_block_sort_key(name: str) -> tuple[int, str]:
+    try:
+        return (_TEST_ADAPTER_BLOCK_ORDER.index(str(name)), "")
+    except ValueError:
+        return (len(_TEST_ADAPTER_BLOCK_ORDER), str(name))
+
+
+def _test_ordered_canonical_depth_labels(feature_names: list[str]) -> list[str]:
+    depth_tuples = {
+        (
+            _test_architecture_block_for_feature_name(feature_name),
+            _test_layer_index_for_feature_name(feature_name),
+        )
+        for feature_name in feature_names
+    }
+    return [
+        f"{architecture_block}.layer{layer_idx}"
+        for architecture_block, layer_idx in sorted(
+            depth_tuples,
+            key=lambda item: (_test_architecture_sort_key(item[0]), int(item[1])),
+        )
+    ]
+
+
+def _test_ordered_canonical_slot_names(feature_names: list[str]) -> list[str]:
+    slot_tuples = {
+        (
+            _test_attention_kind_for_feature_name(feature_name),
+            _test_adapter_block_for_feature_name(feature_name),
+        )
+        for feature_name in feature_names
+    }
+    return [
+        f"{attention_kind}.{adapter_block}"
+        for attention_kind, adapter_block in sorted(
+            slot_tuples,
+            key=lambda item: (
+                _test_attention_kind_sort_key(item[0]),
+                _test_adapter_block_sort_key(item[1]),
+            ),
+        )
+    ]
+
+
 def _locally_aggregate_feature_row(
     *,
     values: np.ndarray,
@@ -820,7 +1001,94 @@ def _locally_aggregate_feature_row(
     return np.asarray(aggregated_values, dtype=np.float32), resolved_output_feature_names
 
 
-def build_tiny_multi_arch_provenance_merge_bundle(tmp_path: Path) -> dict[str, Any]:
+def _locally_aggregate_layer_sequence_row(
+    *,
+    values: np.ndarray,
+    feature_names: list[str],
+    requested_features: list[str] | None = None,
+    spectral_qv_sum_mode: str = "append",
+    depth_labels: list[str] | None = None,
+    slot_names: list[str] | None = None,
+    emitted_feature_names: list[str] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], list[str], list[str]]:
+    requested_feature_set = set(requested_features) if requested_features is not None else None
+    selected: list[tuple[int, str, str, str, str]] = []
+    for col_idx, feature_name in enumerate(feature_names):
+        role_bucket = _test_role_bucket_for_feature_name(feature_name)
+        if spectral_qv_sum_mode == "none" and role_bucket == "qv_sum":
+            continue
+        if spectral_qv_sum_mode == "only" and role_bucket != "qv_sum":
+            continue
+        feature_group = _test_feature_group_for_feature_name(feature_name)
+        if requested_feature_set is not None and feature_group not in requested_feature_set:
+            continue
+        selected.append(
+            (
+                int(col_idx),
+                str(feature_name),
+                _test_canonical_slot_name_for_feature_name(feature_name),
+                str(feature_name).rpartition(".")[2],
+                _test_canonical_depth_label_for_feature_name(feature_name),
+            )
+        )
+
+    resolved_depth_labels = list(depth_labels or [])
+    if not resolved_depth_labels:
+        resolved_depth_labels = _test_ordered_canonical_depth_labels(
+            [feature_name for _col_idx, feature_name, _slot_name, _emitted_feature, _depth_label in selected]
+        )
+    resolved_slot_names = list(slot_names or [])
+    if not resolved_slot_names:
+        resolved_slot_names = _test_ordered_canonical_slot_names(
+            [feature_name for _col_idx, feature_name, _slot_name, _emitted_feature, _depth_label in selected]
+        )
+    resolved_emitted_feature_names = list(emitted_feature_names or [])
+    if not resolved_emitted_feature_names:
+        seen_emitted: set[str] = set()
+        for _col_idx, _feature_name, _slot_name, emitted_feature, _depth_label in selected:
+            if emitted_feature in seen_emitted:
+                continue
+            seen_emitted.add(emitted_feature)
+            resolved_emitted_feature_names.append(emitted_feature)
+
+    grouped_values: dict[str, dict[tuple[str, str], list[int]]] = {}
+    for col_idx, _feature_name, slot_name, emitted_feature, depth_label in selected:
+        grouped_values.setdefault(depth_label, {}).setdefault((slot_name, emitted_feature), []).append(col_idx)
+
+    tensor = np.zeros(
+        (len(resolved_depth_labels), len(resolved_slot_names), len(resolved_emitted_feature_names)),
+        dtype=np.float32,
+    )
+    value_mask = np.zeros_like(tensor, dtype=bool)
+    group_mask = np.zeros(len(resolved_depth_labels), dtype=bool)
+    group_names: list[str] = []
+    for group_idx, depth_label in enumerate(resolved_depth_labels):
+        group_entries = grouped_values.get(depth_label, {})
+        if group_entries:
+            group_mask[group_idx] = True
+            group_names.append(depth_label)
+        for slot_idx, slot_name in enumerate(resolved_slot_names):
+            for feature_idx, emitted_feature in enumerate(resolved_emitted_feature_names):
+                column_indices = group_entries.get((slot_name, emitted_feature), [])
+                if not column_indices:
+                    continue
+                if len(column_indices) != 1:
+                    raise ValueError(
+                        f"Expected one raw module feature per tensor cell, got {len(column_indices)} "
+                        f"for depth_label={depth_label!r}, slot={slot_name!r}, feature={emitted_feature!r}"
+                    )
+                tensor[group_idx, slot_idx, feature_idx] = float(values[int(column_indices[0])])
+                value_mask[group_idx, slot_idx, feature_idx] = True
+
+    return tensor, group_mask, value_mask, group_names, resolved_slot_names, resolved_depth_labels
+
+
+def build_tiny_multi_arch_provenance_merge_bundle(
+    tmp_path: Path,
+    *,
+    spectral_features: list[str] | tuple[str, ...] = ("energy", "stable_rank"),
+    sv_top_k: int = 1,
+) -> dict[str, Any]:
     feature_root = tmp_path / "runs" / "feature_extract"
     manifest_entries: list[str] = []
     per_model_leaf_rows: dict[str, dict[str, Any]] = {}
@@ -866,9 +1134,9 @@ def build_tiny_multi_arch_provenance_merge_bundle(tmp_path: Path) -> dict[str, A
         )
         features, labels, resolved_model_names, metadata = extract_spectral_features(
             items=items,
-            spectral_features=["energy", "stable_rank"],
+            spectral_features=[str(x) for x in spectral_features],
             spectral_qv_sum_mode=spectral_qv_sum_mode,
-            sv_top_k=1,
+            sv_top_k=int(sv_top_k),
             block_size=64,
             dtype=np.float32,
         )
@@ -930,6 +1198,69 @@ def build_tiny_multi_arch_provenance_merge_bundle(tmp_path: Path) -> dict[str, A
         "manifest_entries": manifest_entries,
         "per_model_leaf_rows": per_model_leaf_rows,
     }
+
+
+def build_direct_layer_sequence_bundle(*, include_other_slot: bool = False) -> SupervisedFeatureBundle:
+    depth_labels = ["encoder.layer0", "encoder.layer1", "decoder.layer0"]
+    slot_names = ["self.q", "self.v", "cross.q", "cross.v"]
+    if include_other_slot:
+        slot_names.append("other.q")
+    feature_names = ["energy", "stable_rank"]
+
+    values = np.zeros((2, len(depth_labels), len(slot_names), len(feature_names)), dtype=np.float32)
+    value_mask = np.zeros_like(values, dtype=bool)
+    group_mask = np.zeros((2, len(depth_labels)), dtype=bool)
+
+    group_mask[0, 0] = True
+    group_mask[0, 1] = True
+    values[0, 0, 0, :] = [1.0, 10.0]
+    values[0, 0, 1, :] = [2.0, 20.0]
+    values[0, 1, 0, :] = [3.0, 30.0]
+    values[0, 1, 1, :] = [4.0, 40.0]
+    value_mask[0, 0, 0, :] = True
+    value_mask[0, 0, 1, :] = True
+    value_mask[0, 1, 0, :] = True
+    value_mask[0, 1, 1, :] = True
+
+    group_mask[1, 0] = True
+    group_mask[1, 1] = True
+    group_mask[1, 2] = True
+    values[1, 0, 0, :] = [5.0, 50.0]
+    values[1, 0, 1, :] = [6.0, 60.0]
+    values[1, 1, 0, :] = [7.0, 70.0]
+    values[1, 1, 1, :] = [8.0, 80.0]
+    values[1, 2, 0, :] = [9.0, 90.0]
+    values[1, 2, 1, :] = [10.0, 100.0]
+    values[1, 2, 2, :] = [11.0, 110.0]
+    values[1, 2, 3, :] = [12.0, 120.0]
+    value_mask[1, 0, 0, :] = True
+    value_mask[1, 0, 1, :] = True
+    value_mask[1, 1, 0, :] = True
+    value_mask[1, 1, 1, :] = True
+    value_mask[1, 2, 0, :] = True
+    value_mask[1, 2, 1, :] = True
+    value_mask[1, 2, 2, :] = True
+    value_mask[1, 2, 3, :] = True
+
+    if include_other_slot:
+        values[1, 0, 4, :] = [13.0, 130.0]
+        value_mask[1, 0, 4, :] = True
+
+    return SupervisedFeatureBundle(
+        values=values,
+        representation_kind=ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,
+        metadata={
+            "depth_labels": list(depth_labels),
+            "slot_names": list(slot_names),
+            "emitted_feature_names": list(feature_names),
+        },
+        group_mask=group_mask,
+        value_mask=value_mask,
+        group_names=[
+            ["encoder.layer0", "encoder.layer1"],
+            ["encoder.layer0", "encoder.layer1", "decoder.layer0"],
+        ],
+    )
 
 
 class TestCliAndPipeline(unittest.TestCase):
@@ -1425,6 +1756,106 @@ class TestCliAndPipeline(unittest.TestCase):
             self.assertFalse((run_dir / "reports" / "winner_feature_weights_parts").exists())
             self.assertFalse((run_dir / "features" / "winner_feature_weights_train_features.npy").exists())
             self.assertFalse((run_dir / "features" / "winner_feature_weights_train_labels.npy").exists())
+
+    def test_supervised_finalize_worker_and_merge_skip_already_finalized_unsupported_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            run_dir = tmp_path / "runs" / "supervised" / "unsupported_finalize"
+            for subdir in ["reports", "models", "features", "plots", "logs"]:
+                (run_dir / subdir).mkdir(parents=True, exist_ok=True)
+
+            report_path = run_dir / "reports" / "supervised_report.json"
+            train_scores_path = run_dir / "reports" / "train_scores.csv"
+            best_model_path = run_dir / "models" / "best_model.pt"
+            report_path.write_text("{}", encoding="utf-8")
+            train_scores_path.write_text("score\n0.5\n", encoding="utf-8")
+            best_model_path.write_bytes(b"checkpoint")
+
+            with open(run_dir / "run_config.json", "w", encoding="utf-8") as f:
+                json.dump({"winner_feature_weights_mode": "unsupported_for_backend"}, f)
+            with open(run_dir / "artifact_index.json", "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "report": str(report_path),
+                        "train_scores_csv": str(train_scores_path),
+                        "best_model": str(best_model_path),
+                    },
+                    f,
+                )
+
+            worker_result = run_supervised_pipeline(
+                manifest_json=None,
+                dataset_root=tmp_path,
+                output_root=tmp_path / "runs",
+                run_id=None,
+                model_name="cnn_1d",
+                spectral_features=None,
+                spectral_sv_top_k=2,
+                spectral_moment_source="sv",
+                spectral_qv_sum_mode="none",
+                spectral_entrywise_delta_mode="auto",
+                stream_block_size=131072,
+                dtype_name="float32",
+                cv_folds=2,
+                random_state=42,
+                train_split_percent=100,
+                calibration_split_percent=None,
+                accepted_fpr=None,
+                split_by_folder=False,
+                cv_random_states=[42],
+                n_jobs=1,
+                score_percentiles=[90.0, 95.0],
+                feature_file=None,
+                tuning_executor="local",
+                slurm_partition="extra",
+                slurm_max_concurrent="auto",
+                slurm_cpus_per_task="auto",
+                finalize_export_shards=2,
+                stage="finalize_worker",
+                run_dir=run_dir,
+                task_index=0,
+            )
+            self.assertEqual(worker_result["status"], "skipped")
+            self.assertIn("unsupported_for_backend", worker_result["reason"])
+
+            finalized = run_supervised_pipeline(
+                manifest_json=None,
+                dataset_root=tmp_path,
+                output_root=tmp_path / "runs",
+                run_id=None,
+                model_name="cnn_1d",
+                spectral_features=None,
+                spectral_sv_top_k=2,
+                spectral_moment_source="sv",
+                spectral_qv_sum_mode="none",
+                spectral_entrywise_delta_mode="auto",
+                stream_block_size=131072,
+                dtype_name="float32",
+                cv_folds=2,
+                random_state=42,
+                train_split_percent=100,
+                calibration_split_percent=None,
+                accepted_fpr=None,
+                split_by_folder=False,
+                cv_random_states=[42],
+                n_jobs=1,
+                score_percentiles=[90.0, 95.0],
+                feature_file=None,
+                tuning_executor="local",
+                slurm_partition="extra",
+                slurm_max_concurrent="auto",
+                slurm_cpus_per_task="auto",
+                finalize_export_shards=2,
+                stage="finalize_merge",
+                run_dir=run_dir,
+                task_index=None,
+            )
+
+            self.assertEqual(finalized["run_dir"], str(run_dir))
+            self.assertEqual(finalized["report"], str(report_path))
+            self.assertEqual(finalized["train_scores_csv"], str(train_scores_path))
+            self.assertIsNone(finalized["inference_scores_csv"])
+            self.assertEqual(finalized["best_model"], str(best_model_path))
 
     def test_download_dataset_passthrough_accepts_unknown_flags(self):
         captured_args: list[str] = []
@@ -2845,6 +3276,599 @@ class TestCliAndPipeline(unittest.TestCase):
                 expected_qv_feature_names,
             )
             self.assertEqual([str(x) for x in qv_only_metadata["block_names"]], ["role.qv_sum"])
+
+    def test_util_aggregate_features_layer_sequence_layout_on_mixed_architecture_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle = build_tiny_multi_arch_provenance_merge_bundle(tmp_path)
+            feature_root = bundle["feature_root"]
+            output_dir = feature_root / "mixed_arch_layer_sequence" / "merged"
+
+            proc = run_cli(
+                [
+                    "util",
+                    "aggregate-features",
+                    "--feature-file",
+                    "merged_all",
+                    "--output-filename",
+                    "mixed_arch_layer_sequence",
+                    "--feature-root",
+                    str(feature_root),
+                    "--operator",
+                    "avg",
+                    "--layout",
+                    "layer_sequence",
+                    "--features",
+                    "energy",
+                    "stable_rank",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr + proc.stdout)
+
+            aggregated_features = np.asarray(np.load(output_dir / "spectral_features.npy"), dtype=np.float32)
+            aggregated_group_mask = np.asarray(np.load(output_dir / "spectral_group_mask.npy"), dtype=bool)
+            aggregated_value_mask = np.asarray(np.load(output_dir / "spectral_value_mask.npy"), dtype=bool)
+            aggregated_model_names = load_json_file(output_dir / "spectral_model_names.json")
+            aggregated_group_names = load_json_file(output_dir / "spectral_group_names.json")
+            public_metadata, internal_metadata = load_public_and_internal_spectral_metadata(
+                output_dir / "spectral_metadata.json"
+            )
+            aggregation_report = load_json_file(output_dir / "spectral_aggregation_report.json")
+
+            self.assertEqual(
+                public_metadata["representation_kind"],
+                ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,
+            )
+            self.assertEqual(
+                aggregation_report["representation_kind"],
+                ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,
+            )
+            self.assertEqual(
+                aggregation_report["tensor_axes"],
+                ["model", "architecture_layer", "attention_adapter", "feature"],
+            )
+            self.assertEqual(aggregated_features.shape[:2], aggregated_group_mask.shape)
+            self.assertEqual(aggregated_features.shape, aggregated_value_mask.shape)
+            self.assertEqual(len(aggregated_group_names), len(aggregated_model_names))
+
+            depth_labels = [str(x) for x in internal_metadata["depth_labels"]]
+            slot_names = [str(x) for x in internal_metadata["slot_names"]]
+            emitted_feature_names = [str(x) for x in internal_metadata["emitted_feature_names"]]
+            self.assertIn("encoder.layer0", depth_labels)
+            self.assertIn("decoder.layer0", depth_labels)
+            self.assertTrue(any(name.startswith("self.") for name in slot_names))
+            self.assertTrue(any(name.startswith("cross.") for name in slot_names))
+            expected_rows: list[np.ndarray] = []
+            expected_group_masks: list[np.ndarray] = []
+            expected_value_masks: list[np.ndarray] = []
+            expected_group_names: list[list[str]] = []
+            for model_name in aggregated_model_names:
+                leaf_row = bundle["per_model_leaf_rows"][model_name]
+                (
+                    expected_tensor,
+                    expected_group_mask,
+                    expected_value_mask,
+                    expected_groups,
+                    expected_slot_names,
+                    expected_depth_labels,
+                ) = _locally_aggregate_layer_sequence_row(
+                    values=np.asarray(leaf_row["values"], dtype=np.float32),
+                    feature_names=[str(x) for x in leaf_row["feature_names"]],
+                    requested_features=["energy", "stable_rank"],
+                    spectral_qv_sum_mode="append",
+                    depth_labels=depth_labels,
+                    slot_names=slot_names,
+                    emitted_feature_names=emitted_feature_names,
+                )
+                self.assertEqual(expected_slot_names, slot_names)
+                self.assertEqual(expected_depth_labels, depth_labels)
+                expected_rows.append(expected_tensor)
+                expected_group_masks.append(expected_group_mask)
+                expected_value_masks.append(expected_value_mask)
+                expected_group_names.append(list(expected_groups))
+                self.assertLessEqual(len(expected_groups), len(depth_labels))
+
+            np.testing.assert_allclose(aggregated_features, np.asarray(expected_rows), rtol=1e-6, atol=1e-6)
+            np.testing.assert_array_equal(aggregated_group_mask, np.asarray(expected_group_masks))
+            np.testing.assert_array_equal(aggregated_value_mask, np.asarray(expected_value_masks))
+            self.assertEqual(aggregated_group_names, expected_group_names)
+            self.assertEqual(
+                aggregation_report["stats"]["padding_group_total"],
+                sum(len(depth_labels) - len(names) for names in expected_group_names),
+            )
+            self.assertEqual(
+                aggregation_report["output"]["group_mask_path"],
+                str(output_dir / "spectral_group_mask.npy"),
+            )
+            self.assertEqual(
+                aggregation_report["output"]["group_names_path"],
+                str(output_dir / "spectral_group_names.json"),
+            )
+
+    def test_util_aggregate_features_layer_sequence_layout_expands_sv_topk_channels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle = build_tiny_multi_arch_provenance_merge_bundle(
+                tmp_path,
+                spectral_features=["energy", "sv_topk", "stable_rank"],
+                sv_top_k=2,
+            )
+            feature_root = bundle["feature_root"]
+            output_dir = feature_root / "mixed_arch_layer_sequence_sv_topk" / "merged"
+
+            proc = run_cli(
+                [
+                    "util",
+                    "aggregate-features",
+                    "--feature-file",
+                    "merged_all",
+                    "--output-filename",
+                    "mixed_arch_layer_sequence_sv_topk",
+                    "--feature-root",
+                    str(feature_root),
+                    "--operator",
+                    "avg",
+                    "--layout",
+                    "layer_sequence",
+                    "--features",
+                    "energy",
+                    "sv_topk",
+                    "stable_rank",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr + proc.stdout)
+
+            aggregated_features = np.asarray(np.load(output_dir / "spectral_features.npy"), dtype=np.float32)
+            aggregated_group_mask = np.asarray(np.load(output_dir / "spectral_group_mask.npy"), dtype=bool)
+            aggregated_value_mask = np.asarray(np.load(output_dir / "spectral_value_mask.npy"), dtype=bool)
+            aggregated_model_names = load_json_file(output_dir / "spectral_model_names.json")
+            internal_metadata = load_public_and_internal_spectral_metadata(
+                output_dir / "spectral_metadata.json"
+            )[1]
+
+            emitted_feature_names = [str(x) for x in internal_metadata["emitted_feature_names"]]
+            self.assertIn("energy", emitted_feature_names)
+            self.assertIn("stable_rank", emitted_feature_names)
+            self.assertTrue(any(name.startswith("sv_") for name in emitted_feature_names))
+            self.assertNotIn("sv_topk", emitted_feature_names)
+            self.assertEqual(aggregated_features.shape, aggregated_value_mask.shape)
+            self.assertEqual(aggregated_features.shape[:2], aggregated_group_mask.shape)
+            self.assertEqual(aggregated_features.shape[3], len(emitted_feature_names))
+
+            depth_labels = [str(x) for x in internal_metadata["depth_labels"]]
+            slot_names = [str(x) for x in internal_metadata["slot_names"]]
+            expected_rows: list[np.ndarray] = []
+            expected_group_masks: list[np.ndarray] = []
+            expected_value_masks: list[np.ndarray] = []
+            for model_name in aggregated_model_names:
+                leaf_row = bundle["per_model_leaf_rows"][model_name]
+                (
+                    expected_tensor,
+                    expected_group_mask,
+                    expected_value_mask,
+                    expected_groups,
+                    expected_slot_names,
+                    expected_depth_labels,
+                ) = _locally_aggregate_layer_sequence_row(
+                    values=np.asarray(leaf_row["values"], dtype=np.float32),
+                    feature_names=[str(x) for x in leaf_row["feature_names"]],
+                    requested_features=["energy", "sv_topk", "stable_rank"],
+                    spectral_qv_sum_mode="append",
+                    depth_labels=depth_labels,
+                    slot_names=slot_names,
+                    emitted_feature_names=emitted_feature_names,
+                )
+                self.assertEqual(expected_slot_names, slot_names)
+                self.assertEqual(expected_depth_labels, depth_labels)
+                expected_rows.append(expected_tensor)
+                expected_group_masks.append(expected_group_mask)
+                expected_value_masks.append(expected_value_mask)
+                self.assertLessEqual(len(expected_groups), len(depth_labels))
+
+            np.testing.assert_allclose(aggregated_features, np.asarray(expected_rows), rtol=1e-6, atol=1e-6)
+            np.testing.assert_array_equal(aggregated_group_mask, np.asarray(expected_group_masks))
+            np.testing.assert_array_equal(aggregated_value_mask, np.asarray(expected_value_masks))
+
+    def test_cnn_layer_vectorization_encodes_missing_cross_attention(self):
+        bundle = build_direct_layer_sequence_bundle()
+        vector_batch = build_per_layer_vectors(bundle)
+        padded = pad_layer_sequence_batch(list(vector_batch.sequences))
+        layout = vector_batch.channel_layout
+        sample0 = np.asarray(vector_batch.sequences[0], dtype=np.float32)
+
+        self.assertEqual(sample0.shape[0], 2)
+        np.testing.assert_array_equal(
+            padded.layer_mask,
+            np.asarray([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]], dtype=np.float32),
+        )
+
+        n_features = len(layout.feature_names)
+        cross_slot_indices = [
+            idx for idx, slot_name in enumerate(layout.slot_names) if str(slot_name).startswith("cross.")
+        ]
+        self.assertTrue(cross_slot_indices)
+        for slot_idx in cross_slot_indices:
+            value_start = int(layout.value_start + slot_idx * n_features)
+            value_end = value_start + n_features
+            mask_start = int(layout.value_mask_start + slot_idx * n_features)
+            mask_end = mask_start + n_features
+            np.testing.assert_allclose(sample0[:, value_start:value_end], 0.0, rtol=0.0, atol=0.0)
+            np.testing.assert_allclose(sample0[:, mask_start:mask_end], 0.0, rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(sample0[:, int(layout.cross_attention_index)], 0.0, rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(sample0[:, int(layout.self_attention_index)], 1.0, rtol=0.0, atol=0.0)
+
+    def test_cnn_layer_vectorization_marks_encoder_and_decoder_layers(self):
+        bundle = build_direct_layer_sequence_bundle()
+        first_pass = build_per_layer_vectors(bundle)
+        identity_stats = CNNNormalizationStats(
+            channel_mean=np.zeros(first_pass.channel_layout.input_dim, dtype=np.float32),
+            channel_std=np.ones(first_pass.channel_layout.input_dim, dtype=np.float32),
+        )
+        vector_batch = build_per_layer_vectors(bundle, normalization_stats=identity_stats)
+        layout = vector_batch.channel_layout
+        sample0 = np.asarray(vector_batch.sequences[0], dtype=np.float32)
+        sample1 = np.asarray(vector_batch.sequences[1], dtype=np.float32)
+
+        np.testing.assert_allclose(sample0[:, int(layout.is_encoder_index)], 1.0, rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(sample0[:, int(layout.is_decoder_index)], 0.0, rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(sample1[:2, int(layout.is_encoder_index)], 1.0, rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(sample1[:2, int(layout.is_decoder_index)], 0.0, rtol=0.0, atol=0.0)
+        self.assertEqual(float(sample1[2, int(layout.is_encoder_index)]), 0.0)
+        self.assertEqual(float(sample1[2, int(layout.is_decoder_index)]), 1.0)
+        self.assertEqual(float(sample1[2, int(layout.cross_attention_index)]), 1.0)
+        self.assertEqual(float(sample1[2, int(layout.layer_index_index)]), 0.0)
+        self.assertEqual(float(sample1[2, int(layout.normalized_arch_index_index)]), 0.0)
+        self.assertEqual(float(sample1[2, int(layout.normalized_sequence_index_index)]), 1.0)
+        self.assertEqual(float(sample1[2, int(layout.total_layers_index)]), 3.0)
+        self.assertEqual(float(sample0[1, int(layout.layer_index_index)]), 1.0)
+        self.assertEqual(float(sample0[1, int(layout.normalized_arch_index_index)]), 1.0)
+        self.assertEqual(float(sample0[1, int(layout.normalized_sequence_index_index)]), 1.0)
+        self.assertEqual(float(sample0[1, int(layout.total_layers_index)]), 2.0)
+
+    def test_cnn_layer_vectorization_rejects_populated_other_slots(self):
+        bundle = build_direct_layer_sequence_bundle(include_other_slot=True)
+        with self.assertRaisesRegex(ValueError, "only supports self/cross attention slots"):
+            build_per_layer_vectors(bundle)
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_cnn_masked_pooling_ignores_padded_layers(self):
+        hidden = torch.tensor(
+            [
+                [[1.0, 2.0, 100.0], [4.0, 5.0, 100.0]],
+                [[3.0, 0.0, 0.0], [7.0, 0.0, 0.0]],
+            ],
+            dtype=torch.float32,
+        )
+        layer_mask = torch.tensor(
+            [[1.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+            dtype=torch.float32,
+        )
+
+        mean_pool = masked_mean_pool(hidden, layer_mask)
+        max_pool = masked_max_pool(hidden, layer_mask)
+
+        torch.testing.assert_close(
+            mean_pool,
+            torch.tensor([[1.5, 4.5], [3.0, 7.0]], dtype=torch.float32),
+        )
+        torch.testing.assert_close(
+            max_pool,
+            torch.tensor([[2.0, 5.0], [3.0, 7.0]], dtype=torch.float32),
+        )
+
+    def test_supervised_prepare_rejects_layer_sequence_bundle_for_sklearn_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle = build_tiny_multi_arch_provenance_merge_bundle(tmp_path)
+            feature_root = bundle["feature_root"]
+            aggregated_output_dir = feature_root / "mixed_arch_layer_sequence" / "merged"
+
+            aggregate_proc = run_cli(
+                [
+                    "util",
+                    "aggregate-features",
+                    "--feature-file",
+                    "merged_all",
+                    "--output-filename",
+                    "mixed_arch_layer_sequence",
+                    "--feature-root",
+                    str(feature_root),
+                    "--operator",
+                    "avg",
+                    "--layout",
+                    "layer_sequence",
+                    "--features",
+                    "energy",
+                    "stable_rank",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if aggregate_proc.returncode != 0:
+                self.fail(aggregate_proc.stderr + aggregate_proc.stdout)
+
+            manifest = tmp_path / "mixed_arch_supervised_manifest.json"
+            write_path_manifest(manifest, [str(entry) for entry in bundle["manifest_entries"]])
+
+            proc = run_cli(
+                [
+                    "run",
+                    "supervised",
+                    "--stage",
+                    "prepare",
+                    "--manifest-json",
+                    str(manifest),
+                    "--dataset-root",
+                    str(tmp_path),
+                    "--output-root",
+                    str(tmp_path / "runs"),
+                    "--run-id",
+                    "supervised_bad_layer_sequence_lr",
+                    "--model",
+                    "logistic_regression",
+                    "--features",
+                    "energy",
+                    "stable_rank",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                    "--feature-file",
+                    str(aggregated_output_dir / "spectral_features.npy"),
+                ],
+                cwd=REPO_ROOT,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("does not support representation_kind", proc.stderr + proc.stdout)
+
+    def test_supervised_prepare_rejects_flat_bundle_for_cnn_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle = build_tiny_multi_arch_provenance_merge_bundle(tmp_path)
+            feature_root = bundle["feature_root"]
+            aggregated_output_dir = feature_root / "mixed_arch_flat" / "merged"
+
+            aggregate_proc = run_cli(
+                [
+                    "util",
+                    "aggregate-features",
+                    "--feature-file",
+                    "merged_all",
+                    "--output-filename",
+                    "mixed_arch_flat",
+                    "--feature-root",
+                    str(feature_root),
+                    "--operator",
+                    "avg",
+                    "--features",
+                    "energy",
+                    "stable_rank",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if aggregate_proc.returncode != 0:
+                self.fail(aggregate_proc.stderr + aggregate_proc.stdout)
+
+            manifest = tmp_path / "mixed_arch_supervised_manifest.json"
+            write_path_manifest(manifest, [str(entry) for entry in bundle["manifest_entries"]])
+
+            proc = run_cli(
+                [
+                    "run",
+                    "supervised",
+                    "--stage",
+                    "prepare",
+                    "--manifest-json",
+                    str(manifest),
+                    "--dataset-root",
+                    str(tmp_path),
+                    "--output-root",
+                    str(tmp_path / "runs"),
+                    "--run-id",
+                    "supervised_bad_flat_cnn",
+                    "--model",
+                    "cnn_1d",
+                    "--features",
+                    "energy",
+                    "stable_rank",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                    "--feature-file",
+                    str(aggregated_output_dir / "spectral_features.npy"),
+                ],
+                cwd=REPO_ROOT,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("does not support representation_kind", proc.stderr + proc.stdout)
+
+    def test_supervised_prepare_all_filters_models_for_layer_sequence_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle = build_tiny_multi_arch_provenance_merge_bundle(tmp_path)
+            feature_root = bundle["feature_root"]
+            aggregated_output_dir = feature_root / "mixed_arch_layer_sequence" / "merged"
+
+            aggregate_proc = run_cli(
+                [
+                    "util",
+                    "aggregate-features",
+                    "--feature-file",
+                    "merged_all",
+                    "--output-filename",
+                    "mixed_arch_layer_sequence",
+                    "--feature-root",
+                    str(feature_root),
+                    "--operator",
+                    "avg",
+                    "--layout",
+                    "layer_sequence",
+                    "--features",
+                    "energy",
+                    "stable_rank",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if aggregate_proc.returncode != 0:
+                self.fail(aggregate_proc.stderr + aggregate_proc.stdout)
+
+            manifest = tmp_path / "mixed_arch_supervised_manifest.json"
+            write_path_manifest(manifest, [str(entry) for entry in bundle["manifest_entries"]])
+            runs_root = tmp_path / "runs"
+            run_id = "supervised_all_layer_sequence_prepare"
+            proc = run_cli(
+                [
+                    "run",
+                    "supervised",
+                    "--stage",
+                    "prepare",
+                    "--manifest-json",
+                    str(manifest),
+                    "--dataset-root",
+                    str(tmp_path),
+                    "--output-root",
+                    str(runs_root),
+                    "--run-id",
+                    run_id,
+                    "--model",
+                    "all",
+                    "--features",
+                    "energy",
+                    "stable_rank",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                    "--feature-file",
+                    str(aggregated_output_dir / "spectral_features.npy"),
+                    "--cv-folds",
+                    "2",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr + proc.stdout)
+
+            tuning_manifest = load_json_file(
+                runs_root / "supervised" / run_id / "reports" / "tuning_manifest.json"
+            )
+            self.assertEqual(tuning_manifest["tuning"]["model_names"], ["cnn_1d"])
+            self.assertTrue(
+                any(
+                    "Filtered incompatible supervised models" in str(x)
+                    for x in tuning_manifest.get("warnings", [])
+                )
+            )
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_supervised_runs_on_layer_sequence_bundle_with_cnn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle = build_tiny_multi_arch_provenance_merge_bundle(tmp_path)
+            feature_root = bundle["feature_root"]
+            aggregated_output_dir = feature_root / "mixed_arch_layer_sequence" / "merged"
+
+            aggregate_proc = run_cli(
+                [
+                    "util",
+                    "aggregate-features",
+                    "--feature-file",
+                    "merged_all",
+                    "--output-filename",
+                    "mixed_arch_layer_sequence",
+                    "--feature-root",
+                    str(feature_root),
+                    "--operator",
+                    "avg",
+                    "--layout",
+                    "layer_sequence",
+                    "--features",
+                    "energy",
+                    "stable_rank",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if aggregate_proc.returncode != 0:
+                self.fail(aggregate_proc.stderr + aggregate_proc.stdout)
+
+            manifest = tmp_path / "mixed_arch_supervised_manifest.json"
+            write_path_manifest(manifest, [str(entry) for entry in bundle["manifest_entries"]])
+            runs_root = tmp_path / "runs"
+            run_id = "supervised_layer_sequence_cnn"
+            proc = run_cli(
+                [
+                    "run",
+                    "supervised",
+                    "--manifest-json",
+                    str(manifest),
+                    "--dataset-root",
+                    str(tmp_path),
+                    "--output-root",
+                    str(runs_root),
+                    "--run-id",
+                    run_id,
+                    "--model",
+                    "cnn_1d",
+                    "--features",
+                    "energy",
+                    "stable_rank",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                    "--feature-file",
+                    str(aggregated_output_dir / "spectral_features.npy"),
+                    "--cv-folds",
+                    "2",
+                    "--n-jobs",
+                    "1",
+                    "--tuning-executor",
+                    "local",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr + proc.stdout)
+
+            run_dir = runs_root / "supervised" / run_id
+            report = load_json_file(run_dir / "reports" / "supervised_report.json")
+            run_config = load_json_file(run_dir / "run_config.json")
+            artifact_index = load_json_file(run_dir / "artifact_index.json")
+            self.assertEqual(
+                report["representation"]["extractor_metadata"]["representation_kind"],
+                ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,
+            )
+            self.assertEqual(run_config["winner_feature_weights_mode"], "unsupported_for_backend")
+            self.assertTrue(str(artifact_index["best_model"]).endswith("best_model.pt"))
+            self.assertNotIn("winner_feature_weights_coefficients_csv", artifact_index)
+            self.assertTrue((run_dir / "models" / "best_model.pt").exists())
+            try:
+                checkpoint = torch.load(
+                    run_dir / "models" / "best_model.pt",
+                    map_location="cpu",
+                    weights_only=False,
+                )
+            except TypeError:
+                checkpoint = torch.load(run_dir / "models" / "best_model.pt", map_location="cpu")
+            self.assertEqual(checkpoint["config"]["stride"], 1)
+            self.assertEqual(checkpoint["config"]["dilation"], 1)
+            self.assertTrue(checkpoint["config"]["use_residual"])
+            self.assertEqual(checkpoint["config"]["normalization"], "layernorm")
+            self.assertEqual(checkpoint["config"]["pooling"], "mean_max")
+            self.assertTrue(checkpoint["config"]["include_total_layer_count"])
+            self.assertEqual(checkpoint["config"]["depth_feature_mode"], "both")
+            self.assertIn(checkpoint["config"]["num_conv_layers"], {2, 3})
+            self.assertIn("channel_layout", checkpoint)
+            self.assertIn("slot_names", checkpoint["channel_layout"])
+            self.assertGreater(int(checkpoint["config"]["input_channels"]), 0)
 
     def test_supervised_runs_on_aggregated_mixed_architecture_bundle(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -4512,6 +5536,7 @@ class TestCliAndPipeline(unittest.TestCase):
     def test_supervised_registry_expanded_models_and_pipelines(self):
         expected_counts = {
             "adaboost": 32,
+            "cnn_1d": 64,
             "kernel_svm": 40,
             "linear_svm": 12,
             "logistic_regression": 12,
@@ -4520,6 +5545,7 @@ class TestCliAndPipeline(unittest.TestCase):
         }
         expected_policies = {
             "adaboost": "passthrough",
+            "cnn_1d": "masked_train_only",
             "kernel_svm": "standard_scaler",
             "linear_svm": "standard_scaler",
             "logistic_regression": "standard_scaler",
@@ -4533,6 +5559,15 @@ class TestCliAndPipeline(unittest.TestCase):
             params = candidate_params(model_name)
             self.assertEqual(len(params), expected_count)
             self.assertEqual(normalization_policy(model_name), expected_policies[model_name])
+
+            if model_name == "cnn_1d":
+                if torch is None:
+                    with self.assertRaises(ModuleNotFoundError):
+                        create(model_name, params=params[0], random_state=42)
+                else:
+                    model_obj = create(model_name, params=params[0], random_state=42)
+                    self.assertEqual(type(model_obj).__name__, "CNN1DSupervisedModel")
+                continue
 
             pipeline = create(model_name, params=params[0], random_state=42)
             self.assertIsInstance(pipeline, Pipeline)
@@ -4605,6 +5640,7 @@ class TestCliAndPipeline(unittest.TestCase):
             self.assertTrue(
                 any("Large supervised grid search" in str(x) for x in payload.get("warnings", []))
             )
+            self.assertNotIn("cnn_1d", payload["tuning"]["model_names"])
             self.assertEqual(
                 sorted({task["normalization_policy"] for task in payload["tuning"]["tasks"]}),
                 ["passthrough", "standard_scaler"],

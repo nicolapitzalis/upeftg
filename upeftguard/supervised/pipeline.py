@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -69,12 +70,20 @@ from .distributed import (
     resolve_slurm_cpus_per_task,
     resolve_slurm_max_concurrent,
 )
+from .interfaces import (
+    ARCHITECTURE_INDEPENDENT_AGGREGATION_KIND,
+    ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,
+    SupervisedFeatureBundle,
+    TABULAR_SPECTRAL_REPRESENTATION_KIND,
+)
 from .registry import (
     candidate_params,
     create,
+    model_backend,
     model_complexity_rank,
     normalization_policy,
     registered_models,
+    supported_representation_kinds,
 )
 
 
@@ -84,6 +93,19 @@ FINALIZE_STATE_FILENAME = "finalize_state.json"
 FINALIZE_EXPORT_TRAIN_FEATURES_FILENAME = "winner_feature_weights_train_features.npy"
 FINALIZE_EXPORT_TRAIN_LABELS_FILENAME = "winner_feature_weights_train_labels.npy"
 SELECTED_THRESHOLD_FILENAME = "selected_threshold.json"
+GROUP_MASK_SUFFIX = "_group_mask.npy"
+VALUE_MASK_SUFFIX = "_value_mask.npy"
+GROUP_NAMES_SUFFIX = "_group_names.json"
+
+
+@dataclass(frozen=True)
+class ResolvedFeatureBundlePaths:
+    feature_path: Path
+    model_names_path: Path
+    metadata_path: Path | None
+    group_mask_path: Path | None
+    value_mask_path: Path | None
+    group_names_path: Path | None
 
 
 def _detect_manifest_mode(manifest_json: Path) -> str:
@@ -149,7 +171,7 @@ def _resolve_supervised_feature_bundle_paths(
     feature_spec: Path,
     *,
     feature_root: Path = DEFAULT_FEATURE_EXTRACT_ROOT,
-) -> tuple[Path, Path, Path | None]:
+) -> ResolvedFeatureBundlePaths:
     resolved_feature_root = _resolve_feature_extract_root(feature_root)
     candidate = feature_spec.expanduser()
     local_candidate = candidate if candidate.is_absolute() else (Path.cwd().resolve() / candidate)
@@ -181,10 +203,35 @@ def _resolve_supervised_feature_bundle_paths(
         "_metadata.json",
         required=False,
     )
-    resolved_metadata_path = (
-        metadata_candidate.expanduser().resolve() if metadata_candidate.exists() else None
+    group_mask_candidate = _resolve_existing_companion_path(
+        resolved_feature_path,
+        GROUP_MASK_SUFFIX,
+        required=False,
     )
-    return resolved_feature_path, resolved_model_names_path, resolved_metadata_path
+    value_mask_candidate = _resolve_existing_companion_path(
+        resolved_feature_path,
+        VALUE_MASK_SUFFIX,
+        required=False,
+    )
+    group_names_candidate = _resolve_existing_companion_path(
+        resolved_feature_path,
+        GROUP_NAMES_SUFFIX,
+        required=False,
+    )
+    return ResolvedFeatureBundlePaths(
+        feature_path=resolved_feature_path,
+        model_names_path=resolved_model_names_path,
+        metadata_path=(metadata_candidate.expanduser().resolve() if metadata_candidate.exists() else None),
+        group_mask_path=(
+            group_mask_candidate.expanduser().resolve() if group_mask_candidate.exists() else None
+        ),
+        value_mask_path=(
+            value_mask_candidate.expanduser().resolve() if value_mask_candidate.exists() else None
+        ),
+        group_names_path=(
+            group_names_candidate.expanduser().resolve() if group_names_candidate.exists() else None
+        ),
+    )
 
 
 def _round_half_up(value: float) -> int:
@@ -812,6 +859,101 @@ def _build_requested_feature_names(
     )
 
 
+def _normalized_representation_kind(metadata: dict[str, Any] | None, *, feature_ndim: int | None = None) -> str:
+    if isinstance(metadata, dict):
+        raw_kind = metadata.get("representation_kind")
+        if isinstance(raw_kind, str) and raw_kind.strip():
+            return str(raw_kind).strip()
+    if feature_ndim == 4:
+        return ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND
+    return TABULAR_SPECTRAL_REPRESENTATION_KIND
+
+
+def _slice_supervised_features(features: np.ndarray | SupervisedFeatureBundle, indices: np.ndarray) -> Any:
+    resolved_indices = np.asarray(indices, dtype=np.int64)
+    if isinstance(features, SupervisedFeatureBundle):
+        return features.subset(resolved_indices)
+    return np.asarray(features[resolved_indices], dtype=np.float32)
+
+
+def _tabular_array_or_raise(features: np.ndarray | SupervisedFeatureBundle) -> np.ndarray:
+    if isinstance(features, SupervisedFeatureBundle):
+        raise ValueError("This operation requires a tabular feature matrix, but the run uses a structured bundle")
+    return np.asarray(features, dtype=np.float32)
+
+
+def _supervised_feature_row_count(features: np.ndarray | SupervisedFeatureBundle) -> int:
+    if isinstance(features, SupervisedFeatureBundle):
+        return int(features.n_samples)
+    return int(features.shape[0])
+
+
+def _compatible_model_names_for_representation(
+    *,
+    requested_model_name: str,
+    representation_kind: str,
+) -> tuple[list[str], list[str]]:
+    registered = registered_models()
+    compatible = [
+        name
+        for name in registered
+        if str(representation_kind) in supported_representation_kinds(name)
+    ]
+    incompatible = [name for name in registered if name not in compatible]
+    if requested_model_name == "all":
+        if not compatible:
+            raise ValueError(
+                "No registered supervised models support representation_kind="
+                f"{representation_kind!r}"
+            )
+        return compatible, incompatible
+
+    if requested_model_name not in registered:
+        raise ValueError(
+            f"Unknown supervised model '{requested_model_name}'. Registered: {registered}"
+        )
+    if str(representation_kind) not in supported_representation_kinds(requested_model_name):
+        raise ValueError(
+            f"Supervised model '{requested_model_name}' does not support representation_kind="
+            f"{representation_kind!r}"
+        )
+    return [requested_model_name], incompatible
+
+
+def _validate_layer_sequence_external_bundle(
+    *,
+    metadata: dict[str, Any],
+    spectral_features: list[str],
+    spectral_sv_top_k: int,
+    spectral_moment_source: str,
+    spectral_qv_sum_mode: str,
+) -> dict[str, Any]:
+    selected_features = resolve_spectral_features(spectral_features)
+    resolved_moment_source = resolve_spectral_moment_source(spectral_moment_source)
+    resolved_qv_sum_mode = resolve_spectral_qv_sum_mode(spectral_qv_sum_mode)
+
+    metadata_features = metadata.get("resolved_features")
+    if not isinstance(metadata_features, list) or [str(x) for x in metadata_features] != list(selected_features):
+        raise ValueError(
+            "Structured external feature bundle was already aggregated with a different --features selection"
+        )
+    if "sv_topk" in selected_features and int(metadata.get("sv_top_k", spectral_sv_top_k)) != int(
+        spectral_sv_top_k
+    ):
+        raise ValueError(
+            "Structured external feature bundle was aggregated with a different --spectral-sv-top-k"
+        )
+    if str(metadata.get("spectral_moment_source", resolved_moment_source)) != str(resolved_moment_source):
+        raise ValueError(
+            "Structured external feature bundle was aggregated with a different --spectral-moment-source"
+        )
+    if str(metadata.get("spectral_qv_sum_mode", resolved_qv_sum_mode)) != str(resolved_qv_sum_mode):
+        raise ValueError(
+            "Structured external feature bundle was aggregated with a different --spectral-qv-sum-mode"
+        )
+    return sanitize_spectral_metadata(dict(metadata))
+
+
 def _filter_external_spectral_columns(
     *,
     features: np.ndarray,
@@ -918,13 +1060,16 @@ def _load_external_spectral_bundle(
     feature_file: Path,
     model_names_file: Path,
     metadata_file: Path | None,
+    group_mask_file: Path | None,
+    value_mask_file: Path | None,
+    group_names_file: Path | None,
     expected_model_names: list[str],
     spectral_features: list[str],
     spectral_sv_top_k: int,
     spectral_moment_source: str,
     spectral_qv_sum_mode: str,
     allow_manifest_subset: bool = False,
-) -> tuple[np.ndarray, dict[str, Any], list[str], np.ndarray]:
+) -> tuple[np.ndarray | SupervisedFeatureBundle, dict[str, Any], list[str], np.ndarray]:
     if not feature_file.exists():
         raise FileNotFoundError(f"Feature file not found: {feature_file}")
     if not model_names_file.exists():
@@ -933,8 +1078,10 @@ def _load_external_spectral_bundle(
         raise FileNotFoundError(f"Feature metadata file not found: {metadata_file}")
 
     features_mmap = np.load(feature_file, mmap_mode="r")
-    if features_mmap.ndim != 2:
-        raise ValueError(f"Expected a 2D feature matrix at {feature_file}, got shape={features_mmap.shape}")
+    if features_mmap.ndim not in {2, 4}:
+        raise ValueError(
+            f"Expected a 2D or 4D feature bundle at {feature_file}, got shape={features_mmap.shape}"
+        )
 
     with open(model_names_file, "r", encoding="utf-8") as f:
         model_names = [str(x) for x in json.load(f)]
@@ -949,6 +1096,17 @@ def _load_external_spectral_bundle(
         loaded = load_spectral_metadata(metadata_file)
         if isinstance(loaded, dict):
             metadata = dict(loaded)
+    representation_kind = _normalized_representation_kind(metadata, feature_ndim=int(features_mmap.ndim))
+    if str(representation_kind) == ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND and features_mmap.ndim != 4:
+        raise ValueError(
+            "Structured layer-sequence metadata requires a 4D feature tensor, "
+            f"but {feature_file} has shape={features_mmap.shape}"
+        )
+    if str(representation_kind) != ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND and features_mmap.ndim != 2:
+        raise ValueError(
+            "Tabular supervised representations require a 2D feature matrix, "
+            f"but {feature_file} has shape={features_mmap.shape}"
+        )
 
     ext_index = _unique_index_by_name(model_names, context=str(model_names_file))
     expected_index = _unique_index_by_name(expected_model_names, context="manifest model names")
@@ -1007,12 +1165,70 @@ def _load_external_spectral_bundle(
         warnings.append("Reordered external features to match manifest model order using model names")
 
     metadata = dict(metadata)
+    metadata["representation_kind"] = str(representation_kind)
     metadata["n_models"] = int(features.shape[0])
     metadata["external_manifest_requested_n_models"] = int(requested_rows)
     metadata["external_manifest_selected_n_models"] = int(features.shape[0])
     metadata["external_manifest_missing_model_count"] = int(len(missing))
     if source_rows != int(features.shape[0]):
         metadata["external_source_n_models"] = int(source_rows)
+
+    if str(representation_kind) == ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND:
+        if group_mask_file is None or not group_mask_file.exists():
+            raise FileNotFoundError(
+                "Structured external feature bundle is missing the required group-mask companion"
+            )
+        if value_mask_file is None or not value_mask_file.exists():
+            raise FileNotFoundError(
+                "Structured external feature bundle is missing the required value-mask companion"
+            )
+        if group_names_file is None or not group_names_file.exists():
+            raise FileNotFoundError(
+                "Structured external feature bundle is missing the required group-names companion"
+            )
+
+        group_mask_mmap = np.load(group_mask_file, mmap_mode="r")
+        value_mask_mmap = np.load(value_mask_file, mmap_mode="r")
+        if group_mask_mmap.shape != features_mmap.shape[:2]:
+            raise ValueError(
+                f"group_mask shape {group_mask_mmap.shape} does not match feature tensor shape {features_mmap.shape[:2]}"
+            )
+        if value_mask_mmap.shape != features_mmap.shape:
+            raise ValueError(
+                f"value_mask shape {value_mask_mmap.shape} does not match feature tensor shape {features_mmap.shape}"
+            )
+        with open(group_names_file, "r", encoding="utf-8") as f:
+            raw_group_names = json.load(f)
+        if not isinstance(raw_group_names, list) or len(raw_group_names) != source_rows:
+            raise ValueError(
+                "Structured external feature bundle group-names companion must be a row-aligned JSON list"
+            )
+
+        selected_group_names = [
+            [str(x) for x in raw_group_names[int(source_idx)]]
+            for source_idx in row_indices.tolist()
+        ]
+        metadata = _validate_layer_sequence_external_bundle(
+            metadata=metadata,
+            spectral_features=spectral_features,
+            spectral_sv_top_k=spectral_sv_top_k,
+            spectral_moment_source=spectral_moment_source,
+            spectral_qv_sum_mode=spectral_qv_sum_mode,
+        )
+        metadata["structural_group_names"] = [list(names) for names in selected_group_names]
+        return (
+            SupervisedFeatureBundle(
+                values=features,
+                representation_kind=str(representation_kind),
+                metadata=dict(metadata),
+                group_mask=np.asarray(group_mask_mmap[row_indices], dtype=bool),
+                value_mask=np.asarray(value_mask_mmap[row_indices], dtype=bool),
+                group_names=selected_group_names,
+            ),
+            metadata,
+            warnings,
+            selected_expected_indices,
+        )
 
     features, metadata, column_warnings = _filter_external_spectral_columns(
         features=features,
@@ -1027,7 +1243,9 @@ def _load_external_spectral_bundle(
     return features, metadata, warnings, selected_expected_indices
 
 
-def _load_features_for_tuning_manifest(manifest: dict[str, Any]) -> np.ndarray:
+def _load_features_for_tuning_manifest(
+    manifest: dict[str, Any],
+) -> np.ndarray | SupervisedFeatureBundle:
     data = manifest.get("data")
     if not isinstance(data, dict):
         raise ValueError("Tuning manifest is missing data configuration")
@@ -1065,6 +1283,9 @@ def _load_features_for_tuning_manifest(manifest: dict[str, Any]) -> np.ndarray:
     external_feature_source = extractor_metadata.get("external_feature_source")
     external_model_names_source = extractor_metadata.get("external_model_names_source")
     external_metadata_source = extractor_metadata.get("external_metadata_source")
+    external_group_mask_source = extractor_metadata.get("external_group_mask_source")
+    external_value_mask_source = extractor_metadata.get("external_value_mask_source")
+    external_group_names_source = extractor_metadata.get("external_group_names_source")
     if not isinstance(external_feature_source, str) or not external_feature_source:
         raise ValueError("Tuning manifest is missing extractor.metadata.external_feature_source")
     if not isinstance(external_model_names_source, str) or not external_model_names_source:
@@ -1082,6 +1303,21 @@ def _load_features_for_tuning_manifest(manifest: dict[str, Any]) -> np.ndarray:
         metadata_file=(
             Path(external_metadata_source)
             if isinstance(external_metadata_source, str) and external_metadata_source
+            else None
+        ),
+        group_mask_file=(
+            Path(external_group_mask_source)
+            if isinstance(external_group_mask_source, str) and external_group_mask_source
+            else None
+        ),
+        value_mask_file=(
+            Path(external_value_mask_source)
+            if isinstance(external_value_mask_source, str) and external_value_mask_source
+            else None
+        ),
+        group_names_file=(
+            Path(external_group_names_source)
+            if isinstance(external_group_names_source, str) and external_group_names_source
             else None
         ),
         expected_model_names=expected_model_names,
@@ -1195,7 +1431,10 @@ def _grid_search_warnings(
     return warnings
 
 
-def _predict_scores(model: Any, x: np.ndarray) -> np.ndarray:
+def _predict_scores(model: Any, x: Any) -> np.ndarray:
+    if hasattr(model, "predict_scores"):
+        scores = np.asarray(model.predict_scores(x), dtype=np.float64)
+        return scores.reshape(-1)
     if hasattr(model, "predict_proba"):
         proba = np.asarray(model.predict_proba(x), dtype=np.float64)
         if proba.ndim == 2 and proba.shape[1] >= 2:
@@ -1214,17 +1453,29 @@ def _predict_scores(model: Any, x: np.ndarray) -> np.ndarray:
 
 def _evaluate_fold(
     *,
-    features: np.ndarray,
+    features: np.ndarray | SupervisedFeatureBundle,
     labels: np.ndarray,
     train_indices: np.ndarray,
     valid_indices: np.ndarray,
     model_name: str,
     params: dict[str, Any],
     random_state: int,
+    n_jobs: int,
 ) -> dict[str, Any]:
     model = create(model_name, params=params, random_state=random_state)
-    model.fit(features[train_indices], labels[train_indices])
-    scores = _predict_scores(model, features[valid_indices])
+    train_features = _slice_supervised_features(features, train_indices)
+    valid_features = _slice_supervised_features(features, valid_indices)
+    backend = model_backend(model_name)
+    if backend == "cnn":
+        model.fit(
+            train_features,
+            labels[train_indices],
+            validation_data=(valid_features, labels[valid_indices]),
+            n_jobs=n_jobs,
+        )
+    else:
+        model.fit(train_features, labels[train_indices])
+    scores = _predict_scores(model, valid_features)
     auc = float(roc_auc_score(labels[valid_indices], scores))
     return {
         "n_train": int(train_indices.size),
@@ -1235,7 +1486,7 @@ def _evaluate_fold(
 
 def _evaluate_candidate(
     *,
-    features: np.ndarray,
+    features: np.ndarray | SupervisedFeatureBundle,
     labels: np.ndarray,
     task: dict[str, Any],
     cv_split_groups: list[dict[str, Any]],
@@ -1247,7 +1498,8 @@ def _evaluate_candidate(
         for split in group["cv_splits"]:
             eval_jobs.append((seed, split))
 
-    if n_jobs == 1 or len(eval_jobs) <= 1 or joblib is None:
+    backend = model_backend(str(task["model_name"]))
+    if backend != "sklearn" or n_jobs == 1 or len(eval_jobs) <= 1 or joblib is None:
         evaluated: list[tuple[int, dict[str, Any]]] = []
         for seed, split in eval_jobs:
             tr = np.asarray(split["train_indices"], dtype=np.int64)
@@ -1260,6 +1512,7 @@ def _evaluate_candidate(
                 model_name=str(task["model_name"]),
                 params=dict(task["params"]),
                 random_state=seed,
+                n_jobs=n_jobs,
             )
             row["cv_random_state"] = int(seed)
             evaluated.append((seed, row))
@@ -1273,6 +1526,7 @@ def _evaluate_candidate(
                 model_name=str(task["model_name"]),
                 params=dict(task["params"]),
                 random_state=seed,
+                n_jobs=n_jobs,
             )
             for seed, split in eval_jobs
         )
@@ -1478,6 +1732,7 @@ def _summarize_attack_slice(
             [int(group_labels[i]) for i in range(len(group_labels)) if known_mask[i]],
             dtype=np.int32,
         )
+    known_scores = np.asarray(group_scores[known_mask], dtype=np.float64)
 
     summary = {
         "n_samples": int(group_scores.size),
@@ -1489,6 +1744,7 @@ def _summarize_attack_slice(
         },
         "score_summary": summarize_scores(group_scores),
         "score_percentile_rank_summary": summarize_scores(group_ranks),
+        "offline_metrics": compute_offline_metrics(known_labels, known_scores),
         "threshold_evaluation": _evaluate_attack_threshold_rows(
             group_scores=group_scores,
             known_mask=known_mask,
@@ -1691,13 +1947,14 @@ def _prepare_supervised_run(
     }
     extractor_warnings: list[str] = []
     feature_loading_mode = "external_source"
-    resolved_feature_file, resolved_model_names_file, resolved_metadata_file = (
-        _resolve_supervised_feature_bundle_paths(feature_file)
-    )
+    resolved_bundle_paths = _resolve_supervised_feature_bundle_paths(feature_file)
     features, external_metadata, external_warnings, selected_expected_indices = _load_external_spectral_bundle(
-        feature_file=resolved_feature_file,
-        model_names_file=resolved_model_names_file,
-        metadata_file=resolved_metadata_file,
+        feature_file=resolved_bundle_paths.feature_path,
+        model_names_file=resolved_bundle_paths.model_names_path,
+        metadata_file=resolved_bundle_paths.metadata_path,
+        group_mask_file=resolved_bundle_paths.group_mask_path,
+        value_mask_file=resolved_bundle_paths.value_mask_path,
+        group_names_file=resolved_bundle_paths.group_names_path,
         expected_model_names=[item.model_name for item in all_items],
         spectral_features=selected_spectral_features,
         spectral_sv_top_k=spectral_sv_top_k,
@@ -1728,16 +1985,31 @@ def _prepare_supervised_run(
     run_metadata_path = ctx.features_dir / "spectral_metadata.json"
     extractor_metadata = {
         **external_metadata,
-        "external_feature_source": str(resolved_feature_file),
-        "external_model_names_source": str(resolved_model_names_file),
+        "external_feature_source": str(resolved_bundle_paths.feature_path),
+        "external_model_names_source": str(resolved_bundle_paths.model_names_path),
         "external_metadata_source": (
-            str(resolved_metadata_file) if resolved_metadata_file is not None else None
+            str(resolved_bundle_paths.metadata_path) if resolved_bundle_paths.metadata_path is not None else None
+        ),
+        "external_group_mask_source": (
+            str(resolved_bundle_paths.group_mask_path)
+            if resolved_bundle_paths.group_mask_path is not None
+            else None
+        ),
+        "external_value_mask_source": (
+            str(resolved_bundle_paths.value_mask_path)
+            if resolved_bundle_paths.value_mask_path is not None
+            else None
+        ),
+        "external_group_names_source": (
+            str(resolved_bundle_paths.group_names_path)
+            if resolved_bundle_paths.group_names_path is not None
+            else None
         ),
         "loaded_external_features": True,
     }
     external_dataset_reference_payload = (
-        resolve_dataset_reference_for_metadata(resolved_metadata_file)
-        if resolved_metadata_file is not None
+        resolve_dataset_reference_for_metadata(resolved_bundle_paths.metadata_path)
+        if resolved_bundle_paths.metadata_path is not None
         else None
     )
     write_spectral_metadata(
@@ -1750,11 +2022,26 @@ def _prepare_supervised_run(
     )
 
     artifacts = {
-        "feature_path": str(resolved_feature_file),
+        "feature_path": str(resolved_bundle_paths.feature_path),
         "labels_path": None,
         "model_names_path": None,
         "metadata_path": str(run_metadata_path),
     }
+    representation_kind = _normalized_representation_kind(
+        external_metadata,
+        feature_ndim=(
+            int(features.values.ndim) if isinstance(features, SupervisedFeatureBundle) else int(features.ndim)
+        ),
+    )
+    model_names, incompatible_model_names = _compatible_model_names_for_representation(
+        requested_model_name=model_name,
+        representation_kind=representation_kind,
+    )
+    if model_name == "all" and incompatible_model_names:
+        extractor_warnings.append(
+            "Filtered incompatible supervised models for representation_kind="
+            f"{representation_kind!r}: skipped {incompatible_model_names}"
+        )
 
     labels_values, labels_known, labels_raw = _labels_from_items(all_items)
     split_warnings: list[str] = []
@@ -1855,7 +2142,6 @@ def _prepare_supervised_run(
     cv_splits = list(cv_split_groups[0]["cv_splits"])
 
     tasks: list[dict[str, Any]] = []
-    model_names = registered_models() if model_name == "all" else [model_name]
     task_index = 0
     for selected_model in model_names:
         complexity = model_complexity_rank(selected_model)
@@ -1903,7 +2189,7 @@ def _prepare_supervised_run(
         "manifest_json": str(manifest_json.expanduser().resolve()),
         "dataset_root": str(dataset_root),
         "data": {
-            "n_samples": int(features.shape[0]),
+            "n_samples": int(_supervised_feature_row_count(features)),
             "train_indices": [int(x) for x in fit_train_indices.tolist()],
             "train_pool_indices": [int(x) for x in train_pool_indices.tolist()],
             "calibration_indices": [int(x) for x in calibration_indices.tolist()],
@@ -2081,11 +2367,26 @@ def _select_winner(candidates: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _save_model(model: Any, path: Path) -> None:
+    if hasattr(model, "save"):
+        model.save(path)
+        return
     if joblib is not None:
         joblib.dump(model, path)
         return
     with open(path, "wb") as f:
         pickle.dump(model, f)
+
+
+def _winner_feature_weights_mode(
+    *,
+    skip_feature_importance: bool,
+    winner_model_name: str,
+) -> str:
+    if skip_feature_importance:
+        return "skipped"
+    if model_backend(winner_model_name) != "sklearn":
+        return "unsupported_for_backend"
+    return "pending"
 
 
 def _finalize_state_path(run_dir: Path) -> Path:
@@ -2131,6 +2432,50 @@ def _load_finalize_state(run_dir: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Expected JSON object in finalize state, got {type(payload).__name__}")
     return payload
+
+
+def _load_run_config(run_dir: Path) -> dict[str, Any] | None:
+    path = run_dir / "run_config.json"
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object in run config, got {type(payload).__name__}")
+    return payload
+
+
+def _already_finalized_winner_feature_weights_mode(run_dir: Path) -> str | None:
+    if _finalize_state_path(run_dir).exists():
+        return None
+    run_config = _load_run_config(run_dir)
+    if run_config is None:
+        return None
+    mode = str(run_config.get("winner_feature_weights_mode", ""))
+    if mode in {"skipped", "unsupported_for_backend"}:
+        return mode
+    return None
+
+
+def _completed_supervised_result(run_dir: Path) -> dict[str, Any]:
+    artifact_index_path = run_dir / "artifact_index.json"
+    if not artifact_index_path.exists():
+        raise FileNotFoundError(f"Artifact index not found: {artifact_index_path}")
+    with open(artifact_index_path, "r", encoding="utf-8") as f:
+        artifact_index = json.load(f)
+    if not isinstance(artifact_index, dict):
+        raise ValueError(f"Expected JSON object in artifact index, got {type(artifact_index).__name__}")
+    return {
+        "run_dir": str(run_dir),
+        "report": str(artifact_index.get("report")),
+        "train_scores_csv": str(artifact_index.get("train_scores_csv")),
+        "inference_scores_csv": (
+            str(artifact_index.get("inference_scores_csv"))
+            if artifact_index.get("inference_scores_csv")
+            else None
+        ),
+        "best_model": str(artifact_index.get("best_model")),
+    }
 
 
 def _cleanup_finalize_intermediates(run_dir: Path, state: dict[str, Any]) -> None:
@@ -2201,7 +2546,7 @@ def _prepare_supervised_finalize(
     )
     calibration_indices = np.asarray(manifest["data"].get("calibration_indices", []), dtype=np.int64)
     infer_indices = np.asarray(manifest["data"]["infer_indices"], dtype=np.int64)
-    x_train = features[train_indices]
+    x_train = _slice_supervised_features(features, train_indices)
     y_train = labels_value[train_indices]
 
     model = create(
@@ -2209,14 +2554,22 @@ def _prepare_supervised_finalize(
         params=dict(winner["params"]),
         random_state=int(manifest["tuning"]["random_state"]),
     )
-    model.fit(x_train, y_train)
+    winner_backend = model_backend(str(winner["model_name"]))
+    if winner_backend == "cnn":
+        model.fit(
+            x_train,
+            y_train,
+            n_jobs=int(manifest["tuning"].get("n_jobs", 1)),
+        )
+    else:
+        model.fit(x_train, y_train)
     train_scores = _predict_scores(model, x_train)
     threshold_specs = _build_threshold_specs(
         train_scores=np.asarray(train_scores, dtype=np.float64),
         percentiles=[float(x) for x in score_percentiles],
     )
 
-    model_path = ctx.models_dir / "best_model.joblib"
+    model_path = ctx.models_dir / ("best_model.pt" if winner_backend == "cnn" else "best_model.joblib")
     _save_model(model, model_path)
 
     train_model_names = [model_names[int(i)] for i in train_indices.tolist()]
@@ -2238,7 +2591,7 @@ def _prepare_supervised_finalize(
     calibration_labels_raw: list[int] = []
     calibration_scores: np.ndarray | None = None
     if calibration_indices.size > 0:
-        x_calibration = features[calibration_indices]
+        x_calibration = _slice_supervised_features(features, calibration_indices)
         y_calibration = labels_value[calibration_indices]
         calibration_scores = _predict_scores(model, x_calibration)
         calibration_model_names = [model_names[int(i)] for i in calibration_indices.tolist()]
@@ -2271,7 +2624,7 @@ def _prepare_supervised_finalize(
     infer_labels_np: np.ndarray | None = None
 
     if infer_indices.size > 0:
-        x_infer = features[infer_indices]
+        x_infer = _slice_supervised_features(features, infer_indices)
         infer_scores = _predict_scores(model, x_infer)
         infer_model_names = [model_names[int(i)] for i in infer_indices.tolist()]
         infer_sample_identities = [all_sample_identities[int(i)] for i in infer_indices.tolist()]
@@ -2384,7 +2737,7 @@ def _prepare_supervised_finalize(
     report = {
         "data_info": {
             "mode": manifest["mode"],
-            "n_samples": int(features.shape[0]),
+            "n_samples": int(_supervised_feature_row_count(features)),
             "n_train": int(train_indices.size),
             "n_training_pool": int(train_pool_indices.size),
             "n_calibration": int(calibration_indices.size),
@@ -2457,12 +2810,31 @@ def _prepare_supervised_finalize(
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(json_ready(report), f, indent=2)
 
+    from ..experiments.supervised_architecture_breakdown import (
+        build_supervised_results_summary,
+        write_supervised_results_summary_outputs,
+    )
+
+    results_summary = build_supervised_results_summary(run_dir=run_dir)
+    results_summary_outputs = write_supervised_results_summary_outputs(
+        run_dir=run_dir,
+        summary=results_summary,
+        update_report=True,
+        update_artifact_index=False,
+        remove_legacy_outputs=True,
+    )
+    results_summary_markdown_path = results_summary_outputs["results_summary_md"]
+
     export_train_features_path: Path | None = None
     export_train_labels_path: Path | None = None
-    if not skip_feature_importance:
+    winner_feature_weights_mode = _winner_feature_weights_mode(
+        skip_feature_importance=bool(skip_feature_importance),
+        winner_model_name=str(winner["model_name"]),
+    )
+    if winner_feature_weights_mode == "pending":
         export_train_features_path = ctx.features_dir / FINALIZE_EXPORT_TRAIN_FEATURES_FILENAME
         export_train_labels_path = ctx.features_dir / FINALIZE_EXPORT_TRAIN_LABELS_FILENAME
-        np.save(export_train_features_path, np.asarray(x_train, dtype=np.float32))
+        np.save(export_train_features_path, np.asarray(_tabular_array_or_raise(x_train), dtype=np.float32))
         np.save(export_train_labels_path, np.asarray(y_train, dtype=np.int32))
 
     run_config = {
@@ -2487,6 +2859,7 @@ def _prepare_supervised_finalize(
         "winner": winner,
         "threshold_selection": selected_threshold_summary,
         "skip_feature_importance": bool(skip_feature_importance),
+        "winner_feature_weights_mode": winner_feature_weights_mode,
         "warnings": manifest.get("warnings", []),
     }
     artifacts = {
@@ -2496,6 +2869,7 @@ def _prepare_supervised_finalize(
         "inference_scores_csv": str(infer_scores_csv) if infer_scores_csv is not None else None,
         "selected_threshold": str(selected_threshold_path) if selected_threshold_path is not None else None,
         "report": str(report_path),
+        "results_summary_md": str(results_summary_markdown_path),
         "tuning_manifest": str(tuning_manifest_path),
         "tuning_tasks_dir": str(task_dir),
     }
@@ -2516,6 +2890,7 @@ def _prepare_supervised_finalize(
         "calibration_scores_csv": str(calibration_scores_csv) if calibration_scores_csv is not None else None,
         "inference_scores_csv": str(infer_scores_csv) if infer_scores_csv is not None else None,
         "best_model": str(model_path),
+        "results_summary_md": str(results_summary_markdown_path),
         "train_features": x_train,
         "train_labels": y_train,
         "random_state": int(manifest["tuning"]["random_state"]),
@@ -2523,6 +2898,7 @@ def _prepare_supervised_finalize(
         "finalize_state_path": state_path,
         "winner_export_train_features": export_train_features_path,
         "winner_export_train_labels": export_train_labels_path,
+        "winner_feature_weights_mode": winner_feature_weights_mode,
     }
 
 
@@ -2578,14 +2954,14 @@ def _prepare_supervised_finalize_distributed(
         score_percentiles=score_percentiles,
         skip_feature_importance=skip_feature_importance,
     )
-    if skip_feature_importance:
+    if prepared["winner_feature_weights_mode"] != "pending":
         finalized = _complete_supervised_finalize(
             run_dir=run_dir,
             winner_exports=None,
         )
         return {
             **finalized,
-            "winner_feature_weights_mode": "skipped",
+            "winner_feature_weights_mode": prepared["winner_feature_weights_mode"],
             "winner_feature_weights_tasks": 0,
         }
     if prepared["winner_export_train_features"] is None or prepared["winner_export_train_labels"] is None:
@@ -2618,6 +2994,12 @@ def _run_supervised_finalize_worker(
     task_index: int,
     n_jobs: int | None,
 ) -> dict[str, Any]:
+    finalized_mode = _already_finalized_winner_feature_weights_mode(run_dir)
+    if finalized_mode is not None:
+        return {
+            "status": "skipped",
+            "reason": f"winner feature export already finalized for mode={finalized_mode!r}",
+        }
     return run_winner_feature_weights_export_worker(
         run_dir=run_dir,
         task_index=task_index,
@@ -2629,6 +3011,9 @@ def _merge_supervised_finalize(
     *,
     run_dir: Path,
 ) -> dict[str, Any]:
+    finalized_mode = _already_finalized_winner_feature_weights_mode(run_dir)
+    if finalized_mode is not None:
+        return _completed_supervised_result(run_dir)
     winner_exports = merge_winner_feature_weights_export(
         run_dir=run_dir,
         artifact_index_path=run_dir / "artifact_index.json",
@@ -2651,11 +3036,15 @@ def _finalize_supervised_run(
         score_percentiles=score_percentiles,
         skip_feature_importance=skip_feature_importance,
     )
-    if skip_feature_importance:
-        return _complete_supervised_finalize(
+    if prepared["winner_feature_weights_mode"] != "pending":
+        finalized = _complete_supervised_finalize(
             run_dir=run_dir,
             winner_exports=None,
         )
+        return {
+            **finalized,
+            "winner_feature_weights_mode": prepared["winner_feature_weights_mode"],
+        }
     winner_exports = export_winner_feature_weights(
         run_dir=run_dir,
         report_path=Path(prepared["report"]),

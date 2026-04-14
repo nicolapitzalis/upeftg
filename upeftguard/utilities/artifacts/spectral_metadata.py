@@ -331,9 +331,40 @@ def build_public_spectral_metadata(
     internal_metadata: Mapping[str, Any],
     dataset_layouts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    from ...features.spectral import sanitize_spectral_metadata
-
-    cleaned = sanitize_spectral_metadata(internal_metadata)
+    try:
+        from ...features.spectral import sanitize_spectral_metadata
+    except ModuleNotFoundError as exc:
+        if exc.name != "safetensors":
+            raise
+        cleaned = dict(internal_metadata)
+        raw_block_names = cleaned.get("block_names")
+        block_names = [str(x) for x in raw_block_names] if isinstance(raw_block_names, list) else None
+        if block_names is not None:
+            cleaned["block_names"] = block_names
+            cleaned["n_blocks"] = int(len(block_names))
+        for key in ("base_block_names", "qv_sum_block_names", "feature_names"):
+            value = cleaned.get(key)
+            if isinstance(value, list):
+                cleaned[key] = [str(x) for x in value]
+        extractor_params = cleaned.get("extractor_params")
+        if isinstance(extractor_params, dict):
+            if "resolved_features" not in cleaned and isinstance(extractor_params.get("spectral_features"), list):
+                cleaned["resolved_features"] = [str(x) for x in extractor_params["spectral_features"]]
+            if "sv_top_k" not in cleaned and "spectral_sv_top_k" in extractor_params:
+                cleaned["sv_top_k"] = int(extractor_params["spectral_sv_top_k"])
+            if "spectral_moment_source" not in cleaned and "spectral_moment_source" in extractor_params:
+                cleaned["spectral_moment_source"] = str(extractor_params["spectral_moment_source"])
+            if "spectral_qv_sum_mode" not in cleaned and "spectral_qv_sum_mode" in extractor_params:
+                cleaned["spectral_qv_sum_mode"] = str(extractor_params["spectral_qv_sum_mode"])
+            if (
+                "spectral_entrywise_delta_mode" not in cleaned
+                and "spectral_entrywise_delta_mode" in extractor_params
+            ):
+                cleaned["spectral_entrywise_delta_mode"] = str(
+                    extractor_params["spectral_entrywise_delta_mode"]
+                )
+    else:
+        cleaned = sanitize_spectral_metadata(internal_metadata)
     public = {
         key: value
         for key, value in cleaned.items()

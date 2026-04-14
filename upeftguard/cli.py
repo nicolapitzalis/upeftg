@@ -313,6 +313,7 @@ def _cmd_util_aggregate_features(args: argparse.Namespace) -> int:
         operator=args.operator,
         features=args.features,
         spectral_qv_sum_mode=args.spectral_qv_sum_mode,
+        layout=args.layout,
     )
 
     print("Feature aggregation complete")
@@ -320,6 +321,12 @@ def _cmd_util_aggregate_features(args: argparse.Namespace) -> int:
     print(f"Model names: {outputs['model_names_path']}")
     if outputs["labels_path"] is not None:
         print(f"Labels: {outputs['labels_path']}")
+    if outputs["group_mask_path"] is not None:
+        print(f"Group mask: {outputs['group_mask_path']}")
+    if outputs["value_mask_path"] is not None:
+        print(f"Value mask: {outputs['value_mask_path']}")
+    if outputs["group_names_path"] is not None:
+        print(f"Group names: {outputs['group_names_path']}")
     print(f"Metadata: {outputs['metadata_path']}")
     print(f"Dataset references: {outputs['dataset_reference_report_path']}")
     print(f"Aggregation report: {outputs['aggregation_report_path']}")
@@ -954,8 +961,14 @@ def build_parser() -> argparse.ArgumentParser:
     aggregate_feature_bundle.add_argument(
         "--operator",
         choices=["avg", "max", "min"],
-        required=True,
-        help="Aggregation operator applied over each role-feature group",
+        default="avg",
+        help="Aggregation operator for flat layout; ignored for layer_sequence",
+    )
+    aggregate_feature_bundle.add_argument(
+        "--layout",
+        choices=["flat", "layer_sequence"],
+        default="flat",
+        help="Output layout: flat row-wise aggregation or padded layer-sequence tensor",
     )
     aggregate_feature_bundle.add_argument(
         "--feature-root",

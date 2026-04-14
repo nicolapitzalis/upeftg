@@ -48,6 +48,7 @@ Experiment manifests are grouped under `manifests/` by study:
 - `zero_shots/attack_wise`
 - `zero_shots/rank_wise`
 - `zero_shots/adapter_wise`
+- `leave_one_out`
 - `rank_exploration`
 - `adapter_exploration`
 - `architecture_exploration`
@@ -244,6 +245,16 @@ For post-hoc distributed winner feature importance on an existing supervised run
 RUN_DIR=runs/supervised/<RUN_ID> sbatch ./sbatch/supervised_feature_importance_array.sh
 ```
 
+For the leave-one-out CNN sweep across the committed joint manifests:
+
+```bash
+bash scripts/run_all_leave_one_out_supervised_cnn.sh \
+  --hyperparam_config <REFERENCE_RUN_ID_OR_RUN_DIR> \
+  --dry_run
+```
+
+This launcher scans `manifests/leave_one_out/`, locks every run to the selected CNN winner, and writes outputs under `runs/supervised/leave_one_out_cnn/<RUN_ID>/`.
+
 The same contract applies to direct CLI runs and Slurm-array runs: supervised always consumes a precomputed feature bundle.
 
 ```bash
@@ -353,6 +364,6 @@ Use `--spectral-qv-sum-mode none|append|only` to exclude, include, or isolate q+
 
 ## Maintenance Scripts
 
-- `scripts/generate_backdoor_detection_summaries.py` is a post-processing helper for completed supervised runs. It expects run ids to follow the current manifest naming conventions under `manifests/zero_shots/`, `manifests/rank_exploration/`, `manifests/adapter_exploration/`, and `manifests/architecture_exploration/`.
+- `scripts/generate_backdoor_detection_summaries.py` is a post-processing helper for completed supervised runs. It expects run ids to follow the current manifest naming conventions under `manifests/zero_shots/`, `manifests/leave_one_out/`, `manifests/rank_exploration/`, `manifests/adapter_exploration/`, and `manifests/architecture_exploration/`.
 - `python -m upeftguard.utilities.maintenance.backfill_dataset_reference_reports --root <feature_extract_root>` can recreate missing dataset-reference reports for older feature and merge outputs.
 - `python -m upeftguard.utilities.maintenance.backfill_spectral_metadata --root <feature_extract_root>` rewrites older spectral metadata files into the current public/internal sidecar layout.

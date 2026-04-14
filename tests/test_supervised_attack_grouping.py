@@ -73,6 +73,29 @@ class TestSupervisedAttackGrouping(unittest.TestCase):
         self.assertCountEqual(list(summary["attacks"].keys()), ["toxic_backdoors_alpaca"])
         self.assertNotIn("unknown", summary["attacks"])
 
+    def test_attack_summary_includes_offline_metrics(self):
+        items = [
+            make_manifest_item("llama2_7b_imdb_syntactic_rank256_qv", 0, 0),
+            make_manifest_item("llama2_7b_imdb_syntactic_rank256_qv", 0, 1),
+            make_manifest_item("llama2_7b_imdb_syntactic_rank256_qv", 1, 2),
+            make_manifest_item("llama2_7b_imdb_syntactic_rank256_qv", 1, 3),
+        ]
+        identities = infer_attack_sample_identities(items)
+        scores = np.asarray([0.05, 0.15, 0.85, 0.95], dtype=np.float64)
+        summary = _summarize_attack_groups(
+            sample_identities=identities,
+            labels=[0, 0, 1, 1],
+            scores=scores,
+            threshold_specs=_build_threshold_specs(scores, [50.0]),
+        )
+
+        metrics = summary["attacks"]["syntactic"]["offline_metrics"]
+        self.assertAlmostEqual(metrics["auroc"], 1.0)
+        self.assertAlmostEqual(metrics["auprc"], 1.0)
+        self.assertAlmostEqual(metrics["precision_at_num_positives"], 1.0)
+        self.assertAlmostEqual(metrics["precision_at_5"], 0.5)
+        self.assertAlmostEqual(metrics["precision_at_10"], 0.5)
+
     def test_known_attack_aliases_are_canonicalized(self):
         items = [
             make_manifest_item("llama2_7b_imdb_RIPPLE_rank256_qv", 1, 0),

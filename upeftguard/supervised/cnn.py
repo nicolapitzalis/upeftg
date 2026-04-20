@@ -8,10 +8,14 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import f1_score, roc_auc_score
 
 from .interfaces import (
     ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,
+    BINARY_PROJECTION_ONE_MINUS_CLEAN_PROBABILITY,
+    BINARY_PROJECTION_POSITIVE_CLASS_SCORE,
+    SUPERVISED_TASK_MODE_BINARY,
+    SupervisedTaskSpec,
     SupervisedFeatureBundle,
 )
 
@@ -41,6 +45,16 @@ def _require_torch() -> None:
         raise ModuleNotFoundError(
             "cnn_1d requires the optional 'torch' dependency, but torch is not installed"
         )
+
+
+def _default_binary_task_spec() -> SupervisedTaskSpec:
+    class_names = ("clean", "backdoored")
+    return SupervisedTaskSpec(
+        task_mode=SUPERVISED_TASK_MODE_BINARY,
+        class_names=class_names,
+        class_to_index={name: idx for idx, name in enumerate(class_names)},
+        binary_projection=BINARY_PROJECTION_POSITIVE_CLASS_SCORE,
+    )
 
 
 @dataclass(frozen=True)
@@ -727,6 +741,7 @@ class _CNNLayerSequenceClassifier(TorchModuleBase):
         *,
         input_dim: int,
         config: CNNLayerVectorConfig,
+        output_dim: int,
     ) -> None:
         super().__init__()
         _require_torch()
@@ -735,11 +750,15 @@ class _CNNLayerSequenceClassifier(TorchModuleBase):
             input_dim=int(input_dim),
             config=config,
         )
-        self.head = nn.Linear(int(self.aggregator.embedding_dim), 1)
+        self.output_dim = int(output_dim)
+        self.head = nn.Linear(int(self.aggregator.embedding_dim), int(self.output_dim))
 
     def forward(self, inputs: torch.Tensor, layer_mask: torch.Tensor) -> torch.Tensor:
         embedding = self.aggregator(inputs, layer_mask)
-        return self.head(embedding).squeeze(1)
+        logits = self.head(embedding)
+        if self.output_dim == 1:
+            return logits.squeeze(1)
+        return logits
 
 
 class CNN1DSupervisedModel:
@@ -760,6 +779,7 @@ class CNN1DSupervisedModel:
         learning_rate: float,
         weight_decay: float,
         random_state: int,
+        task_spec: SupervisedTaskSpec | None = None,
         max_epochs: int = CNN_MAX_EPOCHS,
         batch_size: int = CNN_BATCH_SIZE,
         patience: int = CNN_PATIENCE,
@@ -804,6 +824,7 @@ class CNN1DSupervisedModel:
         self.learning_rate = float(learning_rate)
         self.weight_decay = float(weight_decay)
         self.random_state = int(random_state)
+        self.task_spec = task_spec if task_spec is not None else _default_binary_task_spec()
         self.max_epochs = int(max_epochs)
         self.batch_size = int(batch_size)
         self.patience = int(patience)
@@ -813,7 +834,8 @@ class CNN1DSupervisedModel:
         self.channel_mean_: np.ndarray | None = None
         self.channel_std_: np.ndarray | None = None
         self.input_channels_: int | None = None
-        self.classes_ = np.asarray([0, 1], dtype=np.int32)
+        self.classes_ = np.arange(self.task_spec.n_classes, dtype=np.int32)
+        self.class_names_ = tuple(str(x) for x in self.task_spec.class_names)
         self.backend_name_ = "cnn_1d"
         self._fit_summary: dict[str, Any] = {}
 
@@ -883,23 +905,29 @@ class CNN1DSupervisedModel:
         model = _CNNLayerSequenceClassifier(
             input_dim=int(input_channels),
             config=self.layer_vector_config,
+            output_dim=(1 if self.task_spec.is_binary else self.task_spec.n_classes),
         )
         self.input_channels_ = int(input_channels)
         return model
 
-    def _score_loader(self, loader: DataLoader) -> np.ndarray:
+    def _logits_from_loader(self, loader: DataLoader) -> np.ndarray:
         assert torch is not None
         if self.model_ is None:
             raise RuntimeError("cnn_1d model has not been fit")
         self.model_.eval()
-        scores: list[np.ndarray] = []
+        outputs: list[np.ndarray] = []
         with torch.no_grad():
             for batch_inputs, batch_layer_mask in loader:
                 logits = self.model_(batch_inputs, batch_layer_mask)
-                scores.append(logits.detach().cpu().numpy().astype(np.float64, copy=False))
-        if not scores:
-            return np.asarray([], dtype=np.float64)
-        return np.concatenate(scores, axis=0).reshape(-1)
+                outputs.append(logits.detach().cpu().numpy().astype(np.float64, copy=False))
+        if not outputs:
+            if self.task_spec.is_binary:
+                return np.asarray([], dtype=np.float64)
+            return np.asarray([], dtype=np.float64).reshape(0, self.task_spec.n_classes)
+        combined = np.concatenate(outputs, axis=0)
+        if self.task_spec.is_binary:
+            return combined.reshape(-1)
+        return np.asarray(combined, dtype=np.float64)
 
     def fit(
         self,
@@ -915,7 +943,10 @@ class CNN1DSupervisedModel:
         self._set_threads(n_jobs)
 
         train_tensors = self._prepare_numpy_inputs(bundle)
-        y_train = np.asarray(labels, dtype=np.float32).reshape(-1)
+        if self.task_spec.is_binary:
+            y_train = np.asarray(labels, dtype=np.float32).reshape(-1)
+        else:
+            y_train = np.asarray(labels, dtype=np.int64).reshape(-1)
         if train_tensors.inputs.shape[0] != y_train.shape[0]:
             raise ValueError("cnn_1d training features/labels length mismatch")
 
@@ -952,7 +983,7 @@ class CNN1DSupervisedModel:
             lr=float(self.learning_rate),
             weight_decay=float(self.weight_decay),
         )
-        loss_fn = nn.BCEWithLogitsLoss()
+        loss_fn = nn.BCEWithLogitsLoss() if self.task_spec.is_binary else nn.CrossEntropyLoss()
 
         best_state = None
         best_metric = -math.inf
@@ -977,14 +1008,19 @@ class CNN1DSupervisedModel:
             train_loss = train_loss_sum / max(1, train_count)
             metric = -train_loss
             if valid_loader is not None and y_valid is not None:
-                valid_scores = self._score_loader(valid_loader)
-                metric = float(roc_auc_score(y_valid, valid_scores))
+                valid_logits = self._logits_from_loader(valid_loader)
+                if self.task_spec.is_binary:
+                    metric = float(roc_auc_score(y_valid, valid_logits))
+                else:
+                    valid_pred = np.argmax(valid_logits, axis=1).astype(np.int32, copy=False)
+                    metric = float(f1_score(y_valid, valid_pred, average="macro"))
 
             history.append(
                 {
                     "epoch": float(epoch_idx),
                     "train_loss": float(train_loss),
                     "selection_metric": float(metric),
+                    "selection_metric_name": str(self.task_spec.selection_metric_name),
                 }
             )
 
@@ -1008,6 +1044,7 @@ class CNN1DSupervisedModel:
         self._fit_summary = {
             "best_epoch": int(best_epoch),
             "selection_metric": float(best_metric),
+            "selection_metric_name": str(self.task_spec.selection_metric_name),
             "epochs_ran": int(len(history)),
             "history": history,
         }
@@ -1028,15 +1065,25 @@ class CNN1DSupervisedModel:
             batch_size=min(self.batch_size, max(1, len(dataset))),
             shuffle=False,
         )
-        return self._score_loader(loader)
+        return self._logits_from_loader(loader)
 
     def predict_proba(self, bundle: SupervisedFeatureBundle) -> np.ndarray:
-        scores = self.decision_function(bundle)
-        probabilities = 1.0 / (1.0 + np.exp(-scores))
-        return np.column_stack([1.0 - probabilities, probabilities]).astype(np.float64, copy=False)
+        logits = self.decision_function(bundle)
+        if self.task_spec.is_binary:
+            probabilities = 1.0 / (1.0 + np.exp(-np.asarray(logits, dtype=np.float64).reshape(-1)))
+            return np.column_stack([1.0 - probabilities, probabilities]).astype(np.float64, copy=False)
+        logits_2d = np.asarray(logits, dtype=np.float64)
+        shifted = logits_2d - np.max(logits_2d, axis=1, keepdims=True)
+        exp_logits = np.exp(shifted)
+        normalizer = np.sum(exp_logits, axis=1, keepdims=True)
+        normalizer = np.where(normalizer > 0.0, normalizer, 1.0)
+        return np.asarray(exp_logits / normalizer, dtype=np.float64)
 
     def predict(self, bundle: SupervisedFeatureBundle) -> np.ndarray:
-        return (self.decision_function(bundle) >= 0.0).astype(np.int32, copy=False)
+        if self.task_spec.is_binary:
+            return (self.decision_function(bundle) >= 0.0).astype(np.int32, copy=False)
+        probabilities = self.predict_proba(bundle)
+        return np.argmax(probabilities, axis=1).astype(np.int32, copy=False)
 
     def save(self, path: Path) -> None:
         _require_torch()
@@ -1069,6 +1116,8 @@ class CNN1DSupervisedModel:
                 "batch_size": int(self.batch_size),
                 "patience": int(self.patience),
                 "input_channels": int(self.input_channels_ or 0),
+                "task_mode": str(self.task_spec.task_mode),
+                "num_classes": int(self.task_spec.n_classes),
             },
             "channel_layout": asdict(self.channel_layout_),
             "state_dict": self.model_.state_dict(),
@@ -1077,6 +1126,8 @@ class CNN1DSupervisedModel:
                 "channel_std": np.asarray(self.channel_std_, dtype=np.float32),
             },
             "classes": np.asarray(self.classes_, dtype=np.int32),
+            "class_names": list(self.class_names_),
+            "task": self.task_spec.to_dict(),
             "fit_summary": dict(self._fit_summary),
         }
         torch.save(payload, Path(path).expanduser().resolve())

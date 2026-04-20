@@ -1,0 +1,6 @@
+Run complete
+Run dir: /home/n.pitzalis/unsupervised-peftguard/runs/supervised/cnn_multiclass_list2_features_cnn_winner
+Tuning manifest: /home/n.pitzalis/unsupervised-peftguard/runs/supervised/cnn_multiclass_list2_features_cnn_winner/reports/tuning_manifest.json
+Report: /home/n.pitzalis/unsupervised-peftguard/runs/supervised/cnn_multiclass_list2_features_cnn_winner/reports/supervised_report.json
+Train scores: /home/n.pitzalis/unsupervised-peftguard/runs/supervised/cnn_multiclass_list2_features_cnn_winner/reports/train_scores.csv
+Inference scores: /home/n.pitzalis/unsupervised-peftguard/runs/supervised/cnn_multiclass_list2_features_cnn_winner/reports/inference_scores.csv

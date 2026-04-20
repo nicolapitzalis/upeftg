@@ -28,12 +28,17 @@ from ..utilities.artifacts.dataset_references import (
     load_dataset_reference_report,
     resolve_dataset_reference_payload_for_artifact,
 )
+from ..utilities.artifacts.export_feature_subset import (
+    _feature_group_for_feature_name,
+    _normalize_requested_features,
+    _resolve_model_owned_feature_names,
+)
 from ..utilities.artifacts.spectral_metadata import load_spectral_metadata
 from ..utilities.core.run_context import create_run_context
 from ..utilities.core.serialization import json_ready
 
 
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 DEFAULT_FEATURE_EXTRACT_ROOT = Path("runs") / "feature_extract"
 DEFAULT_SPECTRAL_MOMENT_SOURCE = "sv"
 SUPPORTED_GROUPINGS = ("rank",)
@@ -1719,6 +1724,732 @@ def run_layer_value_scatter_analysis(
         ),
         "feature_plots": plot_rows,
         "warnings": warnings,
+    }
+
+
+def _selected_rank_feature_names(
+    feature_names: list[str],
+    *,
+    requested_features: list[str] | None,
+) -> tuple[list[str], list[str] | None]:
+    normalized_requested_features = _normalize_requested_features(requested_features)
+    requested_feature_set = (
+        set(normalized_requested_features) if normalized_requested_features is not None else None
+    )
+
+    selected: list[str] = []
+    seen: set[str] = set()
+    available_feature_groups: set[str] = set()
+    for feature_name in feature_names:
+        emitted_feature = _emitted_feature_name(feature_name)
+        feature_group = _feature_group_for_feature_name(emitted_feature)
+        if feature_group is not None:
+            available_feature_groups.add(feature_group)
+        if requested_feature_set is not None and feature_group not in requested_feature_set:
+            continue
+        if emitted_feature in seen:
+            continue
+        seen.add(emitted_feature)
+        selected.append(emitted_feature)
+
+    if requested_feature_set is not None:
+        missing_features = [
+            feature_name
+            for feature_name in normalized_requested_features or []
+            if feature_name not in available_feature_groups
+        ]
+        if missing_features:
+            preview = ", ".join(missing_features[:5])
+            raise ValueError(
+                "Requested --features are not available for this feature bundle. "
+                f"Examples: {preview}"
+            )
+
+    if not selected:
+        raise ValueError("Rank feature value analysis resolved to zero emitted features")
+    return selected, normalized_requested_features
+
+
+def _rank_feature_label_specs(labels: np.ndarray) -> list[dict[str, Any]]:
+    specs: list[dict[str, Any]] = []
+    for label_value in (0, 1):
+        if not np.any(labels == label_value):
+            continue
+        label_name, color = _LABEL_STYLE[label_value]
+        specs.append(
+            {
+                "value": int(label_value),
+                "name": str(label_name),
+                "title": str(label_name).replace("_", " ").title(),
+                "color": str(color),
+            }
+        )
+    return specs
+
+
+def _spread_positions(center: float, count: int, jitter: float) -> np.ndarray:
+    if count <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    if count == 1 or jitter <= 0:
+        return np.full((count,), float(center), dtype=np.float32)
+    return np.linspace(
+        float(center) - float(jitter),
+        float(center) + float(jitter),
+        num=int(count),
+        dtype=np.float32,
+    )
+
+
+def _save_rank_feature_value_csv(
+    output_path: Path,
+    rows: list[dict[str, Any]],
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "index",
+                "model_name",
+                "label",
+                "rank",
+                "feature_name",
+                "value",
+                "source_column_count",
+            ],
+        )
+        writer.writeheader()
+        for index, row in enumerate(rows):
+            writer.writerow(
+                {
+                    "index": int(index),
+                    "model_name": str(row["model_name"]),
+                    "label": int(row["label"]),
+                    "rank": int(row["rank"]),
+                    "feature_name": str(row["feature_name"]),
+                    "value": float(row["value"]),
+                    "source_column_count": int(row["source_column_count"]),
+                }
+            )
+
+
+def _plot_rank_feature_value_scatter_on_axis(
+    *,
+    ax: Any,
+    rows: list[dict[str, Any]],
+    ordered_ranks: list[int],
+    rank_positions: dict[int, float],
+    label_specs: list[dict[str, Any]],
+    point_size: float,
+    alpha: float,
+    jitter: float,
+    title: str,
+    show_legend: bool,
+) -> bool:
+    if not ordered_ranks:
+        raise ValueError("ordered_ranks must include at least one rank")
+
+    label_offsets = np.linspace(-0.16, 0.16, num=max(1, len(label_specs)), dtype=np.float32)
+    drew_any_points = False
+
+    for label_offset, spec in zip(label_offsets, label_specs):
+        x_values: list[float] = []
+        y_values: list[float] = []
+        for rank in ordered_ranks:
+            group_rows = sorted(
+                (
+                    row
+                    for row in rows
+                    if int(row["rank"]) == int(rank) and int(row["label"]) == int(spec["value"])
+                ),
+                key=lambda row: str(row["model_name"]),
+            )
+            if not group_rows:
+                continue
+
+            base_x = float(rank_positions[int(rank)]) + float(label_offset)
+            x_values.extend(_spread_positions(base_x, len(group_rows), jitter).tolist())
+            y_values.extend(float(row["value"]) for row in group_rows)
+
+        if not x_values:
+            continue
+
+        ax.scatter(
+            x_values,
+            y_values,
+            s=point_size,
+            alpha=alpha,
+            color=str(spec["color"]),
+            label=str(spec["title"]) if show_legend else None,
+        )
+        drew_any_points = True
+
+    if not drew_any_points:
+        ax.text(
+            0.5,
+            0.5,
+            "no samples",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=11,
+            color="#6b6b6b",
+        )
+
+    ax.set_title(title)
+    ax.set_xticks([rank_positions[int(rank)] for rank in ordered_ranks])
+    ax.set_xticklabels([str(int(rank)) for rank in ordered_ranks], rotation=45, ha="right")
+    ax.set_xlabel("rank")
+    ax.grid(True, linestyle="--", alpha=0.25)
+    ax.set_xlim(-0.6, float(len(ordered_ranks) - 1) + 0.6)
+    if show_legend and drew_any_points:
+        ax.legend(loc="best")
+    return drew_any_points
+
+
+def _plot_rank_feature_value_boxplot_on_axis(
+    *,
+    ax: Any,
+    rows: list[dict[str, Any]],
+    ordered_ranks: list[int],
+    rank_positions: dict[int, float],
+    label_specs: list[dict[str, Any]],
+    title: str,
+    show_legend: bool,
+) -> bool:
+    if not ordered_ranks:
+        raise ValueError("ordered_ranks must include at least one rank")
+
+    label_offsets = np.linspace(-0.18, 0.18, num=max(1, len(label_specs)), dtype=np.float32)
+    box_width = 0.3 / max(len(label_specs), 1)
+    drew_any_boxes = False
+
+    for label_offset, spec in zip(label_offsets, label_specs):
+        grouped_values: list[np.ndarray] = []
+        positions: list[float] = []
+        for rank in ordered_ranks:
+            rank_values = np.asarray(
+                [
+                    float(row["value"])
+                    for row in rows
+                    if int(row["rank"]) == int(rank) and int(row["label"]) == int(spec["value"])
+                ],
+                dtype=np.float32,
+            )
+            if int(rank_values.size) <= 0:
+                continue
+            grouped_values.append(rank_values)
+            positions.append(float(rank_positions[int(rank)]) + float(label_offset))
+
+        if not grouped_values:
+            continue
+
+        boxplot = ax.boxplot(
+            grouped_values,
+            positions=positions,
+            widths=box_width,
+            patch_artist=True,
+            showfliers=False,
+            manage_ticks=False,
+            medianprops={"color": "#222222", "linewidth": 1.2},
+            whiskerprops={"color": str(spec["color"]), "linewidth": 1.0},
+            capprops={"color": str(spec["color"]), "linewidth": 1.0},
+            boxprops={"edgecolor": str(spec["color"]), "linewidth": 1.0},
+        )
+        for patch in boxplot["boxes"]:
+            patch.set_facecolor(str(spec["color"]))
+            patch.set_alpha(0.5)
+        drew_any_boxes = True
+
+    if not drew_any_boxes:
+        ax.text(
+            0.5,
+            0.5,
+            "no samples",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=11,
+            color="#6b6b6b",
+        )
+    elif show_legend:
+        handles = [
+            Patch(
+                facecolor=str(spec["color"]),
+                edgecolor=str(spec["color"]),
+                alpha=0.5,
+                label=str(spec["title"]),
+            )
+            for spec in label_specs
+        ]
+        ax.legend(handles=handles, loc="best")
+
+    ax.set_title(title)
+    ax.set_xticks([rank_positions[int(rank)] for rank in ordered_ranks])
+    ax.set_xticklabels([str(int(rank)) for rank in ordered_ranks], rotation=45, ha="right")
+    ax.set_xlabel("rank")
+    ax.grid(True, axis="y", linestyle="--", alpha=0.25)
+    ax.set_xlim(-0.6, float(len(ordered_ranks) - 1) + 0.6)
+    return drew_any_boxes
+
+
+def _plot_all_rank_feature_value_scatters(
+    *,
+    output_path: Path,
+    feature_rows_by_name: dict[str, list[dict[str, Any]]],
+    ordered_features: list[str],
+    ordered_ranks: list[int],
+    label_specs: list[dict[str, Any]],
+    point_size: float,
+    alpha: float,
+    jitter: float,
+    title: str,
+) -> None:
+    if not ordered_features:
+        raise ValueError("ordered_features must include at least one feature")
+
+    rank_positions = {int(rank): float(index) for index, rank in enumerate(ordered_ranks)}
+    n_rows, n_cols = _subplot_grid(len(ordered_features))
+    fig_width = max(18.0, n_cols * 4.4)
+    fig_height = max(12.0, n_rows * 3.8)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_width, fig_height))
+    axes_flat = np.atleast_1d(axes).reshape(-1)
+
+    for ax, feature_name in zip(axes_flat, ordered_features):
+        _plot_rank_feature_value_scatter_on_axis(
+            ax=ax,
+            rows=list(feature_rows_by_name.get(feature_name, [])),
+            ordered_ranks=ordered_ranks,
+            rank_positions=rank_positions,
+            label_specs=label_specs,
+            point_size=point_size,
+            alpha=alpha,
+            jitter=jitter,
+            title=str(feature_name),
+            show_legend=False,
+        )
+        ax.tick_params(axis="x", labelsize=8)
+        ax.tick_params(axis="y", labelsize=8)
+
+    for ax in axes_flat[len(ordered_features) :]:
+        ax.axis("off")
+
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="",
+            markersize=8,
+            markerfacecolor=str(spec["color"]),
+            markeredgecolor=str(spec["color"]),
+            label=str(spec["title"]),
+        )
+        for spec in label_specs
+    ]
+    fig.legend(handles=handles, loc="upper right")
+    fig.suptitle(title, fontsize=16)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_all_rank_feature_value_boxplots(
+    *,
+    output_path: Path,
+    feature_rows_by_name: dict[str, list[dict[str, Any]]],
+    ordered_features: list[str],
+    ordered_ranks: list[int],
+    label_specs: list[dict[str, Any]],
+    title: str,
+) -> None:
+    if not ordered_features:
+        raise ValueError("ordered_features must include at least one feature")
+
+    rank_positions = {int(rank): float(index) for index, rank in enumerate(ordered_ranks)}
+    n_rows, n_cols = _subplot_grid(len(ordered_features))
+    fig_width = max(18.0, n_cols * 4.4)
+    fig_height = max(12.0, n_rows * 3.8)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(fig_width, fig_height))
+    axes_flat = np.atleast_1d(axes).reshape(-1)
+
+    for ax, feature_name in zip(axes_flat, ordered_features):
+        _plot_rank_feature_value_boxplot_on_axis(
+            ax=ax,
+            rows=list(feature_rows_by_name.get(feature_name, [])),
+            ordered_ranks=ordered_ranks,
+            rank_positions=rank_positions,
+            label_specs=label_specs,
+            title=str(feature_name),
+            show_legend=False,
+        )
+        ax.tick_params(axis="x", labelsize=8)
+        ax.tick_params(axis="y", labelsize=8)
+
+    for ax in axes_flat[len(ordered_features) :]:
+        ax.axis("off")
+
+    handles = [
+        Patch(
+            facecolor=str(spec["color"]),
+            edgecolor=str(spec["color"]),
+            alpha=0.5,
+            label=str(spec["title"]),
+        )
+        for spec in label_specs
+    ]
+    fig.legend(handles=handles, loc="upper right")
+    fig.suptitle(title, fontsize=16)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def run_rank_feature_value_analysis(
+    *,
+    feature_file: Path,
+    output_dir: Path,
+    feature_root: Path = DEFAULT_FEATURE_EXTRACT_ROOT,
+    model_names_file: Path | None = None,
+    labels_file: Path | None = None,
+    metadata_file: Path | None = None,
+    dataset_reference_report: Path | None = None,
+    requested_features: list[str] | None = None,
+    point_size: float = 10.0,
+    alpha: float = 0.28,
+    jitter: float = 0.08,
+    sample_table_path: Path | None = None,
+) -> dict[str, Any]:
+    bundle = load_feature_bundle(
+        feature_file=feature_file,
+        feature_root=feature_root,
+        model_names_file=model_names_file,
+        labels_file=labels_file,
+        metadata_file=metadata_file,
+        dataset_reference_report=dataset_reference_report,
+    )
+    representation_kind = str(bundle.metadata.get("representation_kind") or "").strip().lower()
+    if representation_kind.startswith("architecture_independent"):
+        raise ValueError(
+            "Rank feature value analysis requires a raw or merged per-layer spectral bundle, "
+            "not an architecture-independent aggregated bundle"
+        )
+    if not _feature_column_groups(bundle.feature_names):
+        raise ValueError(
+            "Could not resolve per-layer spectral feature columns from the feature metadata. "
+            "Rank feature value analysis requires original per-layer spectral feature names."
+        )
+    if bundle.labels is None:
+        raise ValueError(
+            "Rank feature value plots split by clean/backdoor require sample labels. "
+            "Provide a labels file or dataset reference provenance for the feature bundle."
+        )
+    if point_size <= 0:
+        raise ValueError(f"point_size must be positive, got {point_size}")
+    if alpha <= 0:
+        raise ValueError(f"alpha must be positive, got {alpha}")
+    if jitter < 0:
+        raise ValueError(f"jitter must be non-negative, got {jitter}")
+
+    selected_feature_names, normalized_requested_features = _selected_rank_feature_names(
+        bundle.feature_names,
+        requested_features=requested_features,
+    )
+
+    try:
+        owned_feature_names_by_model, selected_leaf_paths = _resolve_model_owned_feature_names(
+            root_feature_path=bundle.feature_file,
+            root_feature_names=bundle.feature_names,
+            selected_model_names=bundle.model_names,
+        )
+    except Exception as exc:
+        raise ValueError(
+            "Rank feature value analysis requires dataset-reference provenance that can resolve "
+            "each sample's owned raw feature columns"
+        ) from exc
+
+    root_feature_index = {str(feature_name): int(index) for index, feature_name in enumerate(bundle.feature_names)}
+    labels = np.asarray(bundle.labels, dtype=np.int32)
+    label_specs = _rank_feature_label_specs(labels)
+    if not label_specs:
+        raise ValueError(
+            "Rank feature value plots split by clean/backdoor require labels 0 and/or 1 in the feature bundle"
+        )
+
+    warnings: list[str] = []
+    unknown_rank_count = int(sum(rank is None for rank in bundle.sample_ranks))
+    if unknown_rank_count > 0:
+        warnings.append(
+            f"Ignoring {unknown_rank_count} samples with unknown rank while generating rank feature value plots"
+        )
+
+    unknown_label_count = int(np.sum(~np.isin(labels, np.asarray([0, 1], dtype=np.int32))))
+    if unknown_label_count > 0:
+        warnings.append(
+            "Ignoring "
+            f"{unknown_label_count} samples with labels outside {{0, 1}} while generating rank feature value plots"
+        )
+    known_rank_count = int(
+        sum(
+            rank is not None and int(label) in {0, 1}
+            for rank, label in zip(bundle.sample_ranks, labels.tolist())
+        )
+    )
+    if known_rank_count <= 0:
+        raise ValueError(
+            "Could not resolve any sample ranks from the feature bundle. "
+            "Provide a dataset reference report or model names that encode rank."
+        )
+
+    feature_name_set = set(selected_feature_names)
+    sample_value_rows: list[dict[str, Any]] = []
+    sample_counts_by_rank: dict[int, dict[str, int]] = {}
+    n_samples_used = 0
+    for row_idx, model_name in enumerate(bundle.model_names):
+        rank = bundle.sample_ranks[row_idx]
+        label = int(labels[row_idx])
+        if rank is None or label not in {0, 1}:
+            continue
+
+        owned_feature_names = list(owned_feature_names_by_model.get(str(model_name), []))
+        emitted_to_columns: dict[str, list[int]] = {}
+        for feature_name in owned_feature_names:
+            emitted_feature = _emitted_feature_name(feature_name)
+            if emitted_feature not in feature_name_set:
+                continue
+            emitted_to_columns.setdefault(emitted_feature, []).append(int(root_feature_index[feature_name]))
+
+        row_values = np.asarray(bundle.features[row_idx], dtype=np.float32)
+        used_this_sample = False
+        for emitted_feature in selected_feature_names:
+            column_indices = emitted_to_columns.get(emitted_feature, [])
+            if not column_indices:
+                continue
+
+            used_this_sample = True
+            sample_value_rows.append(
+                {
+                    "model_name": str(model_name),
+                    "label": int(label),
+                    "rank": int(rank),
+                    "feature_name": str(emitted_feature),
+                    "value": float(
+                        np.mean(
+                            row_values[np.asarray(column_indices, dtype=np.int64)],
+                            dtype=np.float64,
+                        )
+                    ),
+                    "source_column_count": int(len(column_indices)),
+                }
+            )
+
+        if used_this_sample:
+            sample_counts_by_rank.setdefault(int(rank), {}).setdefault(str(label), 0)
+            sample_counts_by_rank[int(rank)][str(label)] = int(sample_counts_by_rank[int(rank)][str(label)]) + 1
+            n_samples_used += 1
+
+    if not sample_value_rows:
+        raise ValueError("No per-sample rank feature values were available after filtering labels and ranks")
+
+    ordered_ranks = sorted(sample_counts_by_rank)
+    if not ordered_ranks:
+        raise ValueError(
+            "Could not resolve any sample ranks from the feature bundle. "
+            "Provide a dataset reference report or model names that encode rank."
+        )
+
+    feature_rows_by_name: dict[str, list[dict[str, Any]]] = {}
+    for row in sample_value_rows:
+        feature_rows_by_name.setdefault(str(row["feature_name"]), []).append(row)
+
+    ordered_features = [
+        feature_name
+        for feature_name in selected_feature_names
+        if feature_rows_by_name.get(feature_name)
+    ]
+    dropped_features = [
+        feature_name
+        for feature_name in selected_feature_names
+        if not feature_rows_by_name.get(feature_name)
+    ]
+    if dropped_features:
+        warnings.append(
+            "Skipping emitted features with no usable rank/labeled samples: "
+            + ", ".join(dropped_features[:8])
+        )
+    if not ordered_features:
+        raise ValueError("No emitted features had usable rows after label/rank filtering")
+
+    resolved_output_dir = _resolve_path(output_dir)
+    resolved_output_dir.mkdir(parents=True, exist_ok=True)
+    resolved_sample_table_path = (
+        _resolve_path(sample_table_path)
+        if sample_table_path is not None
+        else resolved_output_dir / "rank_feature_values.csv"
+    )
+    scatter_plot_path = resolved_output_dir / "rank_feature_values_scatter.png"
+    box_plot_path = resolved_output_dir / "rank_feature_values_boxplots.png"
+
+    _save_rank_feature_value_csv(resolved_sample_table_path, sample_value_rows)
+    _plot_all_rank_feature_value_scatters(
+        output_path=scatter_plot_path,
+        feature_rows_by_name=feature_rows_by_name,
+        ordered_features=ordered_features,
+        ordered_ranks=ordered_ranks,
+        label_specs=label_specs,
+        point_size=point_size,
+        alpha=alpha,
+        jitter=jitter,
+        title="Per-Sample Feature Values by Rank",
+    )
+    _plot_all_rank_feature_value_boxplots(
+        output_path=box_plot_path,
+        feature_rows_by_name=feature_rows_by_name,
+        ordered_features=ordered_features,
+        ordered_ranks=ordered_ranks,
+        label_specs=label_specs,
+        title="Feature Value Distributions by Rank",
+    )
+
+    feature_panels: list[dict[str, Any]] = []
+    for feature_name in ordered_features:
+        rows = list(feature_rows_by_name.get(feature_name, []))
+        label_counts_by_rank: dict[str, dict[str, int]] = {}
+        for rank in ordered_ranks:
+            rank_counts: dict[str, int] = {}
+            for spec in label_specs:
+                count = int(
+                    sum(
+                        int(row["label"]) == int(spec["value"]) and int(row["rank"]) == int(rank)
+                        for row in rows
+                    )
+                )
+                if count > 0:
+                    rank_counts[str(spec["value"])] = int(count)
+            label_counts_by_rank[str(rank)] = rank_counts
+
+        feature_panels.append(
+            {
+                "feature_name": str(feature_name),
+                "n_points": int(len(rows)),
+                "ranks": [int(rank) for rank in sorted({int(row["rank"]) for row in rows})],
+                "label_counts_by_rank": label_counts_by_rank,
+            }
+        )
+
+    return {
+        "analysis": "rank_feature_values",
+        "script_version": SCRIPT_VERSION,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "feature_file": str(bundle.feature_file),
+        "model_names_file": str(bundle.model_names_file),
+        "labels_file": str(bundle.labels_file) if bundle.labels_file is not None else None,
+        "metadata_file": str(bundle.metadata_file) if bundle.metadata_file is not None else None,
+        "dataset_reference_report": (
+            str(bundle.dataset_reference_report) if bundle.dataset_reference_report is not None else None
+        ),
+        "feature_shape": [int(bundle.features.shape[0]), int(bundle.features.shape[1])],
+        "requested_features": (
+            list(normalized_requested_features) if normalized_requested_features is not None else "all"
+        ),
+        "plotted_features": list(ordered_features),
+        "ranks": [int(rank) for rank in ordered_ranks],
+        "label_panels": [str(spec["name"]) for spec in label_specs],
+        "n_feature_panels": int(len(ordered_features)),
+        "n_samples_total": int(len(bundle.model_names)),
+        "n_samples_used": int(n_samples_used),
+        "n_points": int(len(sample_value_rows)),
+        "sample_table_csv": str(resolved_sample_table_path),
+        "scatter_plot": str(scatter_plot_path),
+        "box_plot": str(box_plot_path),
+        "selected_source_feature_files": [str(path) for path in selected_leaf_paths],
+        "label_counts_by_rank": {
+            str(rank): {
+                str(label): int(count)
+                for label, count in sorted(sample_counts_by_rank[int(rank)].items())
+            }
+            for rank in ordered_ranks
+        },
+        "feature_panels": feature_panels,
+        "warnings": warnings,
+    }
+
+
+def run_unsupervised_rank_feature_values_pipeline(
+    *,
+    feature_file: Path,
+    output_root: Path,
+    run_id: str | None,
+    feature_root: Path = DEFAULT_FEATURE_EXTRACT_ROOT,
+    model_names_file: Path | None = None,
+    labels_file: Path | None = None,
+    metadata_file: Path | None = None,
+    dataset_reference_report: Path | None = None,
+    requested_features: list[str] | None = None,
+    point_size: float = 10.0,
+    alpha: float = 0.28,
+    jitter: float = 0.08,
+) -> dict[str, Any]:
+    start = perf_counter()
+    ctx = create_run_context(
+        pipeline="unsupervised_rank_feature_values",
+        output_root=output_root,
+        run_id=run_id,
+    )
+
+    plot_dir = ctx.plots_dir / "rank_feature_values"
+    sample_table_path = ctx.reports_dir / "rank_feature_values.csv"
+    report = run_rank_feature_value_analysis(
+        feature_file=feature_file,
+        output_dir=plot_dir,
+        feature_root=feature_root,
+        model_names_file=model_names_file,
+        labels_file=labels_file,
+        metadata_file=metadata_file,
+        dataset_reference_report=dataset_reference_report,
+        requested_features=requested_features,
+        point_size=point_size,
+        alpha=alpha,
+        jitter=jitter,
+        sample_table_path=sample_table_path,
+    )
+
+    elapsed_seconds = float(perf_counter() - start)
+    report["elapsed_seconds"] = elapsed_seconds
+    report_path = ctx.reports_dir / "rank_feature_values_report.json"
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(json_ready(report), f, indent=2)
+
+    ctx.add_artifact("report", report_path)
+    ctx.add_artifact("plots", plot_dir)
+    ctx.add_artifact("sample_table", sample_table_path)
+    ctx.add_timing("elapsed_seconds", elapsed_seconds)
+    ctx.finalize(
+        {
+            "pipeline": "unsupervised_rank_feature_values",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "feature_file": str(feature_file),
+            "feature_root": str(feature_root),
+            "model_names_file": str(model_names_file) if model_names_file is not None else None,
+            "labels_file": str(labels_file) if labels_file is not None else None,
+            "metadata_file": str(metadata_file) if metadata_file is not None else None,
+            "dataset_reference_report": (
+                str(dataset_reference_report) if dataset_reference_report is not None else None
+            ),
+            "requested_features": list(requested_features) if requested_features is not None else None,
+            "point_size": float(point_size),
+            "alpha": float(alpha),
+            "jitter": float(jitter),
+        }
+    )
+
+    return {
+        "run_dir": ctx.run_dir,
+        "report": report_path,
+        "plot_dir": plot_dir,
+        "sample_table": sample_table_path,
     }
 
 

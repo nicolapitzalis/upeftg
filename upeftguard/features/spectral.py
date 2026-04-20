@@ -47,6 +47,26 @@ DEFAULT_SPECTRAL_FEATURES = [
     "effective_rank",
 ]
 
+_RANK_NORMALIZED_FEATURE_REPLACEMENTS = {
+    "energy": "energy_per_rank",
+    "l1_norm": "l1_norm_per_rank",
+    "l2_norm": "l2_norm_per_sqrt_rank",
+    "mean_abs": "mean_abs_per_rank",
+    "stable_rank": "stable_rank_frac",
+    "spectral_entropy": "normalized_spectral_entropy",
+    "effective_rank": "effective_rank_frac",
+}
+
+_DERIVED_FEATURE_GROUP_SOURCES = {
+    "energy_per_rank": "energy",
+    "l1_norm_per_rank": "l1_norm",
+    "l2_norm_per_sqrt_rank": "l2_norm",
+    "mean_abs_per_rank": "mean_abs",
+    "stable_rank_frac": "stable_rank",
+    "normalized_spectral_entropy": "spectral_entropy",
+    "effective_rank_frac": "effective_rank",
+}
+
 DEFAULT_SPECTRAL_QV_SUM_MODE = "none"
 DEFAULT_SPECTRAL_MOMENT_SOURCE = "sv"
 DEFAULT_SPECTRAL_ENTRYWISE_DELTA_MODE = DEFAULT_ENTRYWISE_DELTA_MODE
@@ -56,39 +76,64 @@ SUPPORTED_SPECTRAL_ENTRYWISE_DELTA_MODES = tuple(SUPPORTED_ENTRYWISE_DELTA_MODES
 
 SUPPORTED_SPECTRAL_FEATURES = {
     "energy",
+    "energy_per_rank",
+    "block_rank",
     "kurtosis",
     "l1_norm",
+    "l1_norm_per_rank",
     "l2_norm",
+    "l2_norm_per_sqrt_rank",
     "linf_norm",
     "mean_abs",
+    "mean_abs_per_rank",
     "concentration_of_energy",
     "sv_topk",
     "stable_rank",
+    "stable_rank_frac",
     "spectral_entropy",
+    "normalized_spectral_entropy",
     "effective_rank",
+    "effective_rank_frac",
 }
 
-_MOMENT_FEATURES = ("kurtosis", "l1_norm", "linf_norm", "mean_abs")
+_MOMENT_FEATURES = (
+    "kurtosis",
+    "l1_norm",
+    "l1_norm_per_rank",
+    "linf_norm",
+    "mean_abs",
+    "mean_abs_per_rank",
+)
 _MOMENT_FEATURE_SET = set(_MOMENT_FEATURES)
 _SV_MOMENT_FEATURES = {
     "sv_kurtosis",
     "sv_l1_norm",
+    "sv_l1_norm_per_rank",
     "sv_linf_norm",
     "sv_mean_abs",
+    "sv_mean_abs_per_rank",
 }
 _SV_MOMENT_BY_ENTRYWISE = {
     "kurtosis": "sv_kurtosis",
     "l1_norm": "sv_l1_norm",
+    "l1_norm_per_rank": "sv_l1_norm_per_rank",
     "linf_norm": "sv_linf_norm",
     "mean_abs": "sv_mean_abs",
+    "mean_abs_per_rank": "sv_mean_abs_per_rank",
 }
 _SPECTRAL_SCALAR_FEATURES = {
+    "block_rank",
     "energy",
+    "energy_per_rank",
     "l2_norm",
+    "l2_norm_per_sqrt_rank",
     "concentration_of_energy",
     "stable_rank",
+    "stable_rank_frac",
     "spectral_entropy",
+    "normalized_spectral_entropy",
     "effective_rank",
+    "effective_rank_frac",
 }
 _SPECTRAL_METADATA_DROP_KEYS = {
     "a_shapes",
@@ -108,6 +153,33 @@ _QV_ROLE_ALIASES = {
     "v": "v",
     "query": "q",
     "value": "v",
+}
+
+_FEATURE_GROUP_BY_SUFFIX = {
+    "energy": "energy",
+    "energy_per_rank": "energy_per_rank",
+    "block_rank": "block_rank",
+    "kurtosis": "kurtosis",
+    "sv_kurtosis": "kurtosis",
+    "l1_norm": "l1_norm",
+    "sv_l1_norm": "l1_norm",
+    "l1_norm_per_rank": "l1_norm_per_rank",
+    "sv_l1_norm_per_rank": "l1_norm_per_rank",
+    "l2_norm": "l2_norm",
+    "l2_norm_per_sqrt_rank": "l2_norm_per_sqrt_rank",
+    "linf_norm": "linf_norm",
+    "sv_linf_norm": "linf_norm",
+    "mean_abs": "mean_abs",
+    "sv_mean_abs": "mean_abs",
+    "mean_abs_per_rank": "mean_abs_per_rank",
+    "sv_mean_abs_per_rank": "mean_abs_per_rank",
+    "concentration_of_energy": "concentration_of_energy",
+    "stable_rank": "stable_rank",
+    "stable_rank_frac": "stable_rank_frac",
+    "spectral_entropy": "spectral_entropy",
+    "normalized_spectral_entropy": "normalized_spectral_entropy",
+    "effective_rank": "effective_rank",
+    "effective_rank_frac": "effective_rank_frac",
 }
 
 _SKIPPABLE_SPECTRAL_ITEM_EXCEPTIONS = (OSError, SafetensorError, ValueError)
@@ -184,6 +256,27 @@ def expand_spectral_feature_names(
         if resolved_moment_source in {"sv", "both"}:
             emitted.append(_SV_MOMENT_BY_ENTRYWISE[feature])
     return emitted
+
+
+def feature_group_for_spectral_feature_name(feature_name: str) -> str | None:
+    suffix = str(feature_name).rpartition(".")[2]
+    if not suffix:
+        return None
+    if suffix.startswith("sv_") and suffix[3:].isdigit():
+        return "sv_topk"
+    return _FEATURE_GROUP_BY_SUFFIX.get(suffix)
+
+
+def rank_normalized_feature_group(feature_group: str) -> str:
+    resolved = str(feature_group).strip()
+    return _RANK_NORMALIZED_FEATURE_REPLACEMENTS.get(resolved, resolved)
+
+
+def provenance_source_feature_group(feature_group: str) -> str | None:
+    resolved = str(feature_group).strip()
+    if resolved == "block_rank":
+        return None
+    return _DERIVED_FEATURE_GROUP_SOURCES.get(resolved, resolved)
 
 
 def _qv_sum_group_for_block_name(block_name: str) -> tuple[str, str] | None:
@@ -669,6 +762,7 @@ def _append_block_features(
     row: list[float],
     emitted_features: list[str],
     singular_values: np.ndarray | None,
+    block_rank: int,
     sv_top_k: int,
     need_spectral_scalars: bool,
     need_sv_topk: bool,
@@ -678,6 +772,9 @@ def _append_block_features(
     energy = stable_rank = spectral_entropy = effective_rank = None
     l2_norm = None
     concentration_of_energy = None
+    rank_scale = max(1, int(block_rank))
+    sqrt_rank_scale = float(np.sqrt(rank_scale))
+    entropy_rank_scale = float(np.log(max(2, rank_scale)))
     if need_spectral_scalars:
         if singular_values is None:
             raise RuntimeError("Spectral scalars were requested but singular values were not computed")
@@ -702,22 +799,52 @@ def _append_block_features(
             if energy is None:
                 raise RuntimeError("Spectral scalars were required for 'energy' but were not computed")
             row.append(energy)
+        elif feature == "energy_per_rank":
+            if energy is None:
+                raise RuntimeError("Spectral scalars were required for 'energy_per_rank' but were not computed")
+            row.append(float(energy) / float(rank_scale))
+        elif feature == "block_rank":
+            row.append(float(block_rank))
         elif feature == "l2_norm":
             if l2_norm is None:
                 raise RuntimeError("Spectral scalars were required for 'l2_norm' but were not computed")
             row.append(l2_norm)
+        elif feature == "l2_norm_per_sqrt_rank":
+            if l2_norm is None:
+                raise RuntimeError(
+                    "Spectral scalars were required for 'l2_norm_per_sqrt_rank' but were not computed"
+                )
+            row.append(float(l2_norm) / sqrt_rank_scale)
         elif feature == "stable_rank":
             if stable_rank is None:
                 raise RuntimeError("Spectral scalars were required for 'stable_rank' but were not computed")
             row.append(stable_rank)
+        elif feature == "stable_rank_frac":
+            if stable_rank is None:
+                raise RuntimeError(
+                    "Spectral scalars were required for 'stable_rank_frac' but were not computed"
+                )
+            row.append(float(stable_rank) / float(rank_scale))
         elif feature == "spectral_entropy":
             if spectral_entropy is None:
                 raise RuntimeError("Spectral scalars were required for 'spectral_entropy' but were not computed")
             row.append(spectral_entropy)
+        elif feature == "normalized_spectral_entropy":
+            if spectral_entropy is None:
+                raise RuntimeError(
+                    "Spectral scalars were required for 'normalized_spectral_entropy' but were not computed"
+                )
+            row.append(0.0 if rank_scale <= 1 else float(spectral_entropy) / entropy_rank_scale)
         elif feature == "effective_rank":
             if effective_rank is None:
                 raise RuntimeError("Spectral scalars were required for 'effective_rank' but were not computed")
             row.append(effective_rank)
+        elif feature == "effective_rank_frac":
+            if effective_rank is None:
+                raise RuntimeError(
+                    "Spectral scalars were required for 'effective_rank_frac' but were not computed"
+                )
+            row.append(float(effective_rank) / float(rank_scale))
         elif feature == "concentration_of_energy":
             if concentration_of_energy is None:
                 raise RuntimeError(
@@ -822,6 +949,7 @@ def extract_spectral_features(
                 )
                 for pair_idx, (_, a, b) in enumerate(iter_block_factors(reader=reader, schema=schema, dtype=dtype)):
                     if include_base_blocks:
+                        block_rank = int(a.shape[0])
                         singular_values = (
                             block_delta_singular_values(a=a, b=b) if need_singular_values else None
                         )
@@ -842,8 +970,10 @@ def extract_spectral_features(
                             entrywise_moments = {
                                 "kurtosis": float(summary.kurtosis),
                                 "l1_norm": float(summary.l1_norm),
+                                "l1_norm_per_rank": float(summary.l1_norm) / max(1, block_rank),
                                 "linf_norm": float(summary.linf_norm),
                                 "mean_abs": float(summary.mean_abs),
+                                "mean_abs_per_rank": float(summary.mean_abs) / max(1, block_rank),
                             }
 
                         sv_moments: dict[str, float] | None = None
@@ -856,14 +986,17 @@ def extract_spectral_features(
                             sv_moments = {
                                 "sv_kurtosis": float(summary.kurtosis),
                                 "sv_l1_norm": float(summary.l1_norm),
+                                "sv_l1_norm_per_rank": float(summary.l1_norm) / max(1, block_rank),
                                 "sv_linf_norm": float(summary.linf_norm),
                                 "sv_mean_abs": float(summary.mean_abs),
+                                "sv_mean_abs_per_rank": float(summary.mean_abs) / max(1, block_rank),
                             }
 
                         _append_block_features(
                             row=row,
                             emitted_features=emitted_features,
                             singular_values=singular_values,
+                            block_rank=block_rank,
                             sv_top_k=sv_top_k,
                             need_spectral_scalars=need_spectral_scalars,
                             need_sv_topk=need_top_k,
@@ -889,6 +1022,7 @@ def extract_spectral_features(
                     a_v, b_v = pair["v"]
                     a_qv = np.concatenate([a_q, a_v], axis=0)
                     b_qv = np.concatenate([b_q, b_v], axis=1)
+                    block_rank = int(a_qv.shape[0])
                     singular_values = (
                         block_delta_singular_values(a=a_qv, b=b_qv) if need_singular_values else None
                     )
@@ -909,8 +1043,10 @@ def extract_spectral_features(
                         entrywise_moments = {
                             "kurtosis": float(summary.kurtosis),
                             "l1_norm": float(summary.l1_norm),
+                            "l1_norm_per_rank": float(summary.l1_norm) / max(1, block_rank),
                             "linf_norm": float(summary.linf_norm),
                             "mean_abs": float(summary.mean_abs),
+                            "mean_abs_per_rank": float(summary.mean_abs) / max(1, block_rank),
                         }
 
                     sv_moments: dict[str, float] | None = None
@@ -923,14 +1059,17 @@ def extract_spectral_features(
                         sv_moments = {
                             "sv_kurtosis": float(summary.kurtosis),
                             "sv_l1_norm": float(summary.l1_norm),
+                            "sv_l1_norm_per_rank": float(summary.l1_norm) / max(1, block_rank),
                             "sv_linf_norm": float(summary.linf_norm),
                             "sv_mean_abs": float(summary.mean_abs),
+                            "sv_mean_abs_per_rank": float(summary.mean_abs) / max(1, block_rank),
                         }
 
                     _append_block_features(
                         row=row,
                         emitted_features=emitted_features,
                         singular_values=singular_values,
+                        block_rank=block_rank,
                         sv_top_k=sv_top_k,
                         need_spectral_scalars=need_spectral_scalars,
                         need_sv_topk=need_top_k,

@@ -11,6 +11,7 @@ from upeftguard.experiments.supervised_architecture_breakdown import (
     build_supervised_results_summary,
     run_supervised_results_summary,
 )
+from upeftguard.supervised.interfaces import SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS
 from upeftguard.utilities.core.manifest import AttackSampleIdentity
 
 
@@ -152,6 +153,131 @@ def _build_synthetic_run(tmp_path: Path) -> Path:
         ],
     )
 
+    _write_json(run_dir / "artifact_index.json", {"report": str(reports_dir / "supervised_report.json")})
+    return run_dir
+
+
+def _build_synthetic_multiclass_run(tmp_path: Path) -> Path:
+    run_dir = tmp_path / "runs" / "supervised" / "synthetic_multiclass_cnn"
+    reports_dir = run_dir / "reports"
+
+    report = {
+        "task": {
+            "task_mode": SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS,
+            "class_names": ["clean", "RIPPLE", "insertsent", "stybkd", "syntactic"],
+            "binary_projection": "one_minus_clean_probability",
+        },
+        "data_info": {
+            "n_train": 10,
+            "n_train_clean": 2,
+            "n_train_backdoored": 8,
+            "n_calibration": 0,
+            "n_calibration_clean": 0,
+            "n_calibration_backdoored": 0,
+            "n_inference": 5,
+            "n_inference_clean": 1,
+            "n_inference_backdoored": 4,
+            "n_inference_unknown_label": 0,
+        },
+        "fit_assessment": {
+            "score_definition": "backdoor_score",
+            "binary_projection": "one_minus_clean_probability",
+            "train_score_summary": {"mean": 0.75},
+            "train_offline_metrics": {
+                "auroc": 0.990,
+                "auprc": 0.995,
+                "precision_at_num_positives": 0.980,
+            },
+            "calibration_score_summary": None,
+            "calibration_offline_metrics": None,
+            "inference_score_summary": {"mean": 0.70},
+            "offline_metrics": {
+                "auroc": 0.950,
+                "auprc": 0.970,
+                "precision_at_num_positives": 0.900,
+            },
+            "threshold_evaluation": [
+                {
+                    "percentile_from_train": 90.0,
+                    "threshold": 0.80,
+                    "recall": 0.50,
+                    "precision": 1.0,
+                    "false_positive_rate": 0.0,
+                    "fraction_flagged": 0.20,
+                }
+            ],
+        },
+        "multiclass_assessment": {
+            "train": {
+                "accuracy": 0.960,
+                "macro_f1": 0.955,
+                "micro_f1": 0.960,
+                "per_class": [
+                    {
+                        "class_name": "clean",
+                        "support": 2,
+                        "predicted_count": 2,
+                        "precision": 1.0,
+                        "recall": 1.0,
+                        "f1": 1.0,
+                    },
+                    {
+                        "class_name": "syntactic",
+                        "support": 2,
+                        "predicted_count": 2,
+                        "precision": 1.0,
+                        "recall": 1.0,
+                        "f1": 1.0,
+                    },
+                ],
+            },
+            "inference": {
+                "accuracy": 0.800,
+                "macro_f1": 0.790,
+                "micro_f1": 0.800,
+                "per_class": [
+                    {
+                        "class_name": "clean",
+                        "support": 1,
+                        "predicted_count": 2,
+                        "precision": 0.500,
+                        "recall": 1.0,
+                        "f1": 0.667,
+                    },
+                    {
+                        "class_name": "RIPPLE",
+                        "support": 1,
+                        "predicted_count": 1,
+                        "precision": 1.0,
+                        "recall": 1.0,
+                        "f1": 1.0,
+                    },
+                    {
+                        "class_name": "syntactic",
+                        "support": 1,
+                        "predicted_count": 1,
+                        "precision": 1.0,
+                        "recall": 1.0,
+                        "f1": 1.0,
+                    },
+                ],
+            },
+        },
+        "attack_analysis": {
+            "inference": {
+                "attacks": {
+                    "syntactic": {
+                        "offline_metrics": {"auroc": 1.0},
+                    }
+                }
+            }
+        },
+        "tuning": {
+            "model_name": "cnn_1d",
+            "winner": {"model_name": "cnn_1d"},
+        },
+    }
+    _write_json(reports_dir / "supervised_report.json", report)
     _write_json(run_dir / "artifact_index.json", {"report": str(reports_dir / "supervised_report.json")})
     return run_dir
 
@@ -319,6 +445,57 @@ class TestSupervisedArchitectureBreakdown(unittest.TestCase):
             self.assertIn("adapter_analysis", report)
             self.assertIn("attack_analysis", report)
             self.assertIn("architecture_analysis", report)
+            self.assertEqual(
+                report["attack_analysis"]["inference"]["attacks"]["syntactic"]["offline_metrics"]["auroc"],
+                1.0,
+            )
+
+    def test_build_supervised_results_summary_uses_multiclass_structure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = _build_synthetic_multiclass_run(Path(tmp))
+            summary = build_supervised_results_summary(run_dir=run_dir)
+
+            self.assertEqual(summary["summary_mode"], "multiclass")
+            self.assertEqual(summary["task_mode"], SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS)
+            self.assertIn("binary_classification", summary)
+            self.assertIn("class_results", summary)
+            self.assertNotIn("dataset_analysis", summary)
+            self.assertEqual(
+                summary["binary_classification"]["partitions"]["inference"]["offline_metrics"]["auroc"],
+                0.95,
+            )
+            self.assertEqual(
+                summary["class_results"]["partitions"]["inference"]["macro_f1"],
+                0.79,
+            )
+
+    def test_run_supervised_results_summary_writes_multiclass_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = _build_synthetic_multiclass_run(Path(tmp))
+
+            outputs = run_supervised_results_summary(
+                run_spec=run_dir,
+                update_report=True,
+            )
+
+            markdown = outputs["results_summary_md"].read_text(encoding="utf-8")
+            self.assertIn("# Results Summary", markdown)
+            self.assertIn("## Binary Classification", markdown)
+            self.assertIn("## Multiclass Overview", markdown)
+            self.assertIn("## Per-Class Inference", markdown)
+            self.assertNotIn("## Per Architecture", markdown)
+            self.assertNotIn("## Per Dataset", markdown)
+            self.assertNotIn("## Per Adapter", markdown)
+            self.assertNotIn("## Per Attack", markdown)
+            self.assertIn("| inference | 5 | 1 | 4 | 0 | 0.950 | 0.970 | 0.900 |", markdown)
+            self.assertIn("| clean | 1 | 2 | 0.500 | 1.000 | 0.667 |", markdown)
+
+            with open(run_dir / "reports" / "supervised_report.json", "r", encoding="utf-8") as f:
+                report = json.load(f)
+            self.assertEqual(report["results_summary"]["summary_mode"], "multiclass")
+            self.assertIn("binary_classification", report["results_summary"])
+            self.assertIn("class_results", report["results_summary"])
+            self.assertIn("attack_analysis", report)
             self.assertEqual(
                 report["attack_analysis"]["inference"]["attacks"]["syntactic"]["offline_metrics"]["auroc"],
                 1.0,

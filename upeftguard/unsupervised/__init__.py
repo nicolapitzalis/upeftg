@@ -8,7 +8,9 @@ __all__ = [
     "run_grouped_tsne_analysis",
     "run_grouped_tsne_sweep_analysis",
     "run_layer_value_scatter_analysis",
+    "run_rank_feature_value_analysis",
     "run_unsupervised_layer_scatter_pipeline",
+    "run_unsupervised_rank_feature_values_pipeline",
     "run_unsupervised_tsne_pipeline",
     "run_gmm_train_inference_pipeline",
 ]
@@ -19,7 +21,9 @@ def __getattr__(name: str) -> Any:
         "run_grouped_tsne_analysis",
         "run_grouped_tsne_sweep_analysis",
         "run_layer_value_scatter_analysis",
+        "run_rank_feature_value_analysis",
         "run_unsupervised_layer_scatter_pipeline",
+        "run_unsupervised_rank_feature_values_pipeline",
         "run_unsupervised_tsne_pipeline",
     }:
         module = import_module(".analysis", __name__)

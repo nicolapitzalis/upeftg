@@ -50,18 +50,24 @@ OUTPUT_ROOT=${OUTPUT_ROOT:-runs}
 RUN_ID=${RUN_ID:-supervised_${SLURM_JOB_ID:-manual}}
 PIPELINE_MODE=${PIPELINE_MODE:-full}
 MODEL=${MODEL:-all}
+TASK_MODE=${TASK_MODE:-binary}
+MULTICLASS_ATTACK_NAMES=${MULTICLASS_ATTACK_NAMES:-}
+CNN_HYPERPARAMS=${CNN_HYPERPARAMS:-}
 SV_TOP_K=${SV_TOP_K:-8}
 SPECTRAL_MOMENT_SOURCE=${SPECTRAL_MOMENT_SOURCE:-sv}
 SPECTRAL_QV_SUM_MODE=${SPECTRAL_QV_SUM_MODE:-none}
 SPECTRAL_ENTRYWISE_DELTA_MODE=${SPECTRAL_ENTRYWISE_DELTA_MODE:-auto}
 CV_FOLDS=${CV_FOLDS:-5}
 CV_SEEDS=${CV_SEEDS:-"42 43 44"}
+RANDOM_STATE=${RANDOM_STATE:-42}
 TRAIN_SPLIT=${TRAIN_SPLIT:-100}
 CALIBRATION_SPLIT=${CALIBRATION_SPLIT:-}
 ACCEPTED_FPR=${ACCEPTED_FPR:-}
 SPLIT_BY_FOLDER=${SPLIT_BY_FOLDER:-0}
 SCORE_PERCENTILES=${SCORE_PERCENTILES:-}
 SLURM_PARTITION=${SLURM_PARTITION:-extra}
+SLURM_MAX_CONCURRENT_REQUEST=${SLURM_MAX_CONCURRENT_REQUEST:-auto}
+SLURM_CPUS_PER_TASK_REQUEST=${SLURM_CPUS_PER_TASK_REQUEST:-auto}
 SLURM_LOG_DIR=${SLURM_LOG_DIR:-${REPO_ROOT}/logs}
 SKIP_FEATURE_IMPORTANCE=${SKIP_FEATURE_IMPORTANCE:-0}
 
@@ -70,6 +76,37 @@ mkdir -p "${SLURM_LOG_DIR}"
 read -r -a FEATURE_VALUES <<< "${FEATURES}"
 if [[ "${#FEATURE_VALUES[@]}" -eq 0 ]]; then
   echo "FEATURES must include at least one feature group." >&2
+  exit 1
+fi
+
+PARTITION_NODE_COUNT=""
+PARTITION_CPUS_PER_NODE=""
+if [[ "${SLURM_MAX_CONCURRENT_REQUEST}" == "auto" || "${SLURM_CPUS_PER_TASK_REQUEST}" == "auto" ]]; then
+  PARTITION_NODE_COUNT=$(sinfo -h -p "${SLURM_PARTITION}" -o "%D" 2>/dev/null | awk 'NF {sum += int($1)} END {if (sum > 0) print sum}')
+  PARTITION_CPUS_PER_NODE=$(sinfo -h -p "${SLURM_PARTITION}" -o "%c" 2>/dev/null | sort -nr | head -n 1)
+fi
+PARTITION_NODE_COUNT=${PARTITION_NODE_COUNT:-8}
+PARTITION_CPUS_PER_NODE=${PARTITION_CPUS_PER_NODE:-32}
+
+RESOLVED_SLURM_MAX_CONCURRENT_REQUEST=${SLURM_MAX_CONCURRENT_REQUEST}
+if [[ "${RESOLVED_SLURM_MAX_CONCURRENT_REQUEST}" == "auto" ]]; then
+  RESOLVED_SLURM_MAX_CONCURRENT_REQUEST="${PARTITION_NODE_COUNT}"
+fi
+RESOLVED_SLURM_CPUS_PER_TASK_REQUEST=${SLURM_CPUS_PER_TASK_REQUEST}
+if [[ "${RESOLVED_SLURM_CPUS_PER_TASK_REQUEST}" == "auto" ]]; then
+  RESOLVED_SLURM_CPUS_PER_TASK_REQUEST="${PARTITION_CPUS_PER_NODE}"
+fi
+
+MULTICLASS_ATTACK_NAME_VALUES=()
+if [[ -n "${MULTICLASS_ATTACK_NAMES}" ]]; then
+  read -r -a MULTICLASS_ATTACK_NAME_VALUES <<< "${MULTICLASS_ATTACK_NAMES}"
+fi
+if [[ "${TASK_MODE}" == "attack_family_multiclass" && "${#MULTICLASS_ATTACK_NAME_VALUES[@]}" -eq 0 ]]; then
+  echo "MULTICLASS_ATTACK_NAMES is required when TASK_MODE=attack_family_multiclass." >&2
+  exit 1
+fi
+if [[ -n "${CNN_HYPERPARAMS}" && ! -f "${CNN_HYPERPARAMS}" ]]; then
+  echo "CNN_HYPERPARAMS not found: ${CNN_HYPERPARAMS}" >&2
   exit 1
 fi
 
@@ -107,18 +144,29 @@ PREPARE_ARGS=(
   --output-root "${OUTPUT_ROOT}"
   --run-id "${RUN_ID}"
   --model "${MODEL}"
+  --task-mode "${TASK_MODE}"
   --features "${FEATURE_VALUES[@]}"
   --spectral-sv-top-k "${SV_TOP_K}"
   --spectral-moment-source "${SPECTRAL_MOMENT_SOURCE}"
   --spectral-qv-sum-mode "${SPECTRAL_QV_SUM_MODE}"
   --spectral-entrywise-delta-mode "${SPECTRAL_ENTRYWISE_DELTA_MODE}"
   --cv-folds "${CV_FOLDS}"
+  --random-state "${RANDOM_STATE}"
   --train-split "${TRAIN_SPLIT}"
   --feature-file "${FEATURE_FILE}"
   --tuning-executor slurm_array
+  --slurm-partition "${SLURM_PARTITION}"
+  --slurm-max-concurrent "${RESOLVED_SLURM_MAX_CONCURRENT_REQUEST}"
+  --slurm-cpus-per-task "${RESOLVED_SLURM_CPUS_PER_TASK_REQUEST}"
 )
 if [[ -n "${SPLIT_BY_FOLDER_FLAG}" ]]; then
   PREPARE_ARGS+=("${SPLIT_BY_FOLDER_FLAG}")
+fi
+if [[ "${#MULTICLASS_ATTACK_NAME_VALUES[@]}" -gt 0 ]]; then
+  PREPARE_ARGS+=(--multiclass-attack-names "${MULTICLASS_ATTACK_NAME_VALUES[@]}")
+fi
+if [[ -n "${CNN_HYPERPARAMS}" ]]; then
+  PREPARE_ARGS+=(--cnn-hyperparams "${CNN_HYPERPARAMS}")
 fi
 if [[ "${#CALIBRATION_ARGS[@]}" -gt 0 ]]; then
   PREPARE_ARGS+=("${CALIBRATION_ARGS[@]}")
@@ -234,6 +282,16 @@ else
 fi
 echo "Tuning tasks: ${N_TASKS}"
 echo "Pipeline mode: ${PIPELINE_MODE}"
+echo "Task mode: ${TASK_MODE}"
+if [[ "${#MULTICLASS_ATTACK_NAME_VALUES[@]}" -gt 0 ]]; then
+  echo "Multiclass attack names: ${MULTICLASS_ATTACK_NAMES}"
+fi
+if [[ -n "${CNN_HYPERPARAMS}" ]]; then
+  echo "CNN hyperparams: ${CNN_HYPERPARAMS}"
+fi
+echo "Prepare random state: ${RANDOM_STATE}"
+echo "Prepare worker-cpu request: ${RESOLVED_SLURM_CPUS_PER_TASK_REQUEST}"
+echo "Prepare max-concurrent request: ${RESOLVED_SLURM_MAX_CONCURRENT_REQUEST}"
 
 if [[ "${PIPELINE_MODE}" == "prepare_only" ]]; then
   echo "Preparation completed; skipping worker/finalize submission."

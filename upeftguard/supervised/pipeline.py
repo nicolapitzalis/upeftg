@@ -8,7 +8,7 @@ from time import perf_counter
 from typing import Any
 
 import numpy as np
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_recall_fscore_support, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
 try:
@@ -71,9 +71,16 @@ from .distributed import (
     resolve_slurm_max_concurrent,
 )
 from .interfaces import (
+    ATTACK_FAMILY_MULTICLASS_ATTACKS,
     ARCHITECTURE_INDEPENDENT_AGGREGATION_KIND,
     ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,
+    BINARY_PROJECTION_ONE_MINUS_CLEAN_PROBABILITY,
+    BINARY_PROJECTION_POSITIVE_CLASS_SCORE,
+    SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS,
+    SUPERVISED_TASK_MODE_BINARY,
     SupervisedFeatureBundle,
+    SupervisedPredictionOutputs,
+    SupervisedTaskSpec,
     TABULAR_SPECTRAL_REPRESENTATION_KIND,
 )
 from .registry import (
@@ -83,6 +90,7 @@ from .registry import (
     model_complexity_rank,
     normalization_policy,
     registered_models,
+    resolve_cnn_hyperparams,
     supported_representation_kinds,
 )
 
@@ -96,6 +104,93 @@ SELECTED_THRESHOLD_FILENAME = "selected_threshold.json"
 GROUP_MASK_SUFFIX = "_group_mask.npy"
 VALUE_MASK_SUFFIX = "_value_mask.npy"
 GROUP_NAMES_SUFFIX = "_group_names.json"
+
+
+def _default_binary_task_spec() -> SupervisedTaskSpec:
+    class_names = ("clean", "backdoored")
+    return SupervisedTaskSpec(
+        task_mode=SUPERVISED_TASK_MODE_BINARY,
+        class_names=class_names,
+        class_to_index={name: idx for idx, name in enumerate(class_names)},
+        binary_projection=BINARY_PROJECTION_POSITIVE_CLASS_SCORE,
+    )
+
+
+def _resolve_attack_family_multiclass_task_spec(
+    attack_names: list[str] | tuple[str, ...] | None,
+) -> SupervisedTaskSpec:
+    if not attack_names:
+        raise ValueError(
+            "task_mode=attack_family_multiclass requires --multiclass-attack-names with the "
+            f"canonical attack family set {list(ATTACK_FAMILY_MULTICLASS_ATTACKS)}"
+        )
+
+    provided = {str(name).strip() for name in attack_names if str(name).strip()}
+    expected = set(ATTACK_FAMILY_MULTICLASS_ATTACKS)
+    if provided != expected:
+        raise ValueError(
+            "attack_family_multiclass currently requires exactly the canonical attack family set "
+            f"{list(ATTACK_FAMILY_MULTICLASS_ATTACKS)}, got {sorted(provided)}"
+        )
+
+    class_names = ("clean", *ATTACK_FAMILY_MULTICLASS_ATTACKS)
+    return SupervisedTaskSpec(
+        task_mode=SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS,
+        class_names=class_names,
+        class_to_index={name: idx for idx, name in enumerate(class_names)},
+        binary_projection=BINARY_PROJECTION_ONE_MINUS_CLEAN_PROBABILITY,
+    )
+
+
+def _resolve_supervised_task_spec(
+    *,
+    task_mode: str | None,
+    multiclass_attack_names: list[str] | tuple[str, ...] | None,
+) -> SupervisedTaskSpec:
+    resolved_task_mode = str(task_mode or SUPERVISED_TASK_MODE_BINARY)
+    if resolved_task_mode == SUPERVISED_TASK_MODE_BINARY:
+        return _default_binary_task_spec()
+    if resolved_task_mode == SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS:
+        return _resolve_attack_family_multiclass_task_spec(multiclass_attack_names)
+    raise ValueError(f"Unsupported supervised task_mode={resolved_task_mode!r}")
+
+
+def _task_spec_from_payload(payload: Any) -> SupervisedTaskSpec:
+    if not isinstance(payload, dict):
+        return _default_binary_task_spec()
+
+    task_mode = str(payload.get("task_mode") or SUPERVISED_TASK_MODE_BINARY)
+    class_names_raw = payload.get("class_names")
+    if not isinstance(class_names_raw, list) or not class_names_raw:
+        return _default_binary_task_spec()
+    class_names = tuple(str(x) for x in class_names_raw)
+
+    class_to_index_raw = payload.get("class_to_index")
+    if isinstance(class_to_index_raw, dict) and class_to_index_raw:
+        class_to_index = {str(key): int(value) for key, value in class_to_index_raw.items()}
+    else:
+        class_to_index = {name: idx for idx, name in enumerate(class_names)}
+
+    binary_projection = str(
+        payload.get(
+            "binary_projection",
+            (
+                BINARY_PROJECTION_POSITIVE_CLASS_SCORE
+                if task_mode == SUPERVISED_TASK_MODE_BINARY
+                else BINARY_PROJECTION_ONE_MINUS_CLEAN_PROBABILITY
+            ),
+        )
+    )
+    return SupervisedTaskSpec(
+        task_mode=task_mode,
+        class_names=class_names,
+        class_to_index=class_to_index,
+        binary_projection=binary_projection,
+    )
+
+
+def _task_spec_from_manifest(manifest: dict[str, Any]) -> SupervisedTaskSpec:
+    return _task_spec_from_payload(manifest.get("task"))
 
 
 @dataclass(frozen=True)
@@ -117,8 +212,39 @@ def _detect_manifest_mode(manifest_json: Path) -> str:
     return "single"
 
 
-def _labels_from_items(items: list[Any]) -> tuple[np.ndarray, np.ndarray, list[int | None]]:
-    raw_labels = [item.label for item in items]
+def _labels_from_items(
+    items: list[Any],
+    *,
+    task_spec: SupervisedTaskSpec,
+    sample_identities: list[AttackSampleIdentity] | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[int | None]]:
+    if task_spec.is_binary:
+        raw_labels = [item.label for item in items]
+        values = np.asarray([int(label) if label is not None else -1 for label in raw_labels], dtype=np.int32)
+        known = np.asarray([label is not None for label in raw_labels], dtype=bool)
+        return values, known, raw_labels
+
+    if sample_identities is None or len(sample_identities) != len(items):
+        raise ValueError("Multiclass supervised label derivation requires aligned attack sample identities")
+
+    raw_labels: list[int | None] = []
+    for item, identity in zip(items, sample_identities):
+        if item.label is None:
+            raw_labels.append(None)
+            continue
+        if int(item.label) == 0:
+            raw_labels.append(int(task_spec.clean_class_index))
+            continue
+
+        attack_name = str(identity.attack_name)
+        if attack_name not in task_spec.class_to_index:
+            raise ValueError(
+                "task_mode=attack_family_multiclass encountered a positive sample outside the configured "
+                f"attack vocabulary: model={item.model_name!r}, attack_name={attack_name!r}, "
+                f"supported={list(task_spec.class_names[1:])}"
+            )
+        raw_labels.append(int(task_spec.class_to_index[attack_name]))
+
     values = np.asarray([int(label) if label is not None else -1 for label in raw_labels], dtype=np.int32)
     known = np.asarray([label is not None for label in raw_labels], dtype=bool)
     return values, known, raw_labels
@@ -269,6 +395,111 @@ def _label_count_rows(labels: np.ndarray) -> list[dict[str, int]]:
         }
         for label, count in zip(unique.tolist(), counts.tolist())
     ]
+
+
+def _named_label_count_rows(labels: np.ndarray, *, task_spec: SupervisedTaskSpec) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for row in _label_count_rows(labels):
+        label_index = int(row["label"])
+        class_name = (
+            str(task_spec.class_names[label_index])
+            if 0 <= label_index < task_spec.n_classes
+            else f"unknown_{label_index}"
+        )
+        rows.append(
+            {
+                "label": label_index,
+                "class_name": class_name,
+                "count": int(row["count"]),
+            }
+        )
+    return rows
+
+
+def _project_optional_labels_to_binary(
+    labels: list[int | None],
+    *,
+    task_spec: SupervisedTaskSpec,
+) -> list[int | None]:
+    return [task_spec.project_label_to_binary(label) for label in labels]
+
+
+def _distribution_rows_from_predictions(
+    predicted_labels: np.ndarray,
+    *,
+    task_spec: SupervisedTaskSpec,
+) -> list[dict[str, Any]]:
+    predicted = np.asarray(predicted_labels, dtype=np.int32).reshape(-1)
+    unique, counts = np.unique(predicted, return_counts=True)
+    return [
+        {
+            "class_index": int(class_index),
+            "class_name": str(task_spec.class_names[int(class_index)]),
+            "count": int(count),
+        }
+        for class_index, count in zip(unique.tolist(), counts.tolist())
+    ]
+
+
+def _summarize_multiclass_partition(
+    *,
+    labels_true: np.ndarray | None,
+    predicted_labels: np.ndarray,
+    probabilities: np.ndarray | None,
+    task_spec: SupervisedTaskSpec,
+) -> dict[str, Any]:
+    predicted = np.asarray(predicted_labels, dtype=np.int32).reshape(-1)
+    summary: dict[str, Any] = {
+        "class_names": [str(x) for x in task_spec.class_names],
+        "predicted_class_distribution": _distribution_rows_from_predictions(
+            predicted,
+            task_spec=task_spec,
+        ),
+    }
+    if probabilities is not None:
+        summary["mean_probability_by_class"] = [
+            {
+                "class_index": int(class_index),
+                "class_name": str(task_spec.class_names[int(class_index)]),
+                "mean_probability": float(np.mean(probabilities[:, class_index])),
+            }
+            for class_index in range(task_spec.n_classes)
+        ]
+    if labels_true is None:
+        return summary
+
+    truth = np.asarray(labels_true, dtype=np.int32).reshape(-1)
+    precision, recall, f1, support = precision_recall_fscore_support(
+        truth,
+        predicted,
+        labels=np.arange(task_spec.n_classes, dtype=np.int32),
+        zero_division=0,
+    )
+    summary["accuracy"] = float(accuracy_score(truth, predicted))
+    summary["macro_f1"] = float(f1_score(truth, predicted, average="macro"))
+    summary["micro_f1"] = float(f1_score(truth, predicted, average="micro"))
+    summary["true_class_distribution"] = _named_label_count_rows(truth, task_spec=task_spec)
+    summary["confusion_matrix"] = {
+        "labels": [str(x) for x in task_spec.class_names],
+        "rows": confusion_matrix(
+            truth,
+            predicted,
+            labels=np.arange(task_spec.n_classes, dtype=np.int32),
+        ).astype(np.int32, copy=False).tolist(),
+    }
+    summary["per_class"] = [
+        {
+            "class_index": int(class_index),
+            "class_name": str(task_spec.class_names[int(class_index)]),
+            "precision": float(precision[int(class_index)]),
+            "recall": float(recall[int(class_index)]),
+            "f1": float(f1[int(class_index)]),
+            "support": int(support[int(class_index)]),
+            "predicted_count": int(np.sum(predicted == int(class_index))),
+        }
+        for class_index in range(task_spec.n_classes)
+    ]
+    return summary
 
 
 def _build_single_manifest_split_summary(
@@ -1348,14 +1579,18 @@ def _compact_indices_to_selected_scope(
     return np.asarray(compacted, dtype=np.int64)
 
 
+def _validated_train_label_counts(labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    unique, counts = np.unique(labels, return_counts=True)
+    if unique.size < 2:
+        raise ValueError("Supervised classification requires at least two classes in the training set")
+    return unique, counts
+
+
 def _sanitize_cv_folds(labels: np.ndarray, requested_folds: int) -> tuple[int, list[str]]:
     if requested_folds < 2:
         raise ValueError(f"cv_folds must be >=2, got {requested_folds}")
 
-    unique, counts = np.unique(labels, return_counts=True)
-    if unique.size < 2:
-        raise ValueError("Binary classification requires at least two classes in the training set")
-
+    _unique, counts = _validated_train_label_counts(labels)
     min_count = int(np.min(counts))
     warnings: list[str] = []
     if min_count < 2:
@@ -1427,8 +1662,69 @@ def _grid_search_warnings(
         warnings.append(
             "Large supervised grid search: "
             f"{n_tasks} tasks and approximately {estimated_total_fits} total model fits across CV splits"
-        )
+    )
     return warnings
+
+
+def _unwrap_final_estimator(model: Any) -> Any:
+    if hasattr(model, "named_steps") and getattr(model, "named_steps", None):
+        return list(model.named_steps.values())[-1]
+    if hasattr(model, "steps") and getattr(model, "steps", None):
+        return model.steps[-1][1]
+    return model
+
+
+def _sigmoid(values: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.asarray(values, dtype=np.float64)))
+
+
+def _softmax(values: np.ndarray) -> np.ndarray:
+    logits = np.asarray(values, dtype=np.float64)
+    shifted = logits - np.max(logits, axis=1, keepdims=True)
+    exp_logits = np.exp(shifted)
+    normalizer = np.sum(exp_logits, axis=1, keepdims=True)
+    normalizer = np.where(normalizer > 0.0, normalizer, 1.0)
+    return np.asarray(exp_logits / normalizer, dtype=np.float64)
+
+
+def _observed_model_classes(model: Any) -> np.ndarray | None:
+    estimator = _unwrap_final_estimator(model)
+    for candidate in (estimator, model):
+        classes = getattr(candidate, "classes_", None)
+        if classes is not None:
+            return np.asarray(classes, dtype=np.int32).reshape(-1)
+    return None
+
+
+def _align_task_matrix(
+    values: np.ndarray,
+    *,
+    observed_classes: np.ndarray | None,
+    task_spec: SupervisedTaskSpec,
+    fill_value: float,
+) -> np.ndarray:
+    matrix = np.asarray(values, dtype=np.float64)
+    if matrix.ndim != 2:
+        raise ValueError(f"Expected a 2D class-output matrix, got shape={matrix.shape}")
+    if matrix.shape[1] == task_spec.n_classes and observed_classes is None:
+        return np.asarray(matrix, dtype=np.float64)
+    if observed_classes is None:
+        observed_classes = np.arange(matrix.shape[1], dtype=np.int32)
+    if int(observed_classes.shape[0]) != int(matrix.shape[1]):
+        raise ValueError(
+            "Model output columns do not align with model classes_: "
+            f"shape={matrix.shape}, classes={observed_classes.tolist()}"
+        )
+    aligned = np.full((matrix.shape[0], task_spec.n_classes), float(fill_value), dtype=np.float64)
+    for source_col, class_value in enumerate(observed_classes.tolist()):
+        class_index = int(class_value)
+        if class_index < 0 or class_index >= task_spec.n_classes:
+            raise ValueError(
+                f"Observed class index {class_index} is outside the configured task classes "
+                f"[0, {task_spec.n_classes - 1}]"
+            )
+        aligned[:, class_index] = matrix[:, source_col]
+    return aligned
 
 
 def _predict_scores(model: Any, x: Any) -> np.ndarray:
@@ -1451,6 +1747,119 @@ def _predict_scores(model: Any, x: Any) -> np.ndarray:
     return pred.reshape(-1)
 
 
+def _predict_task_outputs(
+    model: Any,
+    x: Any,
+    *,
+    task_spec: SupervisedTaskSpec,
+) -> SupervisedPredictionOutputs:
+    if task_spec.is_binary:
+        probabilities: np.ndarray | None = None
+        logits: np.ndarray | None = None
+        if hasattr(model, "predict_proba"):
+            observed_classes = _observed_model_classes(model)
+            raw_proba = np.asarray(model.predict_proba(x), dtype=np.float64)
+            if raw_proba.ndim == 1:
+                raw_proba = raw_proba.reshape(-1, 1)
+            probabilities = _align_task_matrix(
+                raw_proba,
+                observed_classes=observed_classes,
+                task_spec=task_spec,
+                fill_value=0.0,
+            )
+            backdoor_scores = probabilities[:, 1]
+            clipped = np.clip(backdoor_scores, 1e-12, 1.0 - 1e-12)
+            logits = np.log(clipped / (1.0 - clipped))
+        elif hasattr(model, "decision_function"):
+            raw_decision = np.asarray(model.decision_function(x), dtype=np.float64)
+            if raw_decision.ndim == 2 and raw_decision.shape[1] >= 2:
+                observed_classes = _observed_model_classes(model)
+                aligned = _align_task_matrix(
+                    raw_decision,
+                    observed_classes=observed_classes,
+                    task_spec=task_spec,
+                    fill_value=-math.inf,
+                )
+                backdoor_scores = aligned[:, 1]
+                logits = np.asarray(backdoor_scores, dtype=np.float64)
+            else:
+                backdoor_scores = raw_decision.reshape(-1)
+                logits = np.asarray(backdoor_scores, dtype=np.float64)
+            positive_prob = _sigmoid(backdoor_scores)
+            probabilities = np.column_stack([1.0 - positive_prob, positive_prob]).astype(
+                np.float64,
+                copy=False,
+            )
+        else:
+            predicted = np.asarray(model.predict(x), dtype=np.int32).reshape(-1)
+            backdoor_scores = predicted.astype(np.float64, copy=False)
+            probabilities = np.column_stack([1.0 - backdoor_scores, backdoor_scores]).astype(
+                np.float64,
+                copy=False,
+            )
+            logits = np.asarray(backdoor_scores, dtype=np.float64)
+
+        if hasattr(model, "predict"):
+            predicted_labels = np.asarray(model.predict(x), dtype=np.int32).reshape(-1)
+        elif probabilities is not None:
+            predicted_labels = np.argmax(probabilities, axis=1).astype(np.int32, copy=False)
+        else:
+            predicted_labels = (np.asarray(backdoor_scores) >= 0.0).astype(np.int32, copy=False)
+
+        return SupervisedPredictionOutputs(
+            backdoor_scores=np.asarray(backdoor_scores, dtype=np.float64).reshape(-1),
+            predicted_labels=np.asarray(predicted_labels, dtype=np.int32).reshape(-1),
+            probabilities=probabilities,
+            logits=logits,
+        )
+
+    observed_classes = _observed_model_classes(model)
+    probabilities: np.ndarray | None = None
+    logits: np.ndarray | None = None
+    if hasattr(model, "predict_proba"):
+        raw_proba = np.asarray(model.predict_proba(x), dtype=np.float64)
+        if raw_proba.ndim == 1:
+            raw_proba = raw_proba.reshape(-1, 1)
+        probabilities = _align_task_matrix(
+            raw_proba,
+            observed_classes=observed_classes,
+            task_spec=task_spec,
+            fill_value=0.0,
+        )
+        logits = np.log(np.clip(probabilities, 1e-12, 1.0))
+    elif hasattr(model, "decision_function"):
+        raw_decision = np.asarray(model.decision_function(x), dtype=np.float64)
+        if raw_decision.ndim == 1:
+            raw_decision = np.column_stack([-raw_decision, raw_decision])
+        logits = _align_task_matrix(
+            raw_decision,
+            observed_classes=observed_classes,
+            task_spec=task_spec,
+            fill_value=-math.inf,
+        )
+        probabilities = _softmax(logits)
+    else:
+        predicted = np.asarray(model.predict(x), dtype=np.int32).reshape(-1)
+        probabilities = np.zeros((predicted.shape[0], task_spec.n_classes), dtype=np.float64)
+        probabilities[np.arange(predicted.shape[0], dtype=np.int64), predicted] = 1.0
+        logits = np.log(np.clip(probabilities, 1e-12, 1.0))
+
+    if probabilities is None:
+        raise RuntimeError("Task-aware prediction expected class probabilities or logits")
+
+    if hasattr(model, "predict"):
+        predicted_labels = np.asarray(model.predict(x), dtype=np.int32).reshape(-1)
+    else:
+        predicted_labels = np.argmax(probabilities, axis=1).astype(np.int32, copy=False)
+    backdoor_scores = 1.0 - probabilities[:, task_spec.clean_class_index]
+    return SupervisedPredictionOutputs(
+        backdoor_scores=np.asarray(backdoor_scores, dtype=np.float64).reshape(-1),
+        predicted_labels=np.asarray(predicted_labels, dtype=np.int32).reshape(-1),
+        probabilities=np.asarray(probabilities, dtype=np.float64),
+        logits=None if logits is None else np.asarray(logits, dtype=np.float64),
+    )
+
+
 def _evaluate_fold(
     *,
     features: np.ndarray | SupervisedFeatureBundle,
@@ -1461,8 +1870,9 @@ def _evaluate_fold(
     params: dict[str, Any],
     random_state: int,
     n_jobs: int,
+    task_spec: SupervisedTaskSpec,
 ) -> dict[str, Any]:
-    model = create(model_name, params=params, random_state=random_state)
+    model = create(model_name, params=params, random_state=random_state, task_spec=task_spec)
     train_features = _slice_supervised_features(features, train_indices)
     valid_features = _slice_supervised_features(features, valid_indices)
     backend = model_backend(model_name)
@@ -1475,13 +1885,34 @@ def _evaluate_fold(
         )
     else:
         model.fit(train_features, labels[train_indices])
-    scores = _predict_scores(model, valid_features)
-    auc = float(roc_auc_score(labels[valid_indices], scores))
-    return {
+    outputs = _predict_task_outputs(model, valid_features, task_spec=task_spec)
+    result = {
         "n_train": int(train_indices.size),
         "n_valid": int(valid_indices.size),
-        "roc_auc": auc,
+        "selection_metric_name": str(task_spec.selection_metric_name),
     }
+    if task_spec.is_binary:
+        auc = float(roc_auc_score(labels[valid_indices], outputs.backdoor_scores))
+        result["selection_metric"] = auc
+        result["roc_auc"] = auc
+        return result
+
+    y_valid = np.asarray(labels[valid_indices], dtype=np.int32).reshape(-1)
+    macro_f1 = float(f1_score(y_valid, outputs.predicted_labels, average="macro"))
+    accuracy = float(accuracy_score(y_valid, outputs.predicted_labels))
+    support_unique, support_counts = np.unique(y_valid, return_counts=True)
+    result["selection_metric"] = macro_f1
+    result["macro_f1"] = macro_f1
+    result["accuracy"] = accuracy
+    result["class_support"] = [
+        {
+            "class_index": int(class_index),
+            "class_name": str(task_spec.class_names[int(class_index)]),
+            "count": int(count),
+        }
+        for class_index, count in zip(support_unique.tolist(), support_counts.tolist())
+    ]
+    return result
 
 
 def _evaluate_candidate(
@@ -1491,6 +1922,7 @@ def _evaluate_candidate(
     task: dict[str, Any],
     cv_split_groups: list[dict[str, Any]],
     n_jobs: int,
+    task_spec: SupervisedTaskSpec,
 ) -> dict[str, Any]:
     eval_jobs: list[tuple[int, dict[str, Any]]] = []
     for group in cv_split_groups:
@@ -1513,6 +1945,7 @@ def _evaluate_candidate(
                 params=dict(task["params"]),
                 random_state=seed,
                 n_jobs=n_jobs,
+                task_spec=task_spec,
             )
             row["cv_random_state"] = int(seed)
             evaluated.append((seed, row))
@@ -1527,6 +1960,7 @@ def _evaluate_candidate(
                 params=dict(task["params"]),
                 random_state=seed,
                 n_jobs=n_jobs,
+                task_spec=task_spec,
             )
             for seed, split in eval_jobs
         )
@@ -1537,34 +1971,61 @@ def _evaluate_candidate(
             evaluated.append((seed, row_with_seed))
 
     fold_rows = [row for _, row in evaluated]
-    scores = [float(row["roc_auc"]) for row in fold_rows]
+    selection_metric_name = str(task_spec.selection_metric_name)
+    selection_scores = [float(row["selection_metric"]) for row in fold_rows if row.get("selection_metric") is not None]
 
     seed_results: list[dict[str, Any]] = []
     unique_seeds = sorted({int(seed) for seed, _ in evaluated})
     for seed in unique_seeds:
         seed_fold_rows = [row for seed_value, row in evaluated if int(seed_value) == int(seed)]
-        seed_scores = [float(row["roc_auc"]) for row in seed_fold_rows]
-        seed_results.append(
-            {
-                "random_state": int(seed),
-                "fold_results": seed_fold_rows,
-                "roc_auc_mean": float(np.mean(seed_scores)) if seed_scores else None,
-                "roc_auc_std": float(np.std(seed_scores)) if seed_scores else None,
-            }
-        )
+        seed_scores = [
+            float(row["selection_metric"])
+            for row in seed_fold_rows
+            if row.get("selection_metric") is not None
+        ]
+        seed_result = {
+            "random_state": int(seed),
+            "fold_results": seed_fold_rows,
+            "selection_metric_name": selection_metric_name,
+            "selection_metric_mean": float(np.mean(seed_scores)) if seed_scores else None,
+            "selection_metric_std": float(np.std(seed_scores)) if seed_scores else None,
+        }
+        if task_spec.is_binary:
+            seed_result["roc_auc_mean"] = seed_result["selection_metric_mean"]
+            seed_result["roc_auc_std"] = seed_result["selection_metric_std"]
+        else:
+            macro_f1_scores = [float(row["macro_f1"]) for row in seed_fold_rows if row.get("macro_f1") is not None]
+            accuracy_scores = [float(row["accuracy"]) for row in seed_fold_rows if row.get("accuracy") is not None]
+            seed_result["macro_f1_mean"] = float(np.mean(macro_f1_scores)) if macro_f1_scores else None
+            seed_result["macro_f1_std"] = float(np.std(macro_f1_scores)) if macro_f1_scores else None
+            seed_result["accuracy_mean"] = float(np.mean(accuracy_scores)) if accuracy_scores else None
+            seed_result["accuracy_std"] = float(np.std(accuracy_scores)) if accuracy_scores else None
+        seed_results.append(seed_result)
 
-    return {
+    result = {
         "task_index": int(task["task_index"]),
         "model_name": str(task["model_name"]),
         "params": dict(task["params"]),
         "complexity_rank": int(task["complexity_rank"]),
         "normalization_policy": str(task["normalization_policy"]),
         "status": "ok",
+        "selection_metric_name": selection_metric_name,
         "fold_results": fold_rows,
         "seed_results": seed_results,
-        "roc_auc_mean": float(np.mean(scores)) if scores else None,
-        "roc_auc_std": float(np.std(scores)) if scores else None,
+        "selection_metric_mean": float(np.mean(selection_scores)) if selection_scores else None,
+        "selection_metric_std": float(np.std(selection_scores)) if selection_scores else None,
     }
+    if task_spec.is_binary:
+        result["roc_auc_mean"] = result["selection_metric_mean"]
+        result["roc_auc_std"] = result["selection_metric_std"]
+    else:
+        macro_f1_scores = [float(row["macro_f1"]) for row in fold_rows if row.get("macro_f1") is not None]
+        accuracy_scores = [float(row["accuracy"]) for row in fold_rows if row.get("accuracy") is not None]
+        result["macro_f1_mean"] = float(np.mean(macro_f1_scores)) if macro_f1_scores else None
+        result["macro_f1_std"] = float(np.std(macro_f1_scores)) if macro_f1_scores else None
+        result["accuracy_mean"] = float(np.mean(accuracy_scores)) if accuracy_scores else None
+        result["accuracy_std"] = float(np.std(accuracy_scores)) if accuracy_scores else None
+    return result
 
 
 def _task_result_path(task_dir: Path, task_index: int) -> Path:
@@ -1887,6 +2348,9 @@ def _prepare_supervised_run(
     slurm_partition: str,
     slurm_max_concurrent: str,
     slurm_cpus_per_task: str,
+    task_mode: str,
+    multiclass_attack_names: list[str] | None,
+    cnn_hyperparams: Path | None,
 ) -> dict[str, Any]:
     manifest_json = resolve_manifest_path(manifest_json)
     if not manifest_json.exists():
@@ -1901,6 +2365,12 @@ def _prepare_supervised_run(
             "Supervised pipeline requires --features. Specify the feature groups to select from the "
             "extracted feature bundle."
         )
+    if cnn_hyperparams is not None and model_name not in {"cnn_1d", "all"}:
+        raise ValueError("--cnn-hyperparams is only supported when --model is cnn_1d or all")
+    task_spec = _resolve_supervised_task_spec(
+        task_mode=task_mode,
+        multiclass_attack_names=multiclass_attack_names,
+    )
 
     mode = _detect_manifest_mode(manifest_json)
     if mode == "joint":
@@ -1922,6 +2392,7 @@ def _prepare_supervised_run(
 
     if not train_items:
         raise ValueError("No training items resolved from manifest")
+    all_sample_identities = infer_attack_sample_identities(all_items)
 
     train_split_percent = _resolve_train_split_percent(train_split_percent)
     calibration_split_percent = _resolve_calibration_split_percent(calibration_split_percent)
@@ -1966,6 +2437,7 @@ def _prepare_supervised_run(
 
     if int(selected_expected_indices.size) != int(len(all_items)):
         all_items = [all_items[int(i)] for i in selected_expected_indices.tolist()]
+        all_sample_identities = [all_sample_identities[int(i)] for i in selected_expected_indices.tolist()]
         train_indices = _compact_indices_to_selected_scope(
             train_indices,
             selected_expected_indices=selected_expected_indices,
@@ -2042,8 +2514,20 @@ def _prepare_supervised_run(
             "Filtered incompatible supervised models for representation_kind="
             f"{representation_kind!r}: skipped {incompatible_model_names}"
         )
+    resolved_cnn_hyperparam_axes: dict[str, list[Any]] | None = None
+    cnn_hyperparams_info: dict[str, Any] | None = None
+    if "cnn_1d" in model_names:
+        resolved_cnn_hyperparam_axes, cnn_hyperparams_info = resolve_cnn_hyperparams(cnn_hyperparams)
+    elif cnn_hyperparams is not None:
+        extractor_warnings.append(
+            "Ignored --cnn-hyperparams because cnn_1d is not selected for this supervised run"
+        )
 
-    labels_values, labels_known, labels_raw = _labels_from_items(all_items)
+    labels_values, labels_known, labels_raw = _labels_from_items(
+        all_items,
+        task_spec=task_spec,
+        sample_identities=all_sample_identities,
+    )
     split_warnings: list[str] = []
     if mode == "single":
         if train_split_percent < 100 and not bool(np.all(labels_known)):
@@ -2088,7 +2572,7 @@ def _prepare_supervised_run(
 
     train_known = labels_known[train_indices]
     if not bool(np.all(train_known)):
-        raise ValueError("Training samples must all have labels (label0/label1) for supervised learning")
+        raise ValueError("Training samples must all have known labels for supervised learning")
 
     train_pool_indices = np.asarray(train_indices, dtype=np.int64)
     fit_train_indices = np.asarray(train_pool_indices, dtype=np.int64)
@@ -2113,7 +2597,6 @@ def _prepare_supervised_run(
             )
 
     fit_train_labels = labels_values[fit_train_indices]
-    cv_folds_resolved, cv_warnings = _sanitize_cv_folds(fit_train_labels, cv_folds)
     requested_states = list(cv_random_states) if cv_random_states else [int(random_state)]
     dedup_states: list[int] = []
     seen_states: set[int] = set()
@@ -2126,26 +2609,17 @@ def _prepare_supervised_run(
     if not dedup_states:
         dedup_states = [int(random_state)]
 
-    cv_split_groups: list[dict[str, Any]] = []
-    for state in dedup_states:
-        cv_split_groups.append(
-            {
-                "random_state": int(state),
-                "cv_splits": _build_cv_splits(
-                    train_indices=fit_train_indices,
-                    train_labels=fit_train_labels,
-                    cv_folds=cv_folds_resolved,
-                    random_state=int(state),
-                ),
-            }
-        )
-    cv_splits = list(cv_split_groups[0]["cv_splits"])
-
     tasks: list[dict[str, Any]] = []
     task_index = 0
     for selected_model in model_names:
         complexity = model_complexity_rank(selected_model)
-        for params in candidate_params(selected_model):
+        model_candidate_params = candidate_params(
+            selected_model,
+            cnn_hyperparams=(
+                resolved_cnn_hyperparam_axes if selected_model == "cnn_1d" else None
+            ),
+        )
+        for params in model_candidate_params:
             tasks.append(
                 {
                     "task_index": int(task_index),
@@ -2157,10 +2631,36 @@ def _prepare_supervised_run(
             )
             task_index += 1
 
-    estimated_total_fits = _estimate_total_fit_count(
-        n_tasks=len(tasks),
-        cv_split_groups=cv_split_groups,
-    )
+    _validated_train_label_counts(fit_train_labels)
+    execution_mode = "singleton_no_cv" if len(tasks) == 1 else "cross_validation"
+    cv_split_groups: list[dict[str, Any]] = []
+    cv_splits: list[dict[str, Any]] = []
+    if execution_mode == "singleton_no_cv":
+        cv_folds_resolved = 0
+        cv_warnings = [
+            "Skipped cross-validation because tuning search contains a single candidate; "
+            "singleton_no_cv execution mode will fit only during finalize"
+        ]
+        estimated_total_fits = 1
+    else:
+        cv_folds_resolved, cv_warnings = _sanitize_cv_folds(fit_train_labels, cv_folds)
+        for state in dedup_states:
+            cv_split_groups.append(
+                {
+                    "random_state": int(state),
+                    "cv_splits": _build_cv_splits(
+                        train_indices=fit_train_indices,
+                        train_labels=fit_train_labels,
+                        cv_folds=cv_folds_resolved,
+                        random_state=int(state),
+                    ),
+                }
+            )
+        cv_splits = list(cv_split_groups[0]["cv_splits"])
+        estimated_total_fits = _estimate_total_fit_count(
+            n_tasks=len(tasks),
+            cv_split_groups=cv_split_groups,
+        )
     grid_warnings = _grid_search_warnings(
         n_tasks=len(tasks),
         estimated_total_fits=estimated_total_fits,
@@ -2188,6 +2688,7 @@ def _prepare_supervised_run(
         "mode": mode,
         "manifest_json": str(manifest_json.expanduser().resolve()),
         "dataset_root": str(dataset_root),
+        "task": task_spec.to_dict(),
         "data": {
             "n_samples": int(_supervised_feature_row_count(features)),
             "train_indices": [int(x) for x in fit_train_indices.tolist()],
@@ -2213,7 +2714,7 @@ def _prepare_supervised_run(
             "executor": tuning_executor,
             "model_name": model_name,
             "model_names": model_names,
-            "metric": "roc_auc",
+            "metric": str(task_spec.selection_metric_name),
             "n_jobs": int(n_jobs),
             "random_state": int(random_state),
             "train_split_percent": int(train_split_percent),
@@ -2224,7 +2725,9 @@ def _prepare_supervised_run(
             "cv_random_states": [int(x) for x in dedup_states],
             "cv_folds_requested": int(cv_folds),
             "cv_folds_resolved": int(cv_folds_resolved),
+            "execution_mode": execution_mode,
             "estimated_total_fits": int(estimated_total_fits),
+            "cnn_hyperparams": cnn_hyperparams_info,
             "cv_splits": cv_splits,
             "cv_split_groups": cv_split_groups,
             "tasks": tasks,
@@ -2274,6 +2777,7 @@ def _prepare_supervised_run(
         "slurm_partition": slurm_partition,
         "slurm_max_concurrent": int(slurm_concurrency),
         "slurm_cpus_per_task": int(slurm_cpus),
+        "execution_mode": execution_mode,
         "warnings": tuning_manifest["warnings"],
     }
 
@@ -2296,9 +2800,50 @@ def _run_supervised_worker(
         raise ValueError(f"task_index={task_index} out of range [0, {len(tasks) - 1}]")
 
     task = tasks[task_index]
+    task_spec = _task_spec_from_manifest(manifest)
+    tuning_cfg = manifest["tuning"]
+    execution_mode = str(tuning_cfg.get("execution_mode", "cross_validation"))
+    if execution_mode == "singleton_no_cv":
+        start = perf_counter()
+        result = {
+            "task_index": int(task["task_index"]),
+            "model_name": str(task["model_name"]),
+            "params": dict(task["params"]),
+            "complexity_rank": int(task["complexity_rank"]),
+            "normalization_policy": str(task["normalization_policy"]),
+            "status": "ok",
+            "execution_mode": execution_mode,
+            "selection_metric_name": str(task_spec.selection_metric_name),
+            "selection_metric_mean": None,
+            "selection_metric_std": None,
+            "fold_results": [],
+            "seed_results": [],
+            "elapsed_seconds": float(perf_counter() - start),
+        }
+        if task_spec.is_binary:
+            result["roc_auc_mean"] = None
+            result["roc_auc_std"] = None
+        else:
+            result["macro_f1_mean"] = None
+            result["macro_f1_std"] = None
+            result["accuracy_mean"] = None
+            result["accuracy_std"] = None
+
+        task_dir = run_dir / "reports" / "tuning_tasks"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        out_path = _task_result_path(task_dir, task_index)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(json_ready(result), f, indent=2)
+
+        return {
+            "run_dir": str(run_dir),
+            "task_index": int(task_index),
+            "result_path": str(out_path),
+            "status": result.get("status"),
+        }
+
     features = _load_features_for_tuning_manifest(manifest)
     labels = np.load(manifest["data"]["labels_value_path"]).astype(np.int32)
-    tuning_cfg = manifest["tuning"]
     if "cv_split_groups" in tuning_cfg:
         cv_split_groups = list(tuning_cfg["cv_split_groups"])
     else:
@@ -2318,6 +2863,7 @@ def _run_supervised_worker(
             task=task,
             cv_split_groups=cv_split_groups,
             n_jobs=resolved_n_jobs,
+            task_spec=task_spec,
         )
     except Exception as exc:  # pragma: no cover - failure path asserted via output file shape
         result = {
@@ -2328,10 +2874,21 @@ def _run_supervised_worker(
             "normalization_policy": str(task["normalization_policy"]),
             "status": "error",
             "error": str(exc),
+            "execution_mode": execution_mode,
+            "selection_metric_name": str(task_spec.selection_metric_name),
+            "selection_metric_mean": None,
+            "selection_metric_std": None,
             "fold_results": [],
-            "roc_auc_mean": None,
-            "roc_auc_std": None,
+            "seed_results": [],
         }
+        if task_spec.is_binary:
+            result["roc_auc_mean"] = None
+            result["roc_auc_std"] = None
+        else:
+            result["macro_f1_mean"] = None
+            result["macro_f1_std"] = None
+            result["accuracy_mean"] = None
+            result["accuracy_std"] = None
 
     result["elapsed_seconds"] = float(perf_counter() - start)
 
@@ -2350,15 +2907,30 @@ def _run_supervised_worker(
 
 
 def _select_winner(candidates: list[dict[str, Any]]) -> dict[str, Any]:
-    valid = [row for row in candidates if row.get("status") == "ok" and row.get("roc_auc_mean") is not None]
+    valid = [
+        row
+        for row in candidates
+        if row.get("status") == "ok" and row.get("selection_metric_mean") is not None
+    ]
     if not valid:
+        singleton_no_cv = [
+            row
+            for row in candidates
+            if row.get("status") == "ok" and row.get("execution_mode") == "singleton_no_cv"
+        ]
+        if len(singleton_no_cv) == 1:
+            return singleton_no_cv[0]
         raise RuntimeError("No successful tuning candidates available to select a winner")
 
     ranked = sorted(
         valid,
         key=lambda row: (
-            -float(row["roc_auc_mean"]),
-            float(row["roc_auc_std"]) if row.get("roc_auc_std") is not None else float("inf"),
+            -float(row["selection_metric_mean"]),
+            (
+                float(row["selection_metric_std"])
+                if row.get("selection_metric_std") is not None
+                else float("inf")
+            ),
             int(row.get("complexity_rank", 10**9)),
             int(row["task_index"]),
         ),
@@ -2381,9 +2953,12 @@ def _winner_feature_weights_mode(
     *,
     skip_feature_importance: bool,
     winner_model_name: str,
+    task_spec: SupervisedTaskSpec,
 ) -> str:
     if skip_feature_importance:
         return "skipped"
+    if not task_spec.is_binary:
+        return "unsupported_for_task_mode"
     if model_backend(winner_model_name) != "sklearn":
         return "unsupported_for_backend"
     return "pending"
@@ -2452,7 +3027,7 @@ def _already_finalized_winner_feature_weights_mode(run_dir: Path) -> str | None:
     if run_config is None:
         return None
     mode = str(run_config.get("winner_feature_weights_mode", ""))
-    if mode in {"skipped", "unsupported_for_backend"}:
+    if mode in {"skipped", "unsupported_for_backend", "unsupported_for_task_mode"}:
         return mode
     return None
 
@@ -2522,6 +3097,7 @@ def _prepare_supervised_finalize(
         raise RuntimeError(f"Missing tuning task outputs for indices: {missing[:10]}")
 
     winner = _select_winner(task_results)
+    task_spec = _task_spec_from_manifest(manifest)
     features = _load_features_for_tuning_manifest(manifest)
     labels_value = np.load(manifest["data"]["labels_value_path"]).astype(np.int32)
     labels_known = np.load(manifest["data"]["labels_known_path"]).astype(bool)
@@ -2553,6 +3129,7 @@ def _prepare_supervised_finalize(
         str(winner["model_name"]),
         params=dict(winner["params"]),
         random_state=int(manifest["tuning"]["random_state"]),
+        task_spec=task_spec,
     )
     winner_backend = model_backend(str(winner["model_name"]))
     if winner_backend == "cnn":
@@ -2563,9 +3140,10 @@ def _prepare_supervised_finalize(
         )
     else:
         model.fit(x_train, y_train)
-    train_scores = _predict_scores(model, x_train)
+    train_outputs = _predict_task_outputs(model, x_train, task_spec=task_spec)
+    train_scores = np.asarray(train_outputs.backdoor_scores, dtype=np.float64)
     threshold_specs = _build_threshold_specs(
-        train_scores=np.asarray(train_scores, dtype=np.float64),
+        train_scores=train_scores,
         percentiles=[float(x) for x in score_percentiles],
     )
 
@@ -2574,7 +3152,9 @@ def _prepare_supervised_finalize(
 
     train_model_names = [model_names[int(i)] for i in train_indices.tolist()]
     train_sample_identities = [all_sample_identities[int(i)] for i in train_indices.tolist()]
-    train_labels_raw = [int(x) for x in y_train.tolist()]
+    train_task_labels_raw = [int(x) for x in y_train.tolist()]
+    train_labels_raw = _project_optional_labels_to_binary(train_task_labels_raw, task_spec=task_spec)
+    train_binary_labels_np = task_spec.project_known_labels_to_binary(y_train)
     train_scores_csv = ctx.reports_dir / "train_scores.csv"
     save_score_csv(
         output_path=train_scores_csv,
@@ -2587,18 +3167,23 @@ def _prepare_supervised_finalize(
     calibration_score_summary: dict[str, Any] | None = None
     calibration_offline_metrics: dict[str, Any] | None = None
     calibration_model_names: list[str] = []
-    calibration_sample_identities: list[AttackSampleIdentity] = []
     calibration_labels_raw: list[int] = []
+    calibration_task_labels_raw: list[int] = []
     calibration_scores: np.ndarray | None = None
+    calibration_outputs: SupervisedPredictionOutputs | None = None
+    calibration_binary_labels_np: np.ndarray | None = None
     if calibration_indices.size > 0:
         x_calibration = _slice_supervised_features(features, calibration_indices)
         y_calibration = labels_value[calibration_indices]
-        calibration_scores = _predict_scores(model, x_calibration)
+        calibration_outputs = _predict_task_outputs(model, x_calibration, task_spec=task_spec)
+        calibration_scores = np.asarray(calibration_outputs.backdoor_scores, dtype=np.float64)
         calibration_model_names = [model_names[int(i)] for i in calibration_indices.tolist()]
-        calibration_sample_identities = [
-            all_sample_identities[int(i)] for i in calibration_indices.tolist()
-        ]
-        calibration_labels_raw = [int(x) for x in y_calibration.tolist()]
+        calibration_task_labels_raw = [int(x) for x in y_calibration.tolist()]
+        calibration_labels_raw = _project_optional_labels_to_binary(
+            calibration_task_labels_raw,
+            task_spec=task_spec,
+        )
+        calibration_binary_labels_np = task_spec.project_known_labels_to_binary(y_calibration)
         calibration_scores_csv = ctx.reports_dir / "calibration_scores.csv"
         save_score_csv(
             output_path=calibration_scores_csv,
@@ -2606,10 +3191,10 @@ def _prepare_supervised_finalize(
             labels=calibration_labels_raw,
             scores=calibration_scores,
         )
-        calibration_score_summary = summarize_scores(np.asarray(calibration_scores, dtype=np.float64))
+        calibration_score_summary = summarize_scores(calibration_scores)
         calibration_offline_metrics = compute_offline_metrics(
-            np.asarray(y_calibration, dtype=np.int32),
-            np.asarray(calibration_scores, dtype=np.float64),
+            calibration_binary_labels_np,
+            calibration_scores,
         )
 
     infer_scores_csv: Path | None = None
@@ -2620,22 +3205,35 @@ def _prepare_supervised_finalize(
     infer_model_names: list[str] = []
     infer_sample_identities: list[AttackSampleIdentity] = []
     infer_labels_raw: list[int | None] = []
+    infer_task_labels_raw: list[int | None] = []
     infer_scores: np.ndarray | None = None
     infer_labels_np: np.ndarray | None = None
+    infer_task_labels_np: np.ndarray | None = None
+    infer_known_task_labels_np: np.ndarray | None = None
+    infer_outputs: SupervisedPredictionOutputs | None = None
 
     if infer_indices.size > 0:
         x_infer = _slice_supervised_features(features, infer_indices)
-        infer_scores = _predict_scores(model, x_infer)
+        infer_outputs = _predict_task_outputs(model, x_infer, task_spec=task_spec)
+        infer_scores = np.asarray(infer_outputs.backdoor_scores, dtype=np.float64)
         infer_model_names = [model_names[int(i)] for i in infer_indices.tolist()]
         infer_sample_identities = [all_sample_identities[int(i)] for i in infer_indices.tolist()]
 
         infer_known_mask = labels_known[infer_indices]
         for i in infer_indices.tolist():
             raw = int(labels_value[int(i)])
-            infer_labels_raw.append(None if raw < 0 else raw)
+            infer_task_labels_raw.append(None if raw < 0 else raw)
+        infer_labels_raw = _project_optional_labels_to_binary(
+            infer_task_labels_raw,
+            task_spec=task_spec,
+        )
+        infer_known_task_labels = [int(x) for x in infer_task_labels_raw if x is not None]
+        if infer_known_task_labels:
+            infer_known_task_labels_np = np.asarray(infer_known_task_labels, dtype=np.int32)
 
         if bool(np.all(infer_known_mask)):
-            infer_labels_np = np.asarray([int(x) for x in infer_labels_raw], dtype=np.int32)
+            infer_task_labels_np = np.asarray([int(x) for x in infer_task_labels_raw], dtype=np.int32)
+            infer_labels_np = task_spec.project_known_labels_to_binary(infer_task_labels_np)
 
         infer_scores_csv = ctx.reports_dir / "inference_scores.csv"
         save_score_csv(
@@ -2646,21 +3244,21 @@ def _prepare_supervised_finalize(
         )
 
         threshold_rows = compute_infer_threshold_rows(
-            train_scores=np.asarray(train_scores, dtype=np.float64),
-            infer_scores=np.asarray(infer_scores, dtype=np.float64),
+            train_scores=train_scores,
+            infer_scores=infer_scores,
             percentiles=[float(x) for x in score_percentiles],
             infer_labels=infer_labels_np,
         )
         threshold_rows_from_inference = compute_infer_threshold_rows_from_inference(
-            infer_scores=np.asarray(infer_scores, dtype=np.float64),
+            infer_scores=infer_scores,
             percentiles=[float(x) for x in score_percentiles],
             infer_labels=infer_labels_np,
         )
         infer_offline_metrics = compute_offline_metrics(
             infer_labels_np,
-            np.asarray(infer_scores, dtype=np.float64),
+            infer_scores,
         )
-        inference_summary = summarize_scores(np.asarray(infer_scores, dtype=np.float64))
+        inference_summary = summarize_scores(infer_scores)
 
     threshold_selection_cfg = manifest.get("threshold_selection", {})
     selected_threshold_summary: dict[str, Any] | None = None
@@ -2680,7 +3278,7 @@ def _prepare_supervised_finalize(
         selected_threshold_rows: list[dict[str, Any]] = []
         for accepted_fpr_value in resolved_accepted_fprs:
             selected_threshold_metrics = _select_threshold_max_recall_under_fpr(
-                labels_true=np.asarray(calibration_labels_raw, dtype=np.int32),
+                labels_true=np.asarray(calibration_binary_labels_np, dtype=np.int32),
                 scores=np.asarray(calibration_scores, dtype=np.float64),
                 accepted_fpr=float(accepted_fpr_value),
             )
@@ -2688,7 +3286,7 @@ def _prepare_supervised_finalize(
             if infer_scores is not None and infer_labels_np is not None:
                 inference_selected_metrics = _evaluate_binary_threshold(
                     labels_true=infer_labels_np,
-                    scores=np.asarray(infer_scores, dtype=np.float64),
+                    scores=infer_scores,
                     threshold=float(selected_threshold_metrics["threshold"]),
                 )
 
@@ -2710,14 +3308,52 @@ def _prepare_supervised_finalize(
 
     selected_threshold_specs = _build_selected_threshold_specs(selected_threshold_summary)
     train_offline_metrics = compute_offline_metrics(
-        np.asarray(y_train, dtype=np.int32),
-        np.asarray(train_scores, dtype=np.float64),
+        train_binary_labels_np,
+        train_scores,
     )
+    multiclass_assessment = None
+    if not task_spec.is_binary:
+        multiclass_assessment = {
+            "train": _summarize_multiclass_partition(
+                labels_true=np.asarray(y_train, dtype=np.int32),
+                predicted_labels=train_outputs.predicted_labels,
+                probabilities=train_outputs.probabilities,
+                task_spec=task_spec,
+            ),
+            "calibration": (
+                _summarize_multiclass_partition(
+                    labels_true=np.asarray(labels_value[calibration_indices], dtype=np.int32),
+                    predicted_labels=np.asarray(calibration_outputs.predicted_labels, dtype=np.int32),
+                    probabilities=calibration_outputs.probabilities,
+                    task_spec=task_spec,
+                )
+                if calibration_outputs is not None
+                else None
+            ),
+            "inference": (
+                _summarize_multiclass_partition(
+                    labels_true=(
+                        np.asarray(infer_task_labels_np, dtype=np.int32)
+                        if infer_task_labels_np is not None
+                        else None
+                    ),
+                    predicted_labels=(
+                        np.asarray(infer_outputs.predicted_labels, dtype=np.int32)
+                        if infer_outputs is not None
+                        else np.asarray([], dtype=np.int32)
+                    ),
+                    probabilities=(infer_outputs.probabilities if infer_outputs is not None else None),
+                    task_spec=task_spec,
+                )
+                if infer_outputs is not None
+                else None
+            ),
+        }
     attack_analysis = {
         "train": _summarize_attack_groups(
             sample_identities=train_sample_identities,
             labels=train_labels_raw,
-            scores=np.asarray(train_scores, dtype=np.float64),
+            scores=train_scores,
             threshold_specs=threshold_specs,
             selected_threshold_specs=selected_threshold_specs,
         ),
@@ -2734,7 +3370,22 @@ def _prepare_supervised_finalize(
         ),
     }
 
+    export_train_features_path: Path | None = None
+    export_train_labels_path: Path | None = None
+    winner_feature_weights_mode = _winner_feature_weights_mode(
+        skip_feature_importance=bool(skip_feature_importance),
+        winner_model_name=str(winner["model_name"]),
+        task_spec=task_spec,
+    )
+    report_warnings = [str(x) for x in manifest.get("warnings", [])]
+    if winner_feature_weights_mode == "unsupported_for_task_mode":
+        report_warnings.append(
+            "Skipped winner feature-importance export because multiclass supervised task mode does not "
+            "yet support feature-importance export"
+        )
+
     report = {
+        "task": task_spec.to_dict(),
         "data_info": {
             "mode": manifest["mode"],
             "n_samples": int(_supervised_feature_row_count(features)),
@@ -2744,27 +3395,41 @@ def _prepare_supervised_finalize(
             "n_inference": int(infer_indices.size),
             "split": manifest["data"].get("split"),
             "calibration_split": manifest["data"].get("calibration_split"),
-            "n_train_clean": int(np.sum(y_train == 0)),
-            "n_train_backdoored": int(np.sum(y_train == 1)),
+            "n_train_clean": int(np.sum(train_binary_labels_np == 0)),
+            "n_train_backdoored": int(np.sum(train_binary_labels_np == 1)),
             "n_calibration_clean": (
-                int(np.sum(labels_value[calibration_indices] == 0))
+                int(np.sum(calibration_binary_labels_np == 0))
                 if calibration_indices.size > 0
                 else 0
             ),
             "n_calibration_backdoored": (
-                int(np.sum(labels_value[calibration_indices] == 1))
+                int(np.sum(calibration_binary_labels_np == 1))
                 if calibration_indices.size > 0
                 else 0
             ),
             "n_inference_clean": (
-                int(np.sum(labels_value[infer_indices] == 0))
+                int(sum(1 for label in infer_labels_raw if label == 0))
                 if infer_indices.size > 0
                 else 0
             ),
             "n_inference_backdoored": (
-                int(np.sum(labels_value[infer_indices] == 1))
+                int(sum(1 for label in infer_labels_raw if label == 1))
                 if infer_indices.size > 0
                 else 0
+            ),
+            "train_class_counts": _named_label_count_rows(np.asarray(y_train, dtype=np.int32), task_spec=task_spec),
+            "calibration_class_counts": (
+                _named_label_count_rows(
+                    np.asarray(labels_value[calibration_indices], dtype=np.int32),
+                    task_spec=task_spec,
+                )
+                if calibration_indices.size > 0
+                else []
+            ),
+            "inference_class_counts": (
+                _named_label_count_rows(np.asarray(infer_known_task_labels_np, dtype=np.int32), task_spec=task_spec)
+                if infer_known_task_labels_np is not None
+                else []
             ),
             "n_inference_unknown_label": (
                 int(np.sum(labels_value[infer_indices] < 0))
@@ -2779,9 +3444,11 @@ def _prepare_supervised_finalize(
             "feature_path": manifest["data"]["feature_path"],
         },
         "tuning": {
-            "metric": "roc_auc",
+            "metric": manifest["tuning"].get("metric", task_spec.selection_metric_name),
             "model_name": manifest["tuning"]["model_name"],
             "model_names": manifest["tuning"].get("model_names", [manifest["tuning"]["model_name"]]),
+            "cnn_hyperparams": manifest["tuning"].get("cnn_hyperparams"),
+            "execution_mode": manifest["tuning"].get("execution_mode", "cross_validation"),
             "cv_random_states": manifest["tuning"].get("cv_random_states", [manifest["tuning"]["random_state"]]),
             "cv_folds_resolved": manifest["tuning"]["cv_folds_resolved"],
             "estimated_total_fits": manifest["tuning"].get("estimated_total_fits"),
@@ -2791,8 +3458,13 @@ def _prepare_supervised_finalize(
             "winner": winner,
         },
         "fit_assessment": {
-            "score_definition": "positive_class_score",
-            "train_score_summary": summarize_scores(np.asarray(train_scores, dtype=np.float64)),
+            "score_definition": (
+                "positive_class_score"
+                if task_spec.binary_projection == BINARY_PROJECTION_POSITIVE_CLASS_SCORE
+                else "backdoor_score"
+            ),
+            "binary_projection": str(task_spec.binary_projection),
+            "train_score_summary": summarize_scores(train_scores),
             "train_offline_metrics": train_offline_metrics,
             "calibration_score_summary": calibration_score_summary,
             "calibration_offline_metrics": calibration_offline_metrics,
@@ -2801,9 +3473,10 @@ def _prepare_supervised_finalize(
             "threshold_evaluation_from_inference": threshold_rows_from_inference,
             "offline_metrics": infer_offline_metrics,
         },
+        "multiclass_assessment": multiclass_assessment,
         "threshold_selection": selected_threshold_summary,
         "attack_analysis": attack_analysis,
-        "warnings": manifest.get("warnings", []),
+        "warnings": report_warnings,
     }
 
     report_path = ctx.reports_dir / "supervised_report.json"
@@ -2825,12 +3498,6 @@ def _prepare_supervised_finalize(
     )
     results_summary_markdown_path = results_summary_outputs["results_summary_md"]
 
-    export_train_features_path: Path | None = None
-    export_train_labels_path: Path | None = None
-    winner_feature_weights_mode = _winner_feature_weights_mode(
-        skip_feature_importance=bool(skip_feature_importance),
-        winner_model_name=str(winner["model_name"]),
-    )
     if winner_feature_weights_mode == "pending":
         export_train_features_path = ctx.features_dir / FINALIZE_EXPORT_TRAIN_FEATURES_FILENAME
         export_train_labels_path = ctx.features_dir / FINALIZE_EXPORT_TRAIN_LABELS_FILENAME
@@ -2845,8 +3512,11 @@ def _prepare_supervised_finalize(
         "dataset_root": manifest["dataset_root"],
         "mode": manifest["mode"],
         "tuning_executor": manifest["tuning"]["executor"],
+        "task": task_spec.to_dict(),
         "model_name": manifest["tuning"]["model_name"],
         "model_names": manifest["tuning"].get("model_names", [manifest["tuning"]["model_name"]]),
+        "cnn_hyperparams": manifest["tuning"].get("cnn_hyperparams"),
+        "execution_mode": manifest["tuning"].get("execution_mode", "cross_validation"),
         "train_split_percent": int(manifest["tuning"].get("train_split_percent", 100)),
         "calibration_split_percent": manifest["tuning"].get("calibration_split_percent"),
         "accepted_fprs": threshold_selection_cfg.get("accepted_fprs"),
@@ -2860,7 +3530,7 @@ def _prepare_supervised_finalize(
         "threshold_selection": selected_threshold_summary,
         "skip_feature_importance": bool(skip_feature_importance),
         "winner_feature_weights_mode": winner_feature_weights_mode,
-        "warnings": manifest.get("warnings", []),
+        "warnings": report_warnings,
     }
     artifacts = {
         "best_model": str(model_path),
@@ -3093,6 +3763,9 @@ def run_supervised_pipeline(
     stage: str,
     run_dir: Path | None,
     task_index: int | None,
+    task_mode: str = SUPERVISED_TASK_MODE_BINARY,
+    multiclass_attack_names: list[str] | None = None,
+    cnn_hyperparams: Path | None = None,
     skip_feature_importance: bool = False,
 ) -> dict[str, Any]:
     if stage in {"all", "prepare"} and manifest_json is None:
@@ -3143,6 +3816,9 @@ def run_supervised_pipeline(
             slurm_partition=slurm_partition,
             slurm_max_concurrent=slurm_max_concurrent,
             slurm_cpus_per_task=slurm_cpus_per_task,
+            task_mode=task_mode,
+            multiclass_attack_names=multiclass_attack_names,
+            cnn_hyperparams=cnn_hyperparams,
         )
 
     if stage == "worker":
@@ -3208,6 +3884,9 @@ def run_supervised_pipeline(
         slurm_partition=slurm_partition,
         slurm_max_concurrent=slurm_max_concurrent,
         slurm_cpus_per_task=slurm_cpus_per_task,
+        task_mode=task_mode,
+        multiclass_attack_names=multiclass_attack_names,
+        cnn_hyperparams=cnn_hyperparams,
     )
     resolved_run_dir = Path(prepared["run_dir"])
 

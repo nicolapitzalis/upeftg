@@ -39,9 +39,11 @@ from upeftguard.supervised.interfaces import (
 )
 from upeftguard.supervised.pipeline import _load_features_for_tuning_manifest, run_supervised_pipeline
 from upeftguard.supervised.registry import candidate_params, create, normalization_policy, registered_models
+from upeftguard.unsupervised.analysis import run_rank_feature_value_analysis
 from upeftguard.utilities.artifacts.dataset_references import (
     build_dataset_reference_payload_from_items,
     default_dataset_reference_report_path,
+    resolve_dataset_reference_payload_for_artifact,
     write_dataset_reference_report,
 )
 from upeftguard.utilities.artifacts.spectral_metadata import (
@@ -1198,6 +1200,50 @@ def build_tiny_multi_arch_provenance_merge_bundle(
         "manifest_entries": manifest_entries,
         "per_model_leaf_rows": per_model_leaf_rows,
     }
+
+
+def write_ranked_dataset_reference_report(
+    *,
+    feature_path: Path,
+    output_path: Path,
+    rank_by_model_name: dict[str, int],
+) -> Path:
+    payload = resolve_dataset_reference_payload_for_artifact(feature_path)
+    raw_model_index = payload.get("model_index")
+    if not isinstance(raw_model_index, dict):
+        raise ValueError("Expected model_index in dataset reference payload")
+
+    updated_model_index: dict[str, dict[str, Any]] = {}
+    for model_name, raw_entry in raw_model_index.items():
+        if model_name not in rank_by_model_name:
+            raise ValueError(f"Missing rank mapping for model {model_name}")
+        entry = dict(raw_entry) if isinstance(raw_entry, dict) else {}
+        rank = int(rank_by_model_name[model_name])
+        dataset_name = str(entry.get("dataset_name") or "synthetic_dataset")
+        subset_name = str(entry.get("subset_name") or dataset_name)
+        entry["dataset_name"] = f"{dataset_name}_rank{rank}"
+        entry["subset_name"] = f"{subset_name}_rank{rank}"
+        updated_model_index[str(model_name)] = entry
+
+    updated_payload = dict(payload)
+    updated_payload["model_index"] = updated_model_index
+    return write_dataset_reference_report(output_path, updated_payload)
+
+
+def per_model_emitted_feature_means(
+    per_model_leaf_rows: dict[str, dict[str, Any]],
+) -> dict[tuple[str, str], float]:
+    expected: dict[tuple[str, str], float] = {}
+    for model_name, leaf_row in per_model_leaf_rows.items():
+        grouped_values: dict[str, list[float]] = {}
+        for feature_name, value in zip(leaf_row["feature_names"], np.asarray(leaf_row["values"], dtype=np.float32)):
+            emitted_feature = str(feature_name).rpartition(".")[2]
+            grouped_values.setdefault(emitted_feature, []).append(float(value))
+        for emitted_feature, values in grouped_values.items():
+            expected[(str(model_name), emitted_feature)] = float(
+                np.mean(np.asarray(values, dtype=np.float64), dtype=np.float64)
+            )
+    return expected
 
 
 def build_direct_layer_sequence_bundle(*, include_other_slot: bool = False) -> SupervisedFeatureBundle:
@@ -2382,6 +2428,185 @@ class TestCliAndPipeline(unittest.TestCase):
             self.assertAlmostEqual(reported_threshold, expected, places=6)
             self.assertAlmostEqual(reported_threshold_from_inference, expected_from_inference, places=6)
             self.assertAlmostEqual(reported_percentile_from_inference, 90.0, places=6)
+
+    def test_run_rank_feature_value_analysis_matches_leaf_owned_feature_means_on_mixed_arch_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle = build_tiny_multi_arch_provenance_merge_bundle(tmp_path)
+            rank_by_model_name = {
+                str(model_name): (
+                    8
+                    if str(model_name).startswith("tiny_label") or str(model_name).startswith("tiny_t5")
+                    else 16
+                )
+                for model_name in bundle["per_model_leaf_rows"]
+            }
+            ranked_report_path = write_ranked_dataset_reference_report(
+                feature_path=bundle["merged_feature_path"],
+                output_path=tmp_path / "ranked_dataset_reference_report.json",
+                rank_by_model_name=rank_by_model_name,
+            )
+
+            report = run_rank_feature_value_analysis(
+                feature_file=bundle["merged_feature_path"],
+                output_dir=tmp_path / "rank_feature_values",
+                dataset_reference_report=ranked_report_path,
+            )
+
+            self.assertEqual(report["analysis"], "rank_feature_values")
+            self.assertEqual(report["ranks"], [8, 16])
+            self.assertEqual(sorted(report["plotted_features"]), ["energy", "stable_rank"])
+
+            with open(report["sample_table_csv"], "r", encoding="utf-8") as f:
+                csv_rows = list(csv.DictReader(f))
+
+            actual_values = {
+                (str(row["model_name"]), str(row["feature_name"])): float(row["value"])
+                for row in csv_rows
+            }
+            expected_values = per_model_emitted_feature_means(bundle["per_model_leaf_rows"])
+            self.assertEqual(set(actual_values), set(expected_values))
+            for key, expected_value in expected_values.items():
+                self.assertAlmostEqual(actual_values[key], expected_value, places=6)
+
+            merged_features = np.asarray(np.load(bundle["merged_feature_path"]), dtype=np.float32)
+            merged_model_names = load_json_file(bundle["merged_feature_path"].parent / "spectral_model_names.json")
+            _, merged_metadata = load_public_and_internal_spectral_metadata(
+                bundle["merged_feature_path"].parent / "spectral_metadata.json"
+            )
+            merged_feature_names = [str(x) for x in merged_metadata["feature_names"]]
+
+            found_naive_mean_mismatch = False
+            for row_idx, model_name in enumerate(merged_model_names):
+                for emitted_feature in report["plotted_features"]:
+                    column_indices = [
+                        idx
+                        for idx, feature_name in enumerate(merged_feature_names)
+                        if str(feature_name).rpartition(".")[2] == str(emitted_feature)
+                    ]
+                    naive_mean = float(
+                        np.mean(
+                            merged_features[row_idx, np.asarray(column_indices, dtype=np.int64)],
+                            dtype=np.float64,
+                        )
+                    )
+                    expected_value = expected_values[(str(model_name), str(emitted_feature))]
+                    if not np.isclose(naive_mean, expected_value, rtol=1e-6, atol=1e-6):
+                        found_naive_mean_mismatch = True
+                        break
+                if found_naive_mean_mismatch:
+                    break
+
+            self.assertTrue(found_naive_mean_mismatch)
+
+    def test_cli_run_unsupervised_rank_feature_values_writes_report_and_plots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle = build_tiny_multi_arch_provenance_merge_bundle(tmp_path)
+            rank_by_model_name = {
+                str(model_name): (
+                    8
+                    if str(model_name).startswith("tiny_label") or str(model_name).startswith("tiny_t5")
+                    else 16
+                )
+                for model_name in bundle["per_model_leaf_rows"]
+            }
+            ranked_report_path = write_ranked_dataset_reference_report(
+                feature_path=bundle["merged_feature_path"],
+                output_path=tmp_path / "ranked_dataset_reference_report.json",
+                rank_by_model_name=rank_by_model_name,
+            )
+
+            runs_root = tmp_path / "runs"
+            run_id = "rank_feature_values_cli"
+            proc = run_cli(
+                [
+                    "run",
+                    "unsupervised-rank-feature-values",
+                    "--feature-file",
+                    str(bundle["merged_feature_path"]),
+                    "--dataset-reference-report",
+                    str(ranked_report_path),
+                    "--output-root",
+                    str(runs_root),
+                    "--run-id",
+                    run_id,
+                    "--features",
+                    "energy",
+                    "stable_rank",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr + proc.stdout)
+
+            run_dir = runs_root / "unsupervised_rank_feature_values" / run_id
+            report_path = run_dir / "reports" / "rank_feature_values_report.json"
+            sample_table_path = run_dir / "reports" / "rank_feature_values.csv"
+            scatter_plot_path = run_dir / "plots" / "rank_feature_values" / "rank_feature_values_scatter.png"
+            box_plot_path = run_dir / "plots" / "rank_feature_values" / "rank_feature_values_boxplots.png"
+
+            self.assertTrue(report_path.exists())
+            self.assertTrue(sample_table_path.exists())
+            self.assertTrue(scatter_plot_path.exists())
+            self.assertTrue(box_plot_path.exists())
+
+            report = load_json_file(report_path)
+            self.assertEqual(report["ranks"], [8, 16])
+            self.assertEqual(sorted(report["plotted_features"]), ["energy", "stable_rank"])
+            self.assertEqual(report["sample_table_csv"], str(sample_table_path))
+            self.assertEqual(report["scatter_plot"], str(scatter_plot_path))
+            self.assertEqual(report["box_plot"], str(box_plot_path))
+
+    def test_run_rank_feature_value_analysis_requires_rank_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle = build_tiny_multi_arch_provenance_merge_bundle(tmp_path)
+
+            with self.assertRaisesRegex(ValueError, "Could not resolve any sample ranks"):
+                run_rank_feature_value_analysis(
+                    feature_file=bundle["merged_feature_path"],
+                    output_dir=tmp_path / "rank_feature_values",
+                )
+
+    def test_run_rank_feature_value_analysis_requires_labels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bundle = build_tiny_multi_arch_provenance_merge_bundle(tmp_path)
+            rank_by_model_name = {
+                str(model_name): (
+                    8
+                    if str(model_name).startswith("tiny_label") or str(model_name).startswith("tiny_t5")
+                    else 16
+                )
+                for model_name in bundle["per_model_leaf_rows"]
+            }
+            ranked_report_path = write_ranked_dataset_reference_report(
+                feature_path=bundle["merged_feature_path"],
+                output_path=tmp_path / "ranked_dataset_reference_report.json",
+                rank_by_model_name=rank_by_model_name,
+            )
+
+            merged_features = np.asarray(np.load(bundle["merged_feature_path"]), dtype=np.float32)
+            merged_model_names = load_json_file(bundle["merged_feature_path"].parent / "spectral_model_names.json")
+            _public_metadata, merged_metadata = load_public_and_internal_spectral_metadata(
+                bundle["merged_feature_path"].parent / "spectral_metadata.json"
+            )
+            no_labels_dir = tmp_path / "runs" / "feature_extract" / "no_labels_bundle" / "merged"
+            write_merged_feature_artifacts(
+                no_labels_dir,
+                features=merged_features,
+                labels=np.full((merged_features.shape[0],), -1, dtype=np.int32),
+                model_names=[str(x) for x in merged_model_names],
+                metadata=merged_metadata,
+            )
+
+            with self.assertRaisesRegex(ValueError, "require sample labels"):
+                run_rank_feature_value_analysis(
+                    feature_file=no_labels_dir / "spectral_features.npy",
+                    output_dir=tmp_path / "rank_feature_values",
+                    dataset_reference_report=ranked_report_path,
+                )
 
     def test_spectral_per_block_identities(self):
         with tempfile.TemporaryDirectory() as tmp:

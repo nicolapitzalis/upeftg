@@ -27,6 +27,7 @@ DEFAULT_SUPERVISED_RUNS_ROOT = Path("runs") / "supervised"
 RESULTS_SUMMARY_MD_FILENAME = "results_summary.md"
 LEGACY_ARCHITECTURE_ANALYSIS_JSON_FILENAME = "architecture_analysis.json"
 LEGACY_ARCHITECTURE_ANALYSIS_MD_FILENAME = "architecture_analysis.md"
+_SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS = "attack_family_multiclass"
 _DATASET_GROUP_ATTACK_TOKENS = frozenset({"ripple", "syntactic", "insertsent", "stybkd", "stykbd"})
 _RANKISH_TOKEN_RE = re.compile(r"^rank\d", re.IGNORECASE)
 _DATASET_VARIANT_PREFIX_TOKENS = frozenset({"adalora", "dora", "qlora", "xl", "xxl", "large", "medium", "small", "mini", "tiny"})
@@ -651,6 +652,106 @@ def _threshold_metric(row: dict[str, Any] | None, key: str) -> str:
     return f"{float(value):.3f}"
 
 
+def _raw_metric_text(value: Any) -> str:
+    if value is None:
+        return "-"
+    return f"{float(value):.3f}"
+
+
+def _partition_counts_from_report(
+    report: dict[str, Any],
+    *,
+    partition_name: str,
+) -> dict[str, int]:
+    data_info = report.get("data_info", {})
+    key_map = {
+        "train": ("n_train", "n_train_clean", "n_train_backdoored", "n_train_unknown_label"),
+        "calibration": (
+            "n_calibration",
+            "n_calibration_clean",
+            "n_calibration_backdoored",
+            "n_calibration_unknown_label",
+        ),
+        "inference": (
+            "n_inference",
+            "n_inference_clean",
+            "n_inference_backdoored",
+            "n_inference_unknown_label",
+        ),
+    }
+    n_key, clean_key, backdoor_key, unknown_key = key_map[partition_name]
+    clean = int(data_info.get(clean_key, 0) or 0)
+    backdoored = int(data_info.get(backdoor_key, 0) or 0)
+    unknown = int(data_info.get(unknown_key, 0) or 0)
+    n_samples = data_info.get(n_key)
+    if n_samples is None:
+        n_samples = clean + backdoored + unknown
+
+    if int(n_samples) == 0:
+        partition = (report.get("multiclass_assessment") or {}).get(partition_name)
+        if isinstance(partition, dict):
+            true_distribution = partition.get("true_class_distribution", [])
+            if isinstance(true_distribution, list):
+                n_samples = int(sum(int(row.get("count", 0) or 0) for row in true_distribution if isinstance(row, dict)))
+                clean = int(
+                    sum(
+                        int(row.get("count", 0) or 0)
+                        for row in true_distribution
+                        if isinstance(row, dict) and str(row.get("class_name")) == "clean"
+                    )
+                )
+                backdoored = max(0, int(n_samples) - int(clean))
+                unknown = 0
+
+    return {
+        "n_samples": int(n_samples),
+        "clean": int(clean),
+        "backdoored": int(backdoored),
+        "unknown": int(unknown),
+    }
+
+
+def _binary_partition_summary_from_report(
+    report: dict[str, Any],
+    *,
+    partition_name: str,
+) -> dict[str, Any] | None:
+    fit_assessment = report.get("fit_assessment", {})
+    key_map = {
+        "train": ("train_score_summary", "train_offline_metrics", None),
+        "calibration": ("calibration_score_summary", "calibration_offline_metrics", None),
+        "inference": ("inference_score_summary", "offline_metrics", "threshold_evaluation"),
+    }
+    score_key, metrics_key, threshold_key = key_map[partition_name]
+    score_summary = fit_assessment.get(score_key)
+    offline_metrics = fit_assessment.get(metrics_key)
+    if score_summary is None and offline_metrics is None:
+        return None
+
+    summary = {
+        **_partition_counts_from_report(report, partition_name=partition_name),
+        "score_summary": score_summary,
+        "offline_metrics": offline_metrics,
+    }
+    if threshold_key is not None:
+        threshold_rows = fit_assessment.get(threshold_key)
+        if isinstance(threshold_rows, list):
+            summary["threshold_evaluation"] = [dict(row) for row in threshold_rows if isinstance(row, dict)]
+    return summary
+
+
+def _multiclass_partition_summary_from_report(
+    report: dict[str, Any],
+    *,
+    partition_name: str,
+) -> dict[str, Any] | None:
+    multiclass_assessment = report.get("multiclass_assessment", {})
+    partition = multiclass_assessment.get(partition_name)
+    if not isinstance(partition, dict):
+        return None
+    return dict(partition)
+
+
 def summarize_full_partition(
     *,
     sample_identities: list[AttackSampleIdentity],
@@ -851,6 +952,43 @@ def build_supervised_results_summary(
     report = _load_json(reports_dir / "supervised_report.json")
     tuning_manifest = _load_optional_json(reports_dir / "tuning_manifest.json")
     selected_threshold_summary = _load_optional_json(reports_dir / "selected_threshold.json")
+    task_mode = str(report.get("task", {}).get("task_mode") or "")
+
+    if task_mode == _SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS:
+        binary_partitions: dict[str, Any] = {}
+        class_partitions: dict[str, Any] = {}
+        for partition_name in ("train", "calibration", "inference"):
+            binary_partition = _binary_partition_summary_from_report(
+                report,
+                partition_name=partition_name,
+            )
+            if isinstance(binary_partition, dict):
+                binary_partitions[partition_name] = binary_partition
+            class_partition = _multiclass_partition_summary_from_report(
+                report,
+                partition_name=partition_name,
+            )
+            if isinstance(class_partition, dict):
+                class_partitions[partition_name] = class_partition
+
+        return {
+            "script_version": SCRIPT_VERSION,
+            "summary_mode": "multiclass",
+            "run_dir": str(run_dir),
+            "model_name": report.get("tuning", {}).get("winner", {}).get("model_name")
+            or report.get("tuning", {}).get("model_name"),
+            "task_mode": task_mode,
+            "selected_threshold_summary": selected_threshold_summary,
+            "binary_classification": {
+                "score_definition": report.get("fit_assessment", {}).get("score_definition"),
+                "binary_projection": report.get("fit_assessment", {}).get("binary_projection"),
+                "partitions": binary_partitions,
+            },
+            "class_results": {
+                "class_names": list(report.get("task", {}).get("class_names", [])),
+                "partitions": class_partitions,
+            },
+        }
 
     sample_identities = _infer_sample_identities_for_run(
         reports_dir=reports_dir,
@@ -925,11 +1063,178 @@ def build_supervised_results_summary(
     }
 
 
+def _append_multiclass_binary_partition_table(
+    *,
+    lines: list[str],
+    binary_classification: dict[str, Any],
+) -> None:
+    partitions = binary_classification.get("partitions", {})
+    if not isinstance(partitions, dict) or not partitions:
+        return
+    lines.append("## Binary Classification")
+    lines.append("")
+    projection = binary_classification.get("binary_projection")
+    score_definition = binary_classification.get("score_definition")
+    if projection is not None or score_definition is not None:
+        lines.append(
+            "Projected clean-vs-backdoor view using "
+            f"`{score_definition or 'score'}` with projection `{projection or 'unknown'}`."
+        )
+        lines.append("")
+    lines.append("| Partition | N | Clean | Backdoor | Unknown | AUROC | AUPRC | P@P |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+    for partition_name in ("train", "calibration", "inference"):
+        summary = partitions.get(partition_name)
+        if not isinstance(summary, dict):
+            continue
+        metrics = summary.get("offline_metrics", {})
+        lines.append(
+            "| {partition} | {n_samples} | {clean} | {backdoored} | {unknown} | {auroc} | {auprc} | {p_at_p} |".format(
+                partition=partition_name,
+                n_samples=int(summary.get("n_samples", 0)),
+                clean=int(summary.get("clean", 0)),
+                backdoored=int(summary.get("backdoored", 0)),
+                unknown=int(summary.get("unknown", 0)),
+                auroc=_raw_metric_text((metrics or {}).get("auroc") if isinstance(metrics, dict) else None),
+                auprc=_raw_metric_text((metrics or {}).get("auprc") if isinstance(metrics, dict) else None),
+                p_at_p=_raw_metric_text(
+                    (metrics or {}).get("precision_at_num_positives") if isinstance(metrics, dict) else None
+                ),
+            )
+        )
+    lines.append("")
+
+    inference_summary = partitions.get("inference")
+    threshold_rows = (
+        inference_summary.get("threshold_evaluation")
+        if isinstance(inference_summary, dict)
+        else None
+    )
+    if isinstance(threshold_rows, list) and threshold_rows:
+        lines.append("## Binary Threshold Sweep")
+        lines.append("")
+        lines.append("| Source Percentile | Threshold | Recall | Precision | FPR | Fraction Flagged |")
+        lines.append("| ---: | ---: | ---: | ---: | ---: | ---: |")
+        for row in threshold_rows:
+            if not isinstance(row, dict):
+                continue
+            percentile = row.get("percentile_from_train")
+            if percentile is None:
+                percentile = row.get("percentile_from_inference")
+            percentile_text = "-" if percentile is None else f"{float(percentile):.0f}%"
+            lines.append(
+                "| {percentile} | {threshold} | {recall} | {precision} | {fpr} | {fraction_flagged} |".format(
+                    percentile=percentile_text,
+                    threshold=_raw_metric_text(row.get("threshold")),
+                    recall=_raw_metric_text(row.get("recall")),
+                    precision=_raw_metric_text(row.get("precision")),
+                    fpr=_raw_metric_text(row.get("false_positive_rate")),
+                    fraction_flagged=_raw_metric_text(row.get("fraction_flagged")),
+                )
+            )
+        lines.append("")
+
+
+def _append_multiclass_overview_table(
+    *,
+    lines: list[str],
+    class_results: dict[str, Any],
+) -> None:
+    partitions = class_results.get("partitions", {})
+    if not isinstance(partitions, dict) or not partitions:
+        return
+    lines.append("## Multiclass Overview")
+    lines.append("")
+    lines.append("| Partition | Accuracy | Macro F1 | Micro F1 |")
+    lines.append("| --- | ---: | ---: | ---: |")
+    for partition_name in ("train", "calibration", "inference"):
+        summary = partitions.get(partition_name)
+        if not isinstance(summary, dict):
+            continue
+        lines.append(
+            "| {partition} | {accuracy} | {macro_f1} | {micro_f1} |".format(
+                partition=partition_name,
+                accuracy=_raw_metric_text(summary.get("accuracy")),
+                macro_f1=_raw_metric_text(summary.get("macro_f1")),
+                micro_f1=_raw_metric_text(summary.get("micro_f1")),
+            )
+        )
+    lines.append("")
+
+
+def _append_multiclass_per_class_table(
+    *,
+    lines: list[str],
+    partition_name: str,
+    partition_summary: dict[str, Any],
+) -> None:
+    per_class = partition_summary.get("per_class")
+    if not isinstance(per_class, list) or not per_class:
+        return
+    lines.append(f"## Per-Class {partition_name.capitalize()}")
+    lines.append("")
+    lines.append("| Class | Support | Predicted | Precision | Recall | F1 |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
+    for row in per_class:
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            "| {class_name} | {support} | {predicted_count} | {precision} | {recall} | {f1} |".format(
+                class_name=str(row.get("class_name", "unknown")),
+                support=int(row.get("support", 0)),
+                predicted_count=int(row.get("predicted_count", 0)),
+                precision=_raw_metric_text(row.get("precision")),
+                recall=_raw_metric_text(row.get("recall")),
+                f1=_raw_metric_text(row.get("f1")),
+            )
+        )
+    lines.append("")
+
+
+def _build_multiclass_supervised_results_markdown(
+    *,
+    summary: dict[str, Any],
+    run_dir: Path,
+) -> str:
+    lines: list[str] = []
+    lines.append("# Results Summary")
+    lines.append("")
+    lines.append(f"Run: `{run_dir}`")
+    lines.append("")
+
+    _append_multiclass_binary_partition_table(
+        lines=lines,
+        binary_classification=summary.get("binary_classification", {}),
+    )
+    _append_multiclass_overview_table(
+        lines=lines,
+        class_results=summary.get("class_results", {}),
+    )
+    partitions = summary.get("class_results", {}).get("partitions", {})
+    if isinstance(partitions, dict):
+        for partition_name in ("train", "inference"):
+            partition_summary = partitions.get(partition_name)
+            if isinstance(partition_summary, dict):
+                _append_multiclass_per_class_table(
+                    lines=lines,
+                    partition_name=partition_name,
+                    partition_summary=partition_summary,
+                )
+
+    return "\n".join(line for line in lines if line is not None).rstrip() + "\n"
+
+
 def build_supervised_results_markdown(
     *,
     summary: dict[str, Any],
     run_dir: Path,
 ) -> str:
+    if str(summary.get("summary_mode") or "") == "multiclass":
+        return _build_multiclass_supervised_results_markdown(
+            summary=summary,
+            run_dir=run_dir,
+        )
+
     lines: list[str] = []
     lines.append("# Results Summary")
     lines.append("")
@@ -1030,13 +1335,21 @@ def build_supervised_results_markdown(
 
 
 def _summary_payload_for_report(summary: dict[str, Any], markdown_path: Path) -> dict[str, Any]:
-    return {
+    payload = {
         "script_version": summary.get("script_version"),
         "model_name": summary.get("model_name"),
+        "summary_mode": summary.get("summary_mode"),
+        "task_mode": summary.get("task_mode"),
         "results_summary_md": str(markdown_path),
         "selected_threshold_summary": summary.get("selected_threshold_summary"),
-        "inference_overview": summary.get("inference_overview"),
     }
+    if "inference_overview" in summary:
+        payload["inference_overview"] = summary.get("inference_overview")
+    if "binary_classification" in summary:
+        payload["binary_classification"] = summary.get("binary_classification")
+    if "class_results" in summary:
+        payload["class_results"] = summary.get("class_results")
+    return payload
 
 
 def write_supervised_results_summary_outputs(
@@ -1083,28 +1396,29 @@ def write_supervised_results_summary_outputs(
         attack_analysis = summary.get("attack_analysis")
         architecture_analysis = summary.get("architecture_analysis")
         report["results_summary"] = _summary_payload_for_report(summary, markdown_path)
-        if isinstance(dataset_analysis, dict):
-            report["dataset_analysis"] = {"inference": dataset_analysis}
-        else:
-            report.pop("dataset_analysis", None)
-        if isinstance(adapter_analysis, dict):
-            report["adapter_analysis"] = {"inference": adapter_analysis}
-        else:
-            report.pop("adapter_analysis", None)
-        if isinstance(attack_analysis, dict):
-            prior_attack_analysis = report.get("attack_analysis")
-            if isinstance(prior_attack_analysis, dict):
-                updated_attack_analysis = dict(prior_attack_analysis)
+        if str(summary.get("summary_mode") or "") != "multiclass":
+            if isinstance(dataset_analysis, dict):
+                report["dataset_analysis"] = {"inference": dataset_analysis}
             else:
-                updated_attack_analysis = {}
-            updated_attack_analysis["inference"] = attack_analysis
-            report["attack_analysis"] = updated_attack_analysis
-        else:
-            report.pop("attack_analysis", None)
-        if isinstance(architecture_analysis, dict):
-            report["architecture_analysis"] = {"inference": architecture_analysis}
-        else:
-            report.pop("architecture_analysis", None)
+                report.pop("dataset_analysis", None)
+            if isinstance(adapter_analysis, dict):
+                report["adapter_analysis"] = {"inference": adapter_analysis}
+            else:
+                report.pop("adapter_analysis", None)
+            if isinstance(attack_analysis, dict):
+                prior_attack_analysis = report.get("attack_analysis")
+                if isinstance(prior_attack_analysis, dict):
+                    updated_attack_analysis = dict(prior_attack_analysis)
+                else:
+                    updated_attack_analysis = {}
+                updated_attack_analysis["inference"] = attack_analysis
+                report["attack_analysis"] = updated_attack_analysis
+            else:
+                report.pop("attack_analysis", None)
+            if isinstance(architecture_analysis, dict):
+                report["architecture_analysis"] = {"inference": architecture_analysis}
+            else:
+                report.pop("architecture_analysis", None)
         updated_report_path = _write_json(report_path, report)
 
     outputs = {

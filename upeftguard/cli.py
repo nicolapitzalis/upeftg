@@ -18,9 +18,10 @@ from .features.spectral import (
     SUPPORTED_SPECTRAL_ENTRYWISE_DELTA_MODES,
 )
 from .supervised.pipeline import run_supervised_pipeline
-from .supervised.registry import registered_models
+from .supervised.registry import default_cnn_hyperparams_path, registered_models
 from .unsupervised.analysis import (
     run_unsupervised_layer_scatter_pipeline,
+    run_unsupervised_rank_feature_values_pipeline,
     run_unsupervised_tsne_pipeline,
 )
 from .unsupervised.gmm_train_inference import run_gmm_train_inference_pipeline
@@ -249,6 +250,31 @@ def _cmd_run_unsupervised_layer_scatter(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_run_unsupervised_rank_feature_values(args: argparse.Namespace) -> int:
+    output_root = _resolve_output_root(args.output_root, "run_unsupervised_rank_feature_values")
+    result = run_unsupervised_rank_feature_values_pipeline(
+        feature_file=args.feature_file,
+        output_root=output_root,
+        run_id=args.run_id,
+        feature_root=args.feature_root,
+        model_names_file=args.feature_model_names_file,
+        labels_file=args.feature_labels_file,
+        metadata_file=args.feature_metadata_file,
+        dataset_reference_report=args.dataset_reference_report,
+        requested_features=args.features,
+        point_size=args.point_size,
+        alpha=args.alpha,
+        jitter=args.jitter,
+    )
+
+    print("Run complete")
+    print(f"Run dir: {result['run_dir']}")
+    print(f"Report: {result['report']}")
+    print(f"Plots: {result['plot_dir']}")
+    print(f"Sample table: {result['sample_table']}")
+    return 0
+
+
 def _cmd_run_supervised(args: argparse.Namespace) -> int:
     output_root = _resolve_output_root(args.output_root, "run_supervised")
     result = run_supervised_pipeline(
@@ -281,6 +307,11 @@ def _cmd_run_supervised(args: argparse.Namespace) -> int:
         stage=args.stage,
         run_dir=args.run_dir,
         task_index=args.task_index,
+        task_mode=args.task_mode,
+        multiclass_attack_names=(
+            list(args.multiclass_attack_names) if args.multiclass_attack_names is not None else None
+        ),
+        cnn_hyperparams=args.cnn_hyperparams,
         skip_feature_importance=args.skip_feature_importance,
         feature_file=args.feature_file,
     )
@@ -700,6 +731,62 @@ def build_parser() -> argparse.ArgumentParser:
     unsupervised_layer_scatter.add_argument("--alpha", type=float, default=0.18)
     unsupervised_layer_scatter.set_defaults(func=_cmd_run_unsupervised_layer_scatter)
 
+    unsupervised_rank_feature_values = run_sub.add_parser(
+        "unsupervised-rank-feature-values",
+        help="Save per-sample per-feature value plots across ranks after averaging each sample across layers",
+    )
+    unsupervised_rank_feature_values.add_argument(
+        "--feature-file",
+        type=Path,
+        required=True,
+        help="Input feature run name or explicit spectral feature .npy file",
+    )
+    unsupervised_rank_feature_values.add_argument("--output-root", type=Path, default=Path("runs"))
+    unsupervised_rank_feature_values.add_argument("--run-id", type=str, default=None)
+    unsupervised_rank_feature_values.add_argument(
+        "--feature-root",
+        type=Path,
+        default=Path("runs") / "feature_extract",
+        help="Base directory used to resolve bare feature run names (default: runs/feature_extract)",
+    )
+    unsupervised_rank_feature_values.add_argument(
+        "--feature-model-names-file",
+        type=Path,
+        default=None,
+        help="Optional model-names JSON for --feature-file (defaults to the sibling companion file)",
+    )
+    unsupervised_rank_feature_values.add_argument(
+        "--feature-labels-file",
+        type=Path,
+        default=None,
+        help="Optional labels .npy for --feature-file (defaults to the sibling companion file)",
+    )
+    unsupervised_rank_feature_values.add_argument(
+        "--feature-metadata-file",
+        type=Path,
+        default=None,
+        help="Optional metadata JSON for --feature-file (defaults to the sibling companion file)",
+    )
+    unsupervised_rank_feature_values.add_argument(
+        "--dataset-reference-report",
+        type=Path,
+        default=None,
+        help="Optional dataset_reference_report.json path for rank/label provenance",
+    )
+    unsupervised_rank_feature_values.add_argument(
+        "--features",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional spectral feature groups to plot; "
+            "omit or pass 'all' to include every emitted feature family"
+        ),
+    )
+    unsupervised_rank_feature_values.add_argument("--point-size", type=float, default=10.0)
+    unsupervised_rank_feature_values.add_argument("--alpha", type=float, default=0.28)
+    unsupervised_rank_feature_values.add_argument("--jitter", type=float, default=0.08)
+    unsupervised_rank_feature_values.set_defaults(func=_cmd_run_unsupervised_rank_feature_values)
+
     supervised = run_sub.add_parser("supervised", help="Run supervised spectral feature pipeline")
     supervised.add_argument("--manifest-json", type=Path, default=None)
     supervised.add_argument(
@@ -711,6 +798,36 @@ def build_parser() -> argparse.ArgumentParser:
     supervised.add_argument("--output-root", type=Path, default=Path("runs"))
     supervised.add_argument("--run-id", type=str, default=None)
     supervised.add_argument("--model", choices=["all", *registered_models()], default="logistic_regression")
+    supervised.add_argument(
+        "--task-mode",
+        choices=["binary", "attack_family_multiclass"],
+        default="binary",
+        help=(
+            "Supervised label/task interpretation. 'binary' keeps the existing clean-vs-backdoor "
+            "behavior; 'attack_family_multiclass' trains an exclusive class over clean plus the "
+            "configured attack families."
+        ),
+    )
+    supervised.add_argument(
+        "--multiclass-attack-names",
+        nargs="+",
+        default=None,
+        help=(
+            "Required for --task-mode attack_family_multiclass. For the current experiment this must "
+            "be the canonical set: RIPPLE insertsent stybkd syntactic."
+        ),
+    )
+    supervised.add_argument(
+        "--cnn-hyperparams",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON file describing the cnn_1d hyperparameter search space. Each key must map "
+            "to a list. If every list has one item, cnn_1d runs with a fixed configuration; otherwise "
+            "the Cartesian grid is evaluated. Defaults to "
+            f"{default_cnn_hyperparams_path()}."
+        ),
+    )
     supervised.add_argument(
         "--features",
         nargs="+",

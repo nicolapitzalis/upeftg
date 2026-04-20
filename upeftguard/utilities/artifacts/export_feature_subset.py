@@ -11,7 +11,9 @@ from typing import Any
 import numpy as np
 
 from ...features.spectral import (
+    feature_group_for_spectral_feature_name,
     ordered_block_names_from_feature_names,
+    provenance_source_feature_group,
     resolve_spectral_features,
     sanitize_spectral_metadata,
     spectral_block_lora_dims_by_block,
@@ -91,24 +93,14 @@ def _normalize_requested_features(features: list[str] | tuple[str, ...] | None) 
 
 
 def _feature_group_for_feature_name(feature_name: str) -> str | None:
-    suffix = str(feature_name).rpartition(".")[2]
-    if not suffix:
-        return None
-    if suffix.startswith("sv_") and suffix[3:].isdigit():
-        return "sv_topk"
-    if suffix == "sv_kurtosis":
-        return "kurtosis"
-    if suffix == "sv_l1_norm":
-        return "l1_norm"
-    if suffix == "sv_linf_norm":
-        return "linf_norm"
-    if suffix == "sv_mean_abs":
-        return "mean_abs"
-    try:
-        resolved = resolve_spectral_features([suffix])
-    except ValueError:
-        return None
-    return resolved[0] if resolved else None
+    return feature_group_for_spectral_feature_name(feature_name)
+
+
+def _feature_block_name(feature_name: str) -> str:
+    block_name, sep, _ = str(feature_name).rpartition(".")
+    if not sep or not block_name:
+        raise ValueError(f"Invalid spectral feature name: {feature_name}")
+    return block_name
 
 
 def _resolve_companion_paths(feature_path: Path) -> tuple[Path, Path, Path]:
@@ -351,14 +343,20 @@ def _resolve_model_owned_feature_names(
             )
         missing_in_root = sorted(name for name in owned_feature_name_set if name not in root_feature_name_set)
         if missing_in_root:
-            preview = ", ".join(missing_in_root[:5])
-            raise ValueError(
-                "Provenance source feature names are not present in the requested feature bundle. "
-                f"Examples: {preview}"
+            ordered_owned_feature_names = _resolved_owned_feature_names_by_equivalent_groups(
+                root_feature_names=root_feature_names,
+                owned_feature_name_set=owned_feature_name_set,
             )
-        ordered_owned_feature_names = [
-            name for name in root_feature_names if name in owned_feature_name_set
-        ]
+            if not ordered_owned_feature_names:
+                preview = ", ".join(missing_in_root[:5])
+                raise ValueError(
+                    "Provenance source feature names are not present in the requested feature bundle. "
+                    f"Examples: {preview}"
+                )
+        else:
+            ordered_owned_feature_names = [
+                name for name in root_feature_names if name in owned_feature_name_set
+            ]
         if not ordered_owned_feature_names:
             raise ValueError(
                 "No provenance-backed columns were available for "
@@ -367,6 +365,40 @@ def _resolve_model_owned_feature_names(
         ordered_feature_names_by_model[str(model_name)] = ordered_owned_feature_names
 
     return ordered_feature_names_by_model, matched_leaf_paths
+
+
+def _resolved_owned_feature_names_by_equivalent_groups(
+    *,
+    root_feature_names: list[str],
+    owned_feature_name_set: set[str],
+) -> list[str]:
+    owned_blocks: set[str] = set()
+    owned_block_groups: set[tuple[str, str]] = set()
+    for feature_name in owned_feature_name_set:
+        block_name = _feature_block_name(feature_name)
+        owned_blocks.add(block_name)
+        group = _feature_group_for_feature_name(feature_name)
+        if group is None:
+            continue
+        owned_block_groups.add((block_name, group))
+
+    resolved: list[str] = []
+    for feature_name in root_feature_names:
+        block_name = _feature_block_name(feature_name)
+        if block_name not in owned_blocks:
+            continue
+        group = _feature_group_for_feature_name(feature_name)
+        if group is None:
+            continue
+        if group == "block_rank":
+            resolved.append(feature_name)
+            continue
+        source_group = provenance_source_feature_group(group)
+        if source_group is None:
+            continue
+        if (block_name, source_group) in owned_block_groups:
+            resolved.append(feature_name)
+    return resolved
 
 
 def _resolve_output_feature_names(

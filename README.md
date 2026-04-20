@@ -239,6 +239,50 @@ FEATURES="energy kurtosis l1_norm l2_norm linf_norm mean_abs concentration_of_en
 sbatch ./sbatch/supervised_array.sh
 ```
 
+`sbatch/supervised_array.sh` is the generic Slurm driver. It now accepts task-specific environment variables such as:
+- `TASK_MODE=binary|attack_family_multiclass`
+- `MULTICLASS_ATTACK_NAMES="RIPPLE insertsent stybkd syntactic"`
+- `CNN_HYPERPARAMS=/abs/path/to/hyperparams.json`
+- `SLURM_CPUS_PER_TASK_REQUEST=<N>`
+- `SLURM_MAX_CONCURRENT_REQUEST=<N>`
+
+For most runs, the recommended interface is the thin launcher:
+
+```bash
+python scripts/run_supervised_slurm.py \
+  --manifest-json <MANIFEST_JSON> \
+  --feature-file <FEATURE_FILE> \
+  --features energy kurtosis l1_norm l2_norm linf_norm mean_abs concentration_of_energy sv_topk stable_rank spectral_entropy effective_rank \
+  --model cnn_1d
+```
+
+The launcher submits `sbatch/supervised_array.sh` with the relevant environment variables, keeps the Slurm file generic, and exposes the important knobs as normal CLI flags.
+
+Example: multiclass CNN tuning on the pooled `imdb + ag_news` attack-family manifest:
+
+```bash
+python scripts/run_supervised_slurm.py \
+  --manifest-json manifests/multiclass/llama2_7b_ag_news_imdb_attack_family_multiclass_rank256_qv.json \
+  --feature-file runs/feature_extract/list2_features-merged-cnn/merged/spectral_features.npy \
+  --features energy kurtosis l1_norm l2_norm linf_norm mean_abs concentration_of_energy sv_topk stable_rank spectral_entropy effective_rank \
+  --run-id cnn_ag_news_imdb_attack_family_multiclass_tuning \
+  --model cnn_1d \
+  --task-mode attack_family_multiclass \
+  --multiclass-attack-names RIPPLE insertsent stybkd syntactic \
+  --cnn-hyperparams manifests/cnn_hyperparams/cnn_1d_ag_news_imdb_attack_family_multiclass_tuning.json \
+  --spectral-sv-top-k 8 \
+  --spectral-moment-source both \
+  --spectral-qv-sum-mode append \
+  --spectral-entrywise-delta-mode dense \
+  --cv-folds 5 \
+  --cv-seeds 42 \
+  --partition extra
+```
+
+By default, `scripts/run_supervised_slurm.py` resolves `--worker-cpus` and `--max-concurrent` from the selected partition and tries to use the whole partition. Override them explicitly only when you want to cap resource usage.
+
+Add `--dry-run` to preview the submission without queueing jobs.
+
 For post-hoc distributed winner feature importance on an existing supervised run:
 
 ```bash

@@ -1,3 +1,4 @@
+import csv
 import json
 import tempfile
 import unittest
@@ -19,9 +20,14 @@ from upeftguard.supervised.interfaces import (
     ATTACK_FAMILY_MULTICLASS_ATTACKS,
     BINARY_PROJECTION_ONE_MINUS_CLEAN_PROBABILITY,
     SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS,
+    SupervisedPredictionOutputs,
 )
 from upeftguard.supervised.pipeline import (
+    OPEN_SET_UNKNOWN_ATTACK_NAME,
+    _apply_open_set_unknown_attack_rule,
+    _build_open_set_unknown_attack_config,
     _labels_from_items,
+    _open_set_true_labels,
     _resolve_supervised_task_spec,
     run_supervised_pipeline,
 )
@@ -44,6 +50,11 @@ def make_manifest_item(subset_name: str, label: int, index: int) -> ManifestItem
 def load_json(path: Path) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_csv_rows(path: Path) -> list[dict[str, str]]:
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
 
 
 def write_joint_manifest_by_name(path: Path, *, train_entries: list[str], infer_entries: list[str]) -> None:
@@ -270,6 +281,157 @@ class TestSupervisedMulticlassTaskMode(unittest.TestCase):
                 task_spec=task_spec,
                 sample_identities=identities,
             )
+
+    def test_custom_multiclass_attack_vocabulary_is_supported(self):
+        task_spec = _resolve_supervised_task_spec(
+            task_mode=SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS,
+            multiclass_attack_names=["toxic_backdoors_hard", "toxic_backdoors_alpaca"],
+        )
+        self.assertEqual(
+            list(task_spec.class_names),
+            ["clean", "toxic_backdoors_hard", "toxic_backdoors_alpaca"],
+        )
+        self.assertEqual(task_spec.binary_projection, BINARY_PROJECTION_ONE_MINUS_CLEAN_PROBABILITY)
+
+        items = [
+            make_manifest_item("llama2_7b_toxic_backdoors_hard_rank256_qv", 0, 0),
+            make_manifest_item("llama2_7b_toxic_backdoors_hard_rank256_qv", 1, 1),
+            make_manifest_item("llama2_7b_toxic_backdoors_alpaca_rank256_qv", 1, 2),
+        ]
+        identities = infer_attack_sample_identities(items)
+        values, known, raw_labels = _labels_from_items(
+            items,
+            task_spec=task_spec,
+            sample_identities=identities,
+        )
+
+        self.assertEqual(
+            [identity.attack_name for identity in identities],
+            ["toxic_backdoors_hard", "toxic_backdoors_hard", "toxic_backdoors_alpaca"],
+        )
+        self.assertEqual(values.tolist(), [0, 1, 2])
+        self.assertEqual(known.tolist(), [True, True, True])
+        self.assertEqual(raw_labels, [0, 1, 2])
+
+    def test_custom_attack_vocabulary_open_set_maps_other_attack_to_unknown(self):
+        task_spec = _resolve_supervised_task_spec(
+            task_mode=SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS,
+            multiclass_attack_names=["toxic_backdoors_hard", "toxic_backdoors_alpaca"],
+        )
+        train_probabilities = np.asarray(
+            [
+                [0.98, 0.02, 0.00],
+                [0.03, 0.97, 0.00],
+                [0.04, 0.96, 0.00],
+            ],
+            dtype=np.float64,
+        )
+        train_outputs = SupervisedPredictionOutputs(
+            backdoor_scores=1.0 - train_probabilities[:, 0],
+            predicted_labels=np.argmax(train_probabilities, axis=1).astype(np.int32),
+            probabilities=train_probabilities,
+            logits=None,
+        )
+        train_labels = np.asarray([0, 1, 1], dtype=np.int32)
+
+        config = _build_open_set_unknown_attack_config(
+            train_labels=train_labels,
+            train_outputs=train_outputs,
+            task_spec=task_spec,
+        )
+        self.assertIsNotNone(config)
+        self.assertEqual(config["known_attack_names"], ["toxic_backdoors_hard"])
+
+        infer_probabilities = np.asarray(
+            [
+                [0.04, 0.90, 0.06],
+                [0.02, 0.97, 0.01],
+                [0.99, 0.01, 0.00],
+            ],
+            dtype=np.float64,
+        )
+        infer_outputs = SupervisedPredictionOutputs(
+            backdoor_scores=1.0 - infer_probabilities[:, 0],
+            predicted_labels=np.argmax(infer_probabilities, axis=1).astype(np.int32),
+            probabilities=infer_probabilities,
+            logits=None,
+        )
+        open_set = _apply_open_set_unknown_attack_rule(
+            outputs=infer_outputs,
+            task_spec=task_spec,
+            config=config,
+        )
+        self.assertIsNotNone(open_set)
+        unknown_index = int(config["unknown_class_index"])
+        self.assertEqual(open_set["predicted_labels"].tolist(), [unknown_index, 1, 0])
+
+        true_open_labels = _open_set_true_labels(
+            np.asarray([2, 1, 0], dtype=np.int32),
+            task_spec=task_spec,
+            config=config,
+        )
+        self.assertEqual(true_open_labels.tolist(), [unknown_index, 1, 0])
+
+    def test_open_set_unknown_attack_rule_maps_unseen_attack_to_unknown(self):
+        task_spec = _resolve_supervised_task_spec(
+            task_mode=SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS,
+            multiclass_attack_names=list(ATTACK_FAMILY_MULTICLASS_ATTACKS),
+        )
+        train_probabilities = np.asarray(
+            [
+                [0.98, 0.01, 0.01, 0.00, 0.00],
+                [0.02, 0.96, 0.02, 0.00, 0.00],
+                [0.02, 0.03, 0.95, 0.00, 0.00],
+                [0.03, 0.02, 0.95, 0.00, 0.00],
+            ],
+            dtype=np.float64,
+        )
+        train_outputs = SupervisedPredictionOutputs(
+            backdoor_scores=1.0 - train_probabilities[:, 0],
+            predicted_labels=np.argmax(train_probabilities, axis=1).astype(np.int32),
+            probabilities=train_probabilities,
+            logits=None,
+        )
+        train_labels = np.asarray([0, 1, 2, 2], dtype=np.int32)
+
+        config = _build_open_set_unknown_attack_config(
+            train_labels=train_labels,
+            train_outputs=train_outputs,
+            task_spec=task_spec,
+        )
+        self.assertIsNotNone(config)
+        self.assertEqual(config["known_attack_names"], ["RIPPLE", "insertsent"])
+
+        infer_probabilities = np.asarray(
+            [
+                [0.03, 0.10, 0.15, 0.02, 0.70],
+                [0.02, 0.97, 0.01, 0.00, 0.00],
+                [0.99, 0.01, 0.00, 0.00, 0.00],
+            ],
+            dtype=np.float64,
+        )
+        infer_outputs = SupervisedPredictionOutputs(
+            backdoor_scores=1.0 - infer_probabilities[:, 0],
+            predicted_labels=np.argmax(infer_probabilities, axis=1).astype(np.int32),
+            probabilities=infer_probabilities,
+            logits=None,
+        )
+        open_set = _apply_open_set_unknown_attack_rule(
+            outputs=infer_outputs,
+            task_spec=task_spec,
+            config=config,
+        )
+        self.assertIsNotNone(open_set)
+        unknown_index = int(config["unknown_class_index"])
+        self.assertEqual(open_set["predicted_labels"].tolist(), [unknown_index, 1, 0])
+        self.assertEqual(config["unknown_class_name"], OPEN_SET_UNKNOWN_ATTACK_NAME)
+
+        true_open_labels = _open_set_true_labels(
+            np.asarray([4, 1, 0], dtype=np.int32),
+            task_spec=task_spec,
+            config=config,
+        )
+        self.assertEqual(true_open_labels.tolist(), [unknown_index, 1, 0])
 
     def test_default_task_spec_remains_binary(self):
         task_spec = _resolve_supervised_task_spec(task_mode=None, multiclass_attack_names=None)
@@ -521,6 +683,8 @@ class TestSupervisedMulticlassTaskMode(unittest.TestCase):
             report = load_json(run_dir / "reports" / "supervised_report.json")
             run_config = load_json(run_dir / "run_config.json")
             artifact_index = load_json(run_dir / "artifact_index.json")
+            inference_rows = load_csv_rows(run_dir / "reports" / "inference_scores.csv")
+            summary_markdown = (run_dir / "reports" / "results_summary.md").read_text(encoding="utf-8")
 
             self.assertEqual(report["task"]["task_mode"], SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS)
             self.assertEqual(report["task"]["class_names"], ["clean", "RIPPLE", "insertsent", "stybkd", "syntactic"])
@@ -533,6 +697,14 @@ class TestSupervisedMulticlassTaskMode(unittest.TestCase):
             self.assertIn("confusion_matrix", report["multiclass_assessment"]["train"])
             self.assertIn("per_class", report["multiclass_assessment"]["inference"])
             self.assertIn("predicted_class_distribution", report["multiclass_assessment"]["inference"])
+            self.assertEqual(report["open_set_assessment"]["config"]["unknown_class_name"], OPEN_SET_UNKNOWN_ATTACK_NAME)
+            self.assertIn("per_class", report["open_set_assessment"]["inference"])
+            self.assertIn("open_set_unknown", report["results_summary"])
+            self.assertIn("Open-Set Unknown Attack", summary_markdown)
+            self.assertIn(OPEN_SET_UNKNOWN_ATTACK_NAME, summary_markdown)
+            self.assertIn("prob_clean", inference_rows[0])
+            self.assertIn("prob_RIPPLE", inference_rows[0])
+            self.assertIn("open_set_prediction_name", inference_rows[0])
             self.assertIn("attacks", report["attack_analysis"]["inference"])
             self.assertEqual(run_config["winner_feature_weights_mode"], "unsupported_for_task_mode")
             self.assertTrue(

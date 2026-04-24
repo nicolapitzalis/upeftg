@@ -63,6 +63,7 @@ DEFAULT_RAW_RANK_FEATURE_OUTPUT_RUN = "list2_features-merged-raw_rank"
 DEFAULT_RAW_RANK_CNN_OUTPUT_RUN = "list2_features-merged-raw_rank-cnn"
 DEFAULT_RAW_RANK_REFERENCE_RUN = "list2_features_raw_rank_cnn"
 DEFAULT_RAW_RANK_ZERO_SHOT_PREFIX = "zero_shot_cnn_raw_rank"
+DEFAULT_STUDY_ARMS = ("rank_norm", "raw_rank")
 DEFAULT_REFERENCE_TUNING_EXECUTOR = "slurm_array"
 DEFAULT_REFERENCE_RANDOM_STATE = 42
 DEFAULT_REFERENCE_SCORE_PERCENTILES = (90.0, 95.0, 99.0)
@@ -86,6 +87,9 @@ _DERIVED_EMITTED_FEATURE_SOURCES: dict[str, str | None] = {
     "stable_rank_frac": "stable_rank",
     "normalized_spectral_entropy": "spectral_entropy",
     "effective_rank_frac": "effective_rank",
+}
+_RANK_NORM_STUDY_FEATURE_OVERRIDES: dict[str, tuple[str, ...]] = {
+    "mean_abs": (),
 }
 
 
@@ -165,6 +169,8 @@ class StudyConfig:
     raw_rank_cnn_output_run: str
     raw_rank_reference_run: str
     raw_rank_zero_shot_prefix: str
+    arms: tuple[str, ...]
+    reference_cnn_hyperparams: Path | None
     reference_tuning_executor: str
     reference_n_jobs: int
     reference_dry_run: bool
@@ -423,8 +429,21 @@ def _select_available_rows(
 
 
 def build_arm_feature_groups(*, baseline_features: Sequence[str]) -> tuple[list[str], list[str]]:
-    baseline = [str(feature) for feature in baseline_features]
-    rank_norm = [rank_normalized_feature_group(feature) for feature in baseline]
+    baseline = [str(feature).strip() for feature in baseline_features]
+    rank_norm: list[str] = []
+    seen_rank_norm: set[str] = set()
+    for feature in baseline:
+        overrides = _RANK_NORM_STUDY_FEATURE_OVERRIDES.get(feature)
+        normalized_features = (
+            overrides
+            if overrides is not None
+            else (rank_normalized_feature_group(feature),)
+        )
+        for normalized_feature in normalized_features:
+            if normalized_feature in seen_rank_norm:
+                continue
+            seen_rank_norm.add(normalized_feature)
+            rank_norm.append(normalized_feature)
     raw_rank = [*baseline, "block_rank"]
     return rank_norm, raw_rank
 
@@ -797,16 +816,25 @@ def study_arm_specs(config: StudyConfig, *, baseline_features: Sequence[str]) ->
     rank_norm_features, raw_rank_features = build_arm_feature_groups(
         baseline_features=baseline_features,
     )
-    return [
-        StudyArmSpec(
-            name="baseline",
-            selected_features=tuple(str(x) for x in baseline_features),
-            feature_output_run="",
-            cnn_output_run="",
-            reference_run_id=str(config.baseline_reference_run),
-            zero_shot_run_prefix="",
-            baseline_read_only=True,
-        ),
+    requested_arms = tuple(str(arm) for arm in config.arms)
+    unknown_arms = sorted(set(requested_arms).difference(DEFAULT_STUDY_ARMS))
+    if unknown_arms:
+        raise ValueError(
+            f"Unsupported study arm(s): {unknown_arms}. Expected one of {DEFAULT_STUDY_ARMS}"
+        )
+    if not requested_arms:
+        raise ValueError("At least one study arm must be selected")
+
+    baseline_arm = StudyArmSpec(
+        name="baseline",
+        selected_features=tuple(str(x) for x in baseline_features),
+        feature_output_run="",
+        cnn_output_run="",
+        reference_run_id=str(config.baseline_reference_run),
+        zero_shot_run_prefix="",
+        baseline_read_only=True,
+    )
+    candidate_arms = [
         StudyArmSpec(
             name="rank_norm",
             selected_features=tuple(rank_norm_features),
@@ -824,6 +852,8 @@ def study_arm_specs(config: StudyConfig, *, baseline_features: Sequence[str]) ->
             zero_shot_run_prefix=str(config.raw_rank_zero_shot_prefix),
         ),
     ]
+    requested_set = set(requested_arms)
+    return [baseline_arm, *[arm for arm in candidate_arms if arm.name in requested_set]]
 
 
 def run_reference_tuning(
@@ -866,6 +896,7 @@ def run_reference_tuning(
         stage=stage,
         run_dir=None,
         task_index=None,
+        cnn_hyperparams=config.reference_cnn_hyperparams,
         skip_feature_importance=False,
     )
 
@@ -1009,7 +1040,6 @@ def launch_zero_shot_suite(
     cnn_feature_path: Path,
 ) -> subprocess.CompletedProcess[str]:
     repo_root = Path(__file__).resolve().parents[2]
-    launcher = repo_root / "scripts" / "run_all_zero_shot_supervised_cnn.sh"
     env = os.environ.copy()
     env["ZERO_SHOT_MANIFEST_ROOT"] = str(_resolve_path(config.zero_shot_manifest_root))
     env["RUN_ID_PREFIX"] = str(arm.zero_shot_run_prefix)
@@ -1017,9 +1047,14 @@ def launch_zero_shot_suite(
     env["OUTPUT_ROOT"] = str(_resolve_path(config.output_root))
 
     cmd = [
-        "bash",
-        str(launcher),
-        "--hyperparam_config",
+        "python",
+        "-m",
+        "upeftguard.cli",
+        "experiment",
+        "supervised-cnn-suite",
+        "--suite",
+        "zero-shot",
+        "--hyperparam-config",
         str(reference_run_dir.resolve()),
         "--manifest-filter",
         str(config.zero_shot_manifest_filter),
@@ -1493,6 +1528,12 @@ def run_rank_normalization_study(config: StudyConfig) -> dict[str, Any]:
         "tuning_manifest": str(resolve_manifest_path(config.tuning_manifest)),
         "zero_shot_manifest_root": str(_resolve_path(config.zero_shot_manifest_root)),
         "zero_shot_manifest_filter": str(config.zero_shot_manifest_filter),
+        "active_arms": [str(arm) for arm in config.arms],
+        "reference_cnn_hyperparams": (
+            str(_resolve_path(config.reference_cnn_hyperparams))
+            if config.reference_cnn_hyperparams is not None
+            else None
+        ),
         "selected_model_count": int(len(selected_model_names)),
         "selected_manifest_paths": [str(path.resolve()) for path in manifest_paths],
         "reference_settings": {
@@ -1540,6 +1581,12 @@ def run_rank_normalization_study(config: StudyConfig) -> dict[str, Any]:
             "tuning_manifest": str(config.tuning_manifest),
             "zero_shot_manifest_root": str(config.zero_shot_manifest_root),
             "zero_shot_manifest_filter": str(config.zero_shot_manifest_filter),
+            "active_arms": [str(arm) for arm in config.arms],
+            "reference_cnn_hyperparams": (
+                str(config.reference_cnn_hyperparams)
+                if config.reference_cnn_hyperparams is not None
+                else None
+            ),
             "reference_tuning_executor": str(config.reference_tuning_executor),
             "reference_dry_run": bool(config.reference_dry_run),
             "slurm_partition": str(config.slurm_partition),
@@ -1608,6 +1655,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--raw-rank-zero-shot-prefix", type=str, default=DEFAULT_RAW_RANK_ZERO_SHOT_PREFIX)
 
     parser.add_argument(
+        "--arms",
+        nargs="+",
+        choices=list(DEFAULT_STUDY_ARMS),
+        default=list(DEFAULT_STUDY_ARMS),
+        help=(
+            "Study arms to prepare, train, and launch. Use '--arms rank_norm' "
+            "to run only the rank-normalized feature workflow."
+        ),
+    )
+    parser.add_argument(
+        "--reference-cnn-hyperparams",
+        type=Path,
+        default=None,
+        help=(
+            "Optional CNN hyperparameter grid JSON for rank-aware reference tuning. "
+            "When omitted, the supervised cnn_1d default grid is used."
+        ),
+    )
+    parser.add_argument(
         "--reference-tuning-executor",
         choices=["local", "slurm_array"],
         default=DEFAULT_REFERENCE_TUNING_EXECUTOR,
@@ -1655,6 +1721,12 @@ def args_to_config(args: argparse.Namespace) -> StudyConfig:
         raw_rank_cnn_output_run=str(args.raw_rank_cnn_output_run),
         raw_rank_reference_run=str(args.raw_rank_reference_run),
         raw_rank_zero_shot_prefix=str(args.raw_rank_zero_shot_prefix),
+        arms=tuple(str(arm) for arm in args.arms),
+        reference_cnn_hyperparams=(
+            Path(args.reference_cnn_hyperparams)
+            if args.reference_cnn_hyperparams is not None
+            else None
+        ),
         reference_tuning_executor=str(args.reference_tuning_executor),
         reference_n_jobs=int(args.reference_n_jobs),
         reference_dry_run=bool(args.reference_dry_run),

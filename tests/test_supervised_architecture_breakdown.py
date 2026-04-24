@@ -107,7 +107,57 @@ def _build_synthetic_run(tmp_path: Path) -> Path:
         },
         "tuning": {
             "model_name": "cnn_1d",
-            "winner": {"model_name": "cnn_1d"},
+            "metric": "macro_f1",
+            "execution_mode": "cross_validation",
+            "cnn_hyperparams": {"n_candidates": 2},
+            "cv_folds_resolved": 2,
+            "estimated_total_fits": 4,
+            "candidates": [
+                {
+                    "task_index": 0,
+                    "model_name": "cnn_1d",
+                    "params": {"conv_channels": 32, "dropout": 0.1},
+                    "status": "ok",
+                    "selection_metric_name": "macro_f1",
+                    "selection_metric_mean": 0.700,
+                    "selection_metric_std": 0.020,
+                    "accuracy_mean": 0.710,
+                },
+                {
+                    "task_index": 1,
+                    "model_name": "cnn_1d",
+                    "params": {"conv_channels": 64, "dropout": 0.0},
+                    "status": "ok",
+                    "selection_metric_name": "macro_f1",
+                    "selection_metric_mean": 0.810,
+                    "selection_metric_std": 0.010,
+                    "accuracy_mean": 0.820,
+                },
+            ],
+            "winner": {
+                "task_index": 1,
+                "model_name": "cnn_1d",
+                "params": {"conv_channels": 64, "dropout": 0.0},
+                "status": "ok",
+                "selection_metric_name": "macro_f1",
+                "selection_metric_mean": 0.810,
+                "selection_metric_std": 0.010,
+                "accuracy_mean": 0.820,
+                "fold_results": [
+                    {
+                        "n_train": 8,
+                        "n_valid": 2,
+                        "selection_metric": 0.800,
+                        "accuracy": 0.800,
+                    },
+                    {
+                        "n_train": 8,
+                        "n_valid": 2,
+                        "selection_metric": 0.820,
+                        "accuracy": 0.840,
+                    },
+                ],
+            },
         },
     }
     _write_json(reports_dir / "supervised_report.json", report)
@@ -265,16 +315,73 @@ def _build_synthetic_multiclass_run(tmp_path: Path) -> Path:
         },
         "attack_analysis": {
             "inference": {
+                "grouping_rule": "one-vs-clean per attack using a shared clean pool.",
                 "attacks": {
                     "syntactic": {
-                        "offline_metrics": {"auroc": 1.0},
+                        "n_samples": 2,
+                        "label_counts": {"clean": 1, "backdoored": 1, "unknown": 0},
+                        "offline_metrics": {
+                            "auroc": 1.0,
+                            "auprc": 1.0,
+                            "precision_at_num_positives": 1.0,
+                        },
                     }
                 }
             }
         },
         "tuning": {
             "model_name": "cnn_1d",
-            "winner": {"model_name": "cnn_1d"},
+            "metric": "macro_f1",
+            "execution_mode": "cross_validation",
+            "cnn_hyperparams": {"n_candidates": 2},
+            "cv_folds_resolved": 2,
+            "estimated_total_fits": 4,
+            "candidates": [
+                {
+                    "task_index": 0,
+                    "model_name": "cnn_1d",
+                    "params": {"conv_channels": 32, "dropout": 0.1},
+                    "status": "ok",
+                    "selection_metric_name": "macro_f1",
+                    "selection_metric_mean": 0.700,
+                    "selection_metric_std": 0.020,
+                    "accuracy_mean": 0.710,
+                },
+                {
+                    "task_index": 1,
+                    "model_name": "cnn_1d",
+                    "params": {"conv_channels": 64, "dropout": 0.0},
+                    "status": "ok",
+                    "selection_metric_name": "macro_f1",
+                    "selection_metric_mean": 0.810,
+                    "selection_metric_std": 0.010,
+                    "accuracy_mean": 0.820,
+                },
+            ],
+            "winner": {
+                "task_index": 1,
+                "model_name": "cnn_1d",
+                "params": {"conv_channels": 64, "dropout": 0.0},
+                "status": "ok",
+                "selection_metric_name": "macro_f1",
+                "selection_metric_mean": 0.810,
+                "selection_metric_std": 0.010,
+                "accuracy_mean": 0.820,
+                "fold_results": [
+                    {
+                        "n_train": 8,
+                        "n_valid": 2,
+                        "selection_metric": 0.800,
+                        "accuracy": 0.800,
+                    },
+                    {
+                        "n_train": 8,
+                        "n_valid": 2,
+                        "selection_metric": 0.820,
+                        "accuracy": 0.840,
+                    },
+                ],
+            },
         },
     }
     _write_json(reports_dir / "supervised_report.json", report)
@@ -459,6 +566,7 @@ class TestSupervisedArchitectureBreakdown(unittest.TestCase):
             self.assertEqual(summary["task_mode"], SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS)
             self.assertIn("binary_classification", summary)
             self.assertIn("class_results", summary)
+            self.assertIn("attack_analysis", summary)
             self.assertNotIn("dataset_analysis", summary)
             self.assertEqual(
                 summary["binary_classification"]["partitions"]["inference"]["offline_metrics"]["auroc"],
@@ -481,20 +589,31 @@ class TestSupervisedArchitectureBreakdown(unittest.TestCase):
             markdown = outputs["results_summary_md"].read_text(encoding="utf-8")
             self.assertIn("# Results Summary", markdown)
             self.assertIn("## Binary Classification", markdown)
+            self.assertIn("## Cross-Validation Selection", markdown)
             self.assertIn("## Multiclass Overview", markdown)
             self.assertIn("## Per-Class Inference", markdown)
             self.assertNotIn("## Per Architecture", markdown)
             self.assertNotIn("## Per Dataset", markdown)
             self.assertNotIn("## Per Adapter", markdown)
-            self.assertNotIn("## Per Attack", markdown)
+            self.assertIn("## Per Attack", markdown)
+            self.assertIn("| cnn_1d | 1 | 2 | cross_validation | macro_f1 | 0.810 | 0.010 | 0.820 |", markdown)
+            self.assertIn("Selected params: `conv_channels=64, dropout=0.0`.", markdown)
+            self.assertIn("| 2 | 8 | 2 | 0.820 | 0.840 |", markdown)
+            self.assertIn("| 1 | 1 | 0.810 | 0.010 | 0.820 | `conv_channels=64, dropout=0.0` |", markdown)
             self.assertIn("| inference | 5 | 1 | 4 | 0 | 0.950 | 0.970 | 0.900 |", markdown)
+            self.assertIn("| syntactic | 2 | 1 | 1 | 0 | 1.000 | 1.000 | 1.000 |", markdown)
             self.assertIn("| clean | 1 | 2 | 0.500 | 1.000 | 0.667 |", markdown)
 
             with open(run_dir / "reports" / "supervised_report.json", "r", encoding="utf-8") as f:
                 report = json.load(f)
             self.assertEqual(report["results_summary"]["summary_mode"], "multiclass")
+            self.assertEqual(
+                report["results_summary"]["tuning_selection"]["winner"]["selection_metric_mean"],
+                0.810,
+            )
             self.assertIn("binary_classification", report["results_summary"])
             self.assertIn("class_results", report["results_summary"])
+            self.assertIn("attack_analysis", report["results_summary"])
             self.assertIn("attack_analysis", report)
             self.assertEqual(
                 report["attack_analysis"]["inference"]["attacks"]["syntactic"]["offline_metrics"]["auroc"],

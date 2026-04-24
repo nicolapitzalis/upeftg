@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from importlib import import_module
 import json
 from pathlib import Path
 import sys
@@ -37,6 +38,42 @@ from .utilities.core.paths import default_dataset_root, dataset_root_help
 from .utilities.core.run_context import create_run_context
 from .utilities.core.serialization import json_ready
 from .utilities.merge.merge_feature_files import merge_feature_files
+
+
+EXPERIMENT_COMMANDS: dict[str, tuple[str, str]] = {
+    "paper-qv-reference": (
+        "upeftguard.experiments.paper_qv_reference",
+        "Run the paper q/v reference experiment",
+    ),
+    "rank-normalization-study": (
+        "upeftguard.experiments.rank_normalization_study",
+        "Run or report the rank-normalization study",
+    ),
+    "supervised-results-summary": (
+        "upeftguard.experiments.supervised_architecture_breakdown",
+        "Generate supervised results_summary.md outputs",
+    ),
+    "imdb-clean-reference": (
+        "upeftguard.experiments.imdb_clean_reference",
+        "Run the IMDb clean-reference anomaly experiment",
+    ),
+    "backdoor-detection-summaries": (
+        "upeftguard.experiments.backdoor_detection_summaries",
+        "Aggregate completed supervised run outputs",
+    ),
+    "supervised-slurm": (
+        "upeftguard.experiments.supervised_slurm",
+        "Submit the generic supervised Slurm workflow",
+    ),
+    "prepare-attack-family-leave-one-out": (
+        "upeftguard.experiments.attack_family_leave_one_out",
+        "Generate attack-family leave-one-out manifests",
+    ),
+    "supervised-cnn-suite": (
+        "upeftguard.experiments.supervised_cnn_suite",
+        "Run a supervised CNN transfer suite",
+    ),
+}
 
 
 def _execution_root() -> Path:
@@ -500,6 +537,26 @@ def _cmd_util_export_feature_subset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_experiment_module(args: argparse.Namespace) -> int:
+    module = import_module(str(args.experiment_module))
+    result = module.main(list(args.experiment_args))
+    return 0 if result is None else int(result)
+
+
+def _add_experiment_command(
+    subparsers: argparse._SubParsersAction[argparse.ArgumentParser],
+    name: str,
+    module: str,
+    help_text: str,
+) -> None:
+    command = subparsers.add_parser(name, help=help_text, add_help=False)
+    command.add_argument("experiment_args", nargs=argparse.REMAINDER)
+    command.set_defaults(
+        func=_cmd_experiment_module,
+        experiment_module=module,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="upeftguard unified CLI")
     sub = parser.add_subparsers(dest="command_group", required=True)
@@ -813,8 +870,9 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         help=(
-            "Required for --task-mode attack_family_multiclass. For the current experiment this must "
-            "be the canonical set: RIPPLE insertsent stybkd syntactic."
+            "Required for --task-mode attack_family_multiclass. Provide the positive attack-class "
+            "vocabulary in the desired output order. For open-set evaluation, include the held-out "
+            "attack names here so unseen positives can be scored as unknown_attack at inference."
         ),
     )
     supervised.add_argument(
@@ -1116,6 +1174,11 @@ def build_parser() -> argparse.ArgumentParser:
     download.add_argument("download_args", nargs=argparse.REMAINDER)
     download.set_defaults(func=_cmd_download_dataset)
 
+    experiment_parser = sub.add_parser("experiment", help="Experiment launchers and post-processing commands")
+    experiment_sub = experiment_parser.add_subparsers(dest="experiment_command", required=True)
+    for command_name, (module_name, help_text) in EXPERIMENT_COMMANDS.items():
+        _add_experiment_command(experiment_sub, command_name, module_name, help_text)
+
     return parser
 
 
@@ -1128,6 +1191,14 @@ def main(argv: list[str] | None = None) -> int:
             util_command="download-dataset",
             download_args=argv_tokens[2:],
             func=_cmd_download_dataset,
+        )
+    elif len(argv_tokens) >= 2 and argv_tokens[0] == "experiment" and argv_tokens[1] in EXPERIMENT_COMMANDS:
+        args = argparse.Namespace(
+            command_group="experiment",
+            experiment_command=argv_tokens[1],
+            experiment_args=argv_tokens[2:],
+            experiment_module=EXPERIMENT_COMMANDS[argv_tokens[1]][0],
+            func=_cmd_experiment_module,
         )
     else:
         args = parser.parse_args(argv_tokens)

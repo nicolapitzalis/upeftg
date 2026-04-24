@@ -361,6 +361,8 @@ def _build_config(
         "raw_rank_cnn_output_run": "raw_rank_bundle_cnn",
         "raw_rank_reference_run": "raw_rank_reference",
         "raw_rank_zero_shot_prefix": "zero_shot_cnn_raw_rank",
+        "arms": ("rank_norm", "raw_rank"),
+        "reference_cnn_hyperparams": None,
         "reference_tuning_executor": "local",
         "reference_n_jobs": 1,
         "reference_dry_run": False,
@@ -478,9 +480,19 @@ class RankNormalizationStudyTests(unittest.TestCase):
             self.assertIn("layer0.self_attn.q_proj.energy_per_rank", rank_norm_index)
             self.assertIn("layer0.self_attn.q_proj.sv_l1_norm_per_rank", rank_norm_index)
             self.assertIn("layer0.self_attn.qv_sum.normalized_spectral_entropy", rank_norm_index)
+            self.assertNotIn("l1_norm_per_rank", rank_norm_features)
+            self.assertNotIn("mean_abs_per_rank", rank_norm_features)
+            self.assertNotIn("layer0.self_attn.q_proj.l1_norm_per_rank", rank_norm_index)
+            self.assertNotIn("layer0.self_attn.q_proj.mean_abs_per_rank", rank_norm_index)
+            self.assertNotIn("layer0.self_attn.q_proj.sv_mean_abs_per_rank", rank_norm_index)
             self.assertAlmostEqual(
                 float(rank_norm_matrix[0, rank_norm_index["layer0.self_attn.q_proj.energy_per_rank"]]),
                 88.0 / 8.0,
+                places=6,
+            )
+            self.assertAlmostEqual(
+                float(rank_norm_matrix[0, rank_norm_index["layer0.self_attn.q_proj.sv_l1_norm_per_rank"]]),
+                32.0 / 8.0,
                 places=6,
             )
             self.assertAlmostEqual(
@@ -604,8 +616,12 @@ class RankNormalizationStudyTests(unittest.TestCase):
             self.assertEqual(tensor.ndim, 4)
             metadata = load_spectral_metadata(Path(str(outputs["metadata_path"])))
             self.assertEqual(metadata["resolved_features"], list(arm.selected_features))
+            self.assertIn("sv_l1_norm_per_rank", metadata["emitted_feature_names"])
+            self.assertNotIn("l1_norm_per_rank", metadata["emitted_feature_names"])
+            self.assertNotIn("mean_abs_per_rank", metadata["emitted_feature_names"])
+            self.assertNotIn("sv_mean_abs_per_rank", metadata["emitted_feature_names"])
 
-    def test_launch_zero_shot_suite_uses_existing_launcher_and_explicit_env(self):
+    def test_launch_zero_shot_suite_uses_experiment_cli_and_explicit_env(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             manifests = {
@@ -636,7 +652,9 @@ class RankNormalizationStudyTests(unittest.TestCase):
                 )
                 args, kwargs = run_mock.call_args
                 cmd = args[0]
-                self.assertIn("--hyperparam_config", cmd)
+                self.assertEqual(cmd[:5], ["python", "-m", "upeftguard.cli", "experiment", "supervised-cnn-suite"])
+                self.assertIn("--hyperparam-config", cmd)
+                self.assertIn("zero-shot", cmd)
                 self.assertIn("--manifest-filter", cmd)
                 self.assertIn("llama2_7b_tbh_zero_shot_r256_to_rank", cmd)
                 self.assertEqual(kwargs["env"]["RUN_ID_PREFIX"], "zero_shot_cnn_rank_norm")
@@ -688,6 +706,58 @@ class RankNormalizationStudyTests(unittest.TestCase):
                     study_report["baseline_reference_run"],
                     str((baseline_reference["run_dir"]).resolve()),
                 )
+
+    def test_rank_norm_only_forwards_reference_cnn_hyperparams(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = _write_source_bundle(tmp_path)
+            _write_baseline_reference_run(tmp_path)
+            _write_baseline_cnn_bundle(tmp_path)
+            manifests = _write_manifests(tmp_path)
+            _write_baseline_zero_shot_results(tmp_path)
+            hyperparams = tmp_path / "manifests" / "cnn_hyperparams" / "wide.json"
+            _write_json(
+                hyperparams,
+                {
+                    "conv_channels": [64],
+                    "num_conv_layers": [3],
+                    "kernel_size": [5],
+                    "dropout": [0.1],
+                    "learning_rate": [0.0003],
+                    "weight_decay": [0.0],
+                },
+            )
+
+            config = _build_config(
+                tmp_path=tmp_path,
+                source_feature_root=source["feature_root"],
+                manifests=manifests,
+                arms=("rank_norm",),
+                reference_cnn_hyperparams=hyperparams,
+            )
+
+            with patch("upeftguard.experiments.rank_normalization_study.run_supervised_pipeline") as run_pipeline_mock, patch(
+                "upeftguard.experiments.rank_normalization_study.subprocess.run"
+            ) as subprocess_mock, patch(
+                "upeftguard.experiments.rank_normalization_study._assert_reference_run_completed"
+            ):
+                run_pipeline_mock.return_value = {
+                    "run_dir": str(tmp_path / "runs" / "supervised" / "rank_norm_reference")
+                }
+                subprocess_mock.return_value = object()
+                result = run_rank_normalization_study(config)
+
+                self.assertEqual(run_pipeline_mock.call_count, 1)
+                self.assertEqual(run_pipeline_mock.call_args.kwargs["run_id"], "rank_norm_reference")
+                self.assertEqual(run_pipeline_mock.call_args.kwargs["cnn_hyperparams"], hyperparams)
+                self.assertEqual(subprocess_mock.call_count, 1)
+
+                with open(result["study_report"], "r", encoding="utf-8") as f:
+                    study_report = json.load(f)
+                self.assertEqual(study_report["active_arms"], ["rank_norm"])
+                self.assertIn("rank_norm", study_report["arm_artifacts"])
+                self.assertNotIn("raw_rank", study_report["arm_artifacts"])
+                self.assertEqual(study_report["reference_cnn_hyperparams"], str(hyperparams.resolve()))
 
     def test_prepare_reference_stage_submits_slurm_array_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -772,6 +842,23 @@ class RankNormalizationStudyTests(unittest.TestCase):
         self.assertEqual(config.stage, "report")
         self.assertTrue(config.skip_reference)
         self.assertTrue(config.skip_zero_shot_launch)
+
+    def test_parser_accepts_rank_norm_only_and_reference_hyperparams(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "--arms",
+                "rank_norm",
+                "--reference-cnn-hyperparams",
+                "manifests/cnn_hyperparams/wide.json",
+            ]
+        )
+        config = args_to_config(args)
+        self.assertEqual(config.arms, ("rank_norm",))
+        self.assertEqual(
+            config.reference_cnn_hyperparams,
+            Path("manifests/cnn_hyperparams/wide.json"),
+        )
 
 
 if __name__ == "__main__":

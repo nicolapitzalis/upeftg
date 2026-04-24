@@ -49,9 +49,8 @@ DEFAULT_SPECTRAL_FEATURES = [
 
 _RANK_NORMALIZED_FEATURE_REPLACEMENTS = {
     "energy": "energy_per_rank",
-    "l1_norm": "l1_norm_per_rank",
+    "l1_norm": "sv_l1_norm_per_rank",
     "l2_norm": "l2_norm_per_sqrt_rank",
-    "mean_abs": "mean_abs_per_rank",
     "stable_rank": "stable_rank_frac",
     "spectral_entropy": "normalized_spectral_entropy",
     "effective_rank": "effective_rank_frac",
@@ -60,6 +59,7 @@ _RANK_NORMALIZED_FEATURE_REPLACEMENTS = {
 _DERIVED_FEATURE_GROUP_SOURCES = {
     "energy_per_rank": "energy",
     "l1_norm_per_rank": "l1_norm",
+    "sv_l1_norm_per_rank": "l1_norm",
     "l2_norm_per_sqrt_rank": "l2_norm",
     "mean_abs_per_rank": "mean_abs",
     "stable_rank_frac": "stable_rank",
@@ -81,6 +81,7 @@ SUPPORTED_SPECTRAL_FEATURES = {
     "kurtosis",
     "l1_norm",
     "l1_norm_per_rank",
+    "sv_l1_norm_per_rank",
     "l2_norm",
     "l2_norm_per_sqrt_rank",
     "linf_norm",
@@ -164,7 +165,7 @@ _FEATURE_GROUP_BY_SUFFIX = {
     "l1_norm": "l1_norm",
     "sv_l1_norm": "l1_norm",
     "l1_norm_per_rank": "l1_norm_per_rank",
-    "sv_l1_norm_per_rank": "l1_norm_per_rank",
+    "sv_l1_norm_per_rank": "sv_l1_norm_per_rank",
     "l2_norm": "l2_norm",
     "l2_norm_per_sqrt_rank": "l2_norm_per_sqrt_rank",
     "linf_norm": "linf_norm",
@@ -247,14 +248,22 @@ def expand_spectral_feature_names(
 ) -> list[str]:
     resolved_moment_source = resolve_spectral_moment_source(spectral_moment_source)
     emitted: list[str] = []
+    seen: set[str] = set()
+
+    def append_emitted(feature_name: str) -> None:
+        if feature_name in seen:
+            return
+        seen.add(feature_name)
+        emitted.append(feature_name)
+
     for feature in selected_features:
         if feature not in _MOMENT_FEATURE_SET:
-            emitted.append(feature)
+            append_emitted(feature)
             continue
         if resolved_moment_source in {"entrywise", "both"}:
-            emitted.append(feature)
+            append_emitted(feature)
         if resolved_moment_source in {"sv", "both"}:
-            emitted.append(_SV_MOMENT_BY_ENTRYWISE[feature])
+            append_emitted(_SV_MOMENT_BY_ENTRYWISE[feature])
     return emitted
 
 

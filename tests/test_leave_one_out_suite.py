@@ -1,24 +1,22 @@
 from __future__ import annotations
 
 import csv
-import importlib.util
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from upeftguard.utilities.core.manifest import parse_joint_manifest_json_by_model_name
+from upeftguard.experiments import attack_family_leave_one_out as GENERATOR_MODULE
+from upeftguard.experiments import backdoor_detection_summaries as SUMMARY_MODULE
+from upeftguard.experiments import supervised_cnn_suite as SUITE_MODULE
+from upeftguard.utilities.core.manifest import (
+    infer_attack_sample_identities,
+    parse_joint_manifest_json_by_model_name,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SUMMARY_SCRIPT_PATH = REPO_ROOT / "scripts" / "generate_backdoor_detection_summaries.py"
-SUMMARY_SPEC = importlib.util.spec_from_file_location("generate_backdoor_detection_summaries", SUMMARY_SCRIPT_PATH)
-if SUMMARY_SPEC is None or SUMMARY_SPEC.loader is None:
-    raise RuntimeError(f"Could not load summary script from {SUMMARY_SCRIPT_PATH}")
-SUMMARY_MODULE = importlib.util.module_from_spec(SUMMARY_SPEC)
-sys.modules[SUMMARY_SPEC.name] = SUMMARY_MODULE
-SUMMARY_SPEC.loader.exec_module(SUMMARY_MODULE)
 
 
 def _load_json(path: Path) -> dict:
@@ -99,6 +97,59 @@ class TestLeaveOneOutSuite(unittest.TestCase):
                 for entry in payload["train"]
             )
         )
+
+    def test_attack_family_multiclass_leave_one_out_generator_filters_to_canonical_cohort(self):
+        expected_names = {
+            "holdout_attack_family_RIPPLE_rank256_qv.json",
+            "holdout_attack_family_insertsent_rank256_qv.json",
+            "holdout_attack_family_stybkd_rank256_qv.json",
+            "holdout_attack_family_syntactic_rank256_qv.json",
+        }
+        allowed_positive_attacks = {"RIPPLE", "insertsent", "stybkd", "syntactic"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "generated_manifests"
+            generated_paths = GENERATOR_MODULE.prepare_manifests(
+                REPO_ROOT / "manifests" / "leave_one_out",
+                output_root,
+            )
+
+            self.assertEqual({path.name for path in generated_paths}, expected_names)
+            self.assertEqual(len(generated_paths), 4)
+
+            for manifest_path in generated_paths:
+                heldout_attack = manifest_path.stem.removeprefix("holdout_attack_family_").removesuffix(
+                    "_rank256_qv"
+                )
+                payload = _load_json(manifest_path)
+                self.assertEqual(len(payload["train"]), 8)
+                self.assertEqual(len(payload["infer"]), 4)
+                for section_name in ("train", "infer"):
+                    self.assertGreater(len(payload[section_name]), 0)
+                    for entry in payload[section_name]:
+                        self.assertRegex(
+                            entry["path"],
+                            r"^llama2_7b_(ag_news|imdb)_(RIPPLE|insertsent|stybkd|syntactic)_rank256_qv/",
+                            msg=f"{manifest_path}:{section_name}",
+                        )
+
+                train_items, infer_items = parse_joint_manifest_json_by_model_name(manifest_path=manifest_path)
+                train_identities = infer_attack_sample_identities(train_items)
+                infer_identities = infer_attack_sample_identities(infer_items)
+                train_positive_attack_names = {
+                    identity.attack_name
+                    for item, identity in zip(train_items, train_identities)
+                    if item.label == 1
+                }
+                infer_positive_attack_names = {
+                    identity.attack_name
+                    for item, identity in zip(infer_items, infer_identities)
+                    if item.label == 1
+                }
+                self.assertEqual(train_positive_attack_names, allowed_positive_attacks - {heldout_attack})
+                self.assertEqual(infer_positive_attack_names, {heldout_attack})
+                self.assertEqual(sum(1 for item in train_items if item.label == 0), 250)
+                self.assertEqual(sum(1 for item in infer_items if item.label == 0), 250)
 
     def test_discover_leave_one_out_run_specs_matches_committed_manifests(self):
         run_specs = SUMMARY_MODULE.discover_leave_one_out_run_specs(REPO_ROOT)
@@ -240,6 +291,68 @@ class TestLeaveOneOutSuite(unittest.TestCase):
             universal_rows = _load_csv_rows(universal_path)
             self.assertEqual(len(universal_rows), 1)
             self.assertEqual(universal_rows[0]["model"], "cnn_1d")
+
+    def test_supervised_cnn_suite_dry_run_enumerates_manifests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            manifest_dir = repo_root / "manifests" / "zero_shots"
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(manifest_dir / "toy_transfer.json", {"train": [], "infer": []})
+
+            reference_dir = repo_root / "runs" / "supervised" / "reference_cnn"
+            reports_dir = reference_dir / "reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            params = {
+                "conv_channels": 64,
+                "dropout": 0.1,
+                "kernel_size": 5,
+                "learning_rate": 0.0003,
+                "num_conv_layers": 3,
+                "weight_decay": 0.0,
+            }
+            _write_json(reference_dir / "run_config.json", {"pipeline": "supervised"})
+            _write_json(
+                reports_dir / "supervised_report.json",
+                {
+                    "tuning": {
+                        "winner": {
+                            "model_name": "cnn_1d",
+                            "task_index": 3,
+                            "params": params,
+                        }
+                    }
+                },
+            )
+            _write_json(
+                reports_dir / "tuning_manifest.json",
+                {
+                    "extractor": {
+                        "params": {
+                            "spectral_features": ["energy"],
+                            "spectral_sv_top_k": 8,
+                            "spectral_moment_source": "both",
+                            "spectral_qv_sum_mode": "append",
+                            "spectral_entrywise_delta_mode": "dense",
+                        },
+                        "metadata": {"external_feature_source": "toy_features"},
+                    },
+                    "threshold_selection": {},
+                    "tuning": {"cv_folds_requested": 2, "cv_random_states": [42]},
+                },
+            )
+
+            with mock.patch.object(SUITE_MODULE, "_repo_root", return_value=repo_root):
+                rc = SUITE_MODULE.main(
+                    [
+                        "--suite",
+                        "zero-shot",
+                        "--hyperparam-config",
+                        "reference_cnn",
+                        "--dry-run",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":

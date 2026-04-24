@@ -101,6 +101,9 @@ FINALIZE_STATE_FILENAME = "finalize_state.json"
 FINALIZE_EXPORT_TRAIN_FEATURES_FILENAME = "winner_feature_weights_train_features.npy"
 FINALIZE_EXPORT_TRAIN_LABELS_FILENAME = "winner_feature_weights_train_labels.npy"
 SELECTED_THRESHOLD_FILENAME = "selected_threshold.json"
+OPEN_SET_UNKNOWN_ATTACK_NAME = "unknown_attack"
+OPEN_SET_ATTACK_FPR = 0.05
+OPEN_SET_KNOWN_ATTACK_MISS_RATE = 0.05
 GROUP_MASK_SUFFIX = "_group_mask.npy"
 VALUE_MASK_SUFFIX = "_value_mask.npy"
 GROUP_NAMES_SUFFIX = "_group_names.json"
@@ -121,19 +124,35 @@ def _resolve_attack_family_multiclass_task_spec(
 ) -> SupervisedTaskSpec:
     if not attack_names:
         raise ValueError(
-            "task_mode=attack_family_multiclass requires --multiclass-attack-names with the "
-            f"canonical attack family set {list(ATTACK_FAMILY_MULTICLASS_ATTACKS)}"
+            "task_mode=attack_family_multiclass requires --multiclass-attack-names with at least "
+            "one positive attack class name"
         )
 
-    provided = {str(name).strip() for name in attack_names if str(name).strip()}
-    expected = set(ATTACK_FAMILY_MULTICLASS_ATTACKS)
-    if provided != expected:
+    normalized_names: list[str] = []
+    seen_names: set[str] = set()
+    for raw_name in attack_names:
+        name = str(raw_name).strip()
+        if not name or name in seen_names:
+            continue
+        seen_names.add(name)
+        normalized_names.append(name)
+
+    if not normalized_names:
         raise ValueError(
-            "attack_family_multiclass currently requires exactly the canonical attack family set "
-            f"{list(ATTACK_FAMILY_MULTICLASS_ATTACKS)}, got {sorted(provided)}"
+            "task_mode=attack_family_multiclass requires at least one non-empty attack class name"
         )
 
-    class_names = ("clean", *ATTACK_FAMILY_MULTICLASS_ATTACKS)
+    reserved_names = {"clean", OPEN_SET_UNKNOWN_ATTACK_NAME}
+    conflicting_names = [
+        name for name in normalized_names if str(name).strip().lower() in reserved_names
+    ]
+    if conflicting_names:
+        raise ValueError(
+            "attack_family_multiclass class names cannot reuse reserved labels "
+            f"{sorted(reserved_names)}; got {conflicting_names}"
+        )
+
+    class_names = ("clean", *normalized_names)
     return SupervisedTaskSpec(
         task_mode=SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS,
         class_names=class_names,
@@ -441,6 +460,302 @@ def _distribution_rows_from_predictions(
     ]
 
 
+def _open_set_unknown_class_index(task_spec: SupervisedTaskSpec) -> int:
+    return int(task_spec.n_classes)
+
+
+def _open_set_class_name(class_index: int, *, task_spec: SupervisedTaskSpec) -> str:
+    resolved = int(class_index)
+    if 0 <= resolved < task_spec.n_classes:
+        return str(task_spec.class_names[resolved])
+    if resolved == _open_set_unknown_class_index(task_spec):
+        return OPEN_SET_UNKNOWN_ATTACK_NAME
+    return f"unknown_{resolved}"
+
+
+def _csv_safe_class_name(class_name: str) -> str:
+    return "".join(ch if ch.isalnum() else "_" for ch in str(class_name)).strip("_") or "class"
+
+
+def _open_set_distribution_rows(
+    predicted_labels: np.ndarray,
+    *,
+    task_spec: SupervisedTaskSpec,
+) -> list[dict[str, Any]]:
+    predicted = np.asarray(predicted_labels, dtype=np.int32).reshape(-1)
+    if predicted.size == 0:
+        return []
+    unique, counts = np.unique(predicted, return_counts=True)
+    return [
+        {
+            "class_index": int(class_index),
+            "class_name": _open_set_class_name(int(class_index), task_spec=task_spec),
+            "count": int(count),
+        }
+        for class_index, count in zip(unique.tolist(), counts.tolist())
+    ]
+
+
+def _observed_known_attack_indices(labels: np.ndarray, *, task_spec: SupervisedTaskSpec) -> list[int]:
+    labels_np = np.asarray(labels, dtype=np.int32).reshape(-1)
+    unique = sorted(int(x) for x in np.unique(labels_np).tolist())
+    return [
+        label
+        for label in unique
+        if label != task_spec.clean_class_index and 0 <= label < task_spec.n_classes
+    ]
+
+
+def _finite_or_default(values: np.ndarray, default: float) -> np.ndarray:
+    values_np = np.asarray(values, dtype=np.float64).reshape(-1)
+    finite = values_np[np.isfinite(values_np)]
+    if finite.size == 0:
+        return np.asarray([float(default)], dtype=np.float64)
+    return finite
+
+
+def _build_open_set_unknown_attack_config(
+    *,
+    train_labels: np.ndarray,
+    train_outputs: SupervisedPredictionOutputs,
+    task_spec: SupervisedTaskSpec,
+) -> dict[str, Any] | None:
+    if task_spec.is_binary or train_outputs.probabilities is None:
+        return None
+
+    labels = np.asarray(train_labels, dtype=np.int32).reshape(-1)
+    probabilities = np.asarray(train_outputs.probabilities, dtype=np.float64)
+    if probabilities.ndim != 2 or probabilities.shape[1] != task_spec.n_classes:
+        return None
+
+    known_attack_indices = _observed_known_attack_indices(labels, task_spec=task_spec)
+    if not known_attack_indices:
+        return None
+
+    scores = np.asarray(train_outputs.backdoor_scores, dtype=np.float64).reshape(-1)
+    clean_scores = _finite_or_default(
+        scores[labels == task_spec.clean_class_index],
+        default=0.5,
+    )
+    attack_threshold = float(np.percentile(clean_scores, 100.0 * (1.0 - OPEN_SET_ATTACK_FPR)))
+
+    true_known_confidences: list[float] = []
+    known_set = set(int(x) for x in known_attack_indices)
+    for row_idx, label in enumerate(labels.tolist()):
+        label_index = int(label)
+        if label_index not in known_set:
+            continue
+        true_known_confidences.append(float(probabilities[int(row_idx), label_index]))
+    known_conf = _finite_or_default(np.asarray(true_known_confidences, dtype=np.float64), default=0.5)
+    known_attack_confidence_threshold = float(
+        np.percentile(known_conf, 100.0 * OPEN_SET_KNOWN_ATTACK_MISS_RATE)
+    )
+
+    return {
+        "method": "backdoor_score_and_known_attack_confidence",
+        "unknown_class_name": OPEN_SET_UNKNOWN_ATTACK_NAME,
+        "unknown_class_index": _open_set_unknown_class_index(task_spec),
+        "attack_threshold": attack_threshold,
+        "attack_threshold_source": "train_clean_backdoor_score_p95",
+        "attack_threshold_target_fpr": float(OPEN_SET_ATTACK_FPR),
+        "known_attack_confidence_threshold": known_attack_confidence_threshold,
+        "known_attack_confidence_threshold_source": "train_known_attack_true_class_probability_p05",
+        "known_attack_confidence_target_miss_rate": float(OPEN_SET_KNOWN_ATTACK_MISS_RATE),
+        "known_attack_indices": [int(x) for x in known_attack_indices],
+        "known_attack_names": [str(task_spec.class_names[int(x)]) for x in known_attack_indices],
+        "rule": (
+            "clean if backdoor_score < attack_threshold; unknown_attack if backdoor_score >= "
+            "attack_threshold and max probability over training-observed attack heads is below "
+            "known_attack_confidence_threshold; otherwise argmax over training-observed attack heads"
+        ),
+    }
+
+
+def _apply_open_set_unknown_attack_rule(
+    *,
+    outputs: SupervisedPredictionOutputs,
+    task_spec: SupervisedTaskSpec,
+    config: dict[str, Any] | None,
+) -> dict[str, np.ndarray] | None:
+    if task_spec.is_binary or config is None or outputs.probabilities is None:
+        return None
+
+    probabilities = np.asarray(outputs.probabilities, dtype=np.float64)
+    if probabilities.ndim != 2 or probabilities.shape[1] != task_spec.n_classes:
+        return None
+
+    known_attack_indices = [int(x) for x in config.get("known_attack_indices", [])]
+    if not known_attack_indices:
+        return None
+
+    scores = np.asarray(outputs.backdoor_scores, dtype=np.float64).reshape(-1)
+    known_probs = probabilities[:, known_attack_indices]
+    known_rel_argmax = np.argmax(known_probs, axis=1)
+    known_confidence = np.max(known_probs, axis=1).astype(np.float64, copy=False)
+    known_argmax = np.asarray(
+        [known_attack_indices[int(i)] for i in known_rel_argmax.tolist()],
+        dtype=np.int32,
+    )
+    attack_threshold = float(config["attack_threshold"])
+    known_threshold = float(config["known_attack_confidence_threshold"])
+    unknown_index = int(config["unknown_class_index"])
+
+    predicted = np.where(
+        scores < attack_threshold,
+        int(task_spec.clean_class_index),
+        np.where(known_confidence < known_threshold, unknown_index, known_argmax),
+    ).astype(np.int32, copy=False)
+
+    return {
+        "predicted_labels": predicted,
+        "known_attack_confidence": known_confidence,
+        "known_attack_argmax": known_argmax,
+        "is_unknown_attack": (predicted == unknown_index),
+    }
+
+
+def _open_set_true_labels(
+    labels: np.ndarray,
+    *,
+    task_spec: SupervisedTaskSpec,
+    config: dict[str, Any] | None,
+) -> np.ndarray | None:
+    if config is None:
+        return None
+    labels_np = np.asarray(labels, dtype=np.int32).reshape(-1)
+    known_attack_indices = set(int(x) for x in config.get("known_attack_indices", []))
+    unknown_index = int(config["unknown_class_index"])
+    mapped: list[int] = []
+    for label in labels_np.tolist():
+        label_index = int(label)
+        if label_index < 0:
+            mapped.append(-1)
+        elif label_index == task_spec.clean_class_index or label_index in known_attack_indices:
+            mapped.append(label_index)
+        elif 0 <= label_index < task_spec.n_classes:
+            mapped.append(unknown_index)
+        else:
+            mapped.append(-1)
+    return np.asarray(mapped, dtype=np.int32)
+
+
+def _summarize_open_set_partition(
+    *,
+    labels_true: np.ndarray | None,
+    open_set_result: dict[str, np.ndarray] | None,
+    task_spec: SupervisedTaskSpec,
+    config: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if open_set_result is None or config is None:
+        return None
+
+    predicted = np.asarray(open_set_result["predicted_labels"], dtype=np.int32).reshape(-1)
+    labels = [*task_spec.class_names, OPEN_SET_UNKNOWN_ATTACK_NAME]
+    label_indices = np.arange(task_spec.n_classes + 1, dtype=np.int32)
+    summary: dict[str, Any] = {
+        "class_names": [str(x) for x in labels],
+        "unknown_class_index": int(config["unknown_class_index"]),
+        "predicted_class_distribution": _open_set_distribution_rows(
+            predicted,
+            task_spec=task_spec,
+        ),
+        "n_unknown_attack_predictions": int(np.sum(predicted == int(config["unknown_class_index"]))),
+        "known_attack_confidence_summary": summarize_scores(
+            np.asarray(open_set_result["known_attack_confidence"], dtype=np.float64)
+        ),
+    }
+    if labels_true is None:
+        return summary
+
+    truth_all = np.asarray(labels_true, dtype=np.int32).reshape(-1)
+    known_mask = truth_all >= 0
+    if not bool(np.any(known_mask)):
+        return summary
+    truth = truth_all[known_mask]
+    predicted_known = predicted[known_mask]
+    precision, recall, f1, support = precision_recall_fscore_support(
+        truth,
+        predicted_known,
+        labels=label_indices,
+        zero_division=0,
+    )
+    summary["accuracy"] = float(accuracy_score(truth, predicted_known))
+    summary["macro_f1"] = float(
+        f1_score(truth, predicted_known, labels=label_indices, average="macro", zero_division=0)
+    )
+    summary["micro_f1"] = float(
+        f1_score(truth, predicted_known, labels=label_indices, average="micro", zero_division=0)
+    )
+    summary["true_class_distribution"] = _open_set_distribution_rows(truth, task_spec=task_spec)
+    summary["confusion_matrix"] = {
+        "labels": [str(x) for x in labels],
+        "rows": confusion_matrix(
+            truth,
+            predicted_known,
+            labels=label_indices,
+        ).astype(np.int32, copy=False).tolist(),
+    }
+    summary["per_class"] = [
+        {
+            "class_index": int(class_index),
+            "class_name": _open_set_class_name(int(class_index), task_spec=task_spec),
+            "precision": float(precision[int(pos)]),
+            "recall": float(recall[int(pos)]),
+            "f1": float(f1[int(pos)]),
+            "support": int(support[int(pos)]),
+            "predicted_count": int(np.sum(predicted_known == int(class_index))),
+        }
+        for pos, class_index in enumerate(label_indices.tolist())
+    ]
+    return summary
+
+
+def _multiclass_score_extra_rows(
+    *,
+    task_labels: list[int | None],
+    outputs: SupervisedPredictionOutputs,
+    task_spec: SupervisedTaskSpec,
+    open_set_result: dict[str, np.ndarray] | None,
+) -> list[dict[str, Any]] | None:
+    if task_spec.is_binary or outputs.probabilities is None:
+        return None
+
+    probabilities = np.asarray(outputs.probabilities, dtype=np.float64)
+    predicted = np.asarray(outputs.predicted_labels, dtype=np.int32).reshape(-1)
+    rows: list[dict[str, Any]] = []
+    for row_idx, raw_label in enumerate(task_labels):
+        predicted_index = int(predicted[row_idx])
+        row: dict[str, Any] = {
+            "task_label": "" if raw_label is None else int(raw_label),
+            "task_class_name": (
+                "" if raw_label is None else _open_set_class_name(int(raw_label), task_spec=task_spec)
+            ),
+            "predicted_class": predicted_index,
+            "predicted_class_name": _open_set_class_name(predicted_index, task_spec=task_spec),
+        }
+        for class_index, class_name in enumerate(task_spec.class_names):
+            row[f"prob_{_csv_safe_class_name(str(class_name))}"] = float(
+                probabilities[row_idx, int(class_index)]
+            )
+        if open_set_result is not None:
+            open_pred = int(open_set_result["predicted_labels"][row_idx])
+            row.update(
+                {
+                    "open_set_prediction": open_pred,
+                    "open_set_prediction_name": _open_set_class_name(open_pred, task_spec=task_spec),
+                    "open_set_is_unknown_attack": bool(open_set_result["is_unknown_attack"][row_idx]),
+                    "known_attack_confidence": float(open_set_result["known_attack_confidence"][row_idx]),
+                    "known_attack_argmax": int(open_set_result["known_attack_argmax"][row_idx]),
+                    "known_attack_argmax_name": _open_set_class_name(
+                        int(open_set_result["known_attack_argmax"][row_idx]),
+                        task_spec=task_spec,
+                    ),
+                }
+            )
+        rows.append(row)
+    return rows
+
+
 def _summarize_multiclass_partition(
     *,
     labels_true: np.ndarray | None,
@@ -476,8 +791,8 @@ def _summarize_multiclass_partition(
         zero_division=0,
     )
     summary["accuracy"] = float(accuracy_score(truth, predicted))
-    summary["macro_f1"] = float(f1_score(truth, predicted, average="macro"))
-    summary["micro_f1"] = float(f1_score(truth, predicted, average="micro"))
+    summary["macro_f1"] = float(f1_score(truth, predicted, average="macro", zero_division=0))
+    summary["micro_f1"] = float(f1_score(truth, predicted, average="micro", zero_division=0))
     summary["true_class_distribution"] = _named_label_count_rows(truth, task_spec=task_spec)
     summary["confusion_matrix"] = {
         "labels": [str(x) for x in task_spec.class_names],
@@ -3142,6 +3457,16 @@ def _prepare_supervised_finalize(
         model.fit(x_train, y_train)
     train_outputs = _predict_task_outputs(model, x_train, task_spec=task_spec)
     train_scores = np.asarray(train_outputs.backdoor_scores, dtype=np.float64)
+    open_set_unknown_config = _build_open_set_unknown_attack_config(
+        train_labels=y_train,
+        train_outputs=train_outputs,
+        task_spec=task_spec,
+    )
+    train_open_set_result = _apply_open_set_unknown_attack_rule(
+        outputs=train_outputs,
+        task_spec=task_spec,
+        config=open_set_unknown_config,
+    )
     threshold_specs = _build_threshold_specs(
         train_scores=train_scores,
         percentiles=[float(x) for x in score_percentiles],
@@ -3161,6 +3486,12 @@ def _prepare_supervised_finalize(
         model_names=train_model_names,
         labels=train_labels_raw,
         scores=train_scores,
+        extra_rows=_multiclass_score_extra_rows(
+            task_labels=train_task_labels_raw,
+            outputs=train_outputs,
+            task_spec=task_spec,
+            open_set_result=train_open_set_result,
+        ),
     )
 
     calibration_scores_csv: Path | None = None
@@ -3171,11 +3502,17 @@ def _prepare_supervised_finalize(
     calibration_task_labels_raw: list[int] = []
     calibration_scores: np.ndarray | None = None
     calibration_outputs: SupervisedPredictionOutputs | None = None
+    calibration_open_set_result: dict[str, np.ndarray] | None = None
     calibration_binary_labels_np: np.ndarray | None = None
     if calibration_indices.size > 0:
         x_calibration = _slice_supervised_features(features, calibration_indices)
         y_calibration = labels_value[calibration_indices]
         calibration_outputs = _predict_task_outputs(model, x_calibration, task_spec=task_spec)
+        calibration_open_set_result = _apply_open_set_unknown_attack_rule(
+            outputs=calibration_outputs,
+            task_spec=task_spec,
+            config=open_set_unknown_config,
+        )
         calibration_scores = np.asarray(calibration_outputs.backdoor_scores, dtype=np.float64)
         calibration_model_names = [model_names[int(i)] for i in calibration_indices.tolist()]
         calibration_task_labels_raw = [int(x) for x in y_calibration.tolist()]
@@ -3190,6 +3527,12 @@ def _prepare_supervised_finalize(
             model_names=calibration_model_names,
             labels=calibration_labels_raw,
             scores=calibration_scores,
+            extra_rows=_multiclass_score_extra_rows(
+                task_labels=calibration_task_labels_raw,
+                outputs=calibration_outputs,
+                task_spec=task_spec,
+                open_set_result=calibration_open_set_result,
+            ),
         )
         calibration_score_summary = summarize_scores(calibration_scores)
         calibration_offline_metrics = compute_offline_metrics(
@@ -3211,10 +3554,16 @@ def _prepare_supervised_finalize(
     infer_task_labels_np: np.ndarray | None = None
     infer_known_task_labels_np: np.ndarray | None = None
     infer_outputs: SupervisedPredictionOutputs | None = None
+    infer_open_set_result: dict[str, np.ndarray] | None = None
 
     if infer_indices.size > 0:
         x_infer = _slice_supervised_features(features, infer_indices)
         infer_outputs = _predict_task_outputs(model, x_infer, task_spec=task_spec)
+        infer_open_set_result = _apply_open_set_unknown_attack_rule(
+            outputs=infer_outputs,
+            task_spec=task_spec,
+            config=open_set_unknown_config,
+        )
         infer_scores = np.asarray(infer_outputs.backdoor_scores, dtype=np.float64)
         infer_model_names = [model_names[int(i)] for i in infer_indices.tolist()]
         infer_sample_identities = [all_sample_identities[int(i)] for i in infer_indices.tolist()]
@@ -3241,6 +3590,12 @@ def _prepare_supervised_finalize(
             model_names=infer_model_names,
             labels=infer_labels_raw,
             scores=infer_scores,
+            extra_rows=_multiclass_score_extra_rows(
+                task_labels=infer_task_labels_raw,
+                outputs=infer_outputs,
+                task_spec=task_spec,
+                open_set_result=infer_open_set_result,
+            ),
         )
 
         threshold_rows = compute_infer_threshold_rows(
@@ -3311,6 +3666,53 @@ def _prepare_supervised_finalize(
         train_binary_labels_np,
         train_scores,
     )
+    open_set_assessment = None
+    if open_set_unknown_config is not None:
+        open_set_assessment = {
+            "config": open_set_unknown_config,
+            "train": _summarize_open_set_partition(
+                labels_true=_open_set_true_labels(
+                    np.asarray(y_train, dtype=np.int32),
+                    task_spec=task_spec,
+                    config=open_set_unknown_config,
+                ),
+                open_set_result=train_open_set_result,
+                task_spec=task_spec,
+                config=open_set_unknown_config,
+            ),
+            "calibration": (
+                _summarize_open_set_partition(
+                    labels_true=_open_set_true_labels(
+                        np.asarray(labels_value[calibration_indices], dtype=np.int32),
+                        task_spec=task_spec,
+                        config=open_set_unknown_config,
+                    ),
+                    open_set_result=calibration_open_set_result,
+                    task_spec=task_spec,
+                    config=open_set_unknown_config,
+                )
+                if calibration_open_set_result is not None
+                else None
+            ),
+            "inference": (
+                _summarize_open_set_partition(
+                    labels_true=(
+                        _open_set_true_labels(
+                            np.asarray(infer_task_labels_np, dtype=np.int32),
+                            task_spec=task_spec,
+                            config=open_set_unknown_config,
+                        )
+                        if infer_task_labels_np is not None
+                        else None
+                    ),
+                    open_set_result=infer_open_set_result,
+                    task_spec=task_spec,
+                    config=open_set_unknown_config,
+                )
+                if infer_open_set_result is not None
+                else None
+            ),
+        }
     multiclass_assessment = None
     if not task_spec.is_binary:
         multiclass_assessment = {
@@ -3474,6 +3876,7 @@ def _prepare_supervised_finalize(
             "offline_metrics": infer_offline_metrics,
         },
         "multiclass_assessment": multiclass_assessment,
+        "open_set_assessment": open_set_assessment,
         "threshold_selection": selected_threshold_summary,
         "attack_analysis": attack_analysis,
         "warnings": report_warnings,
@@ -3528,6 +3931,7 @@ def _prepare_supervised_finalize(
         "score_percentiles": [float(x) for x in score_percentiles],
         "winner": winner,
         "threshold_selection": selected_threshold_summary,
+        "open_set_unknown_attack": open_set_unknown_config,
         "skip_feature_importance": bool(skip_feature_importance),
         "winner_feature_weights_mode": winner_feature_weights_mode,
         "warnings": report_warnings,

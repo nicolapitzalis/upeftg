@@ -135,29 +135,46 @@ def save_score_csv(
     model_names: list[str],
     labels: list[int | None],
     scores: np.ndarray,
+    extra_rows: list[dict[str, Any]] | None = None,
 ) -> None:
     ranks = np.argsort(np.argsort(scores))
     pct = ranks / max(1, len(scores) - 1)
+    resolved_extra_rows = extra_rows or []
+    if resolved_extra_rows and len(resolved_extra_rows) != len(model_names):
+        raise ValueError(
+            "extra_rows must have the same length as model_names when writing score CSVs"
+        )
+
+    base_fieldnames = [
+        "index",
+        "model_name",
+        "label",
+        "score",
+        "score_percentile_rank",
+    ]
+    extra_fieldnames: list[str] = []
+    seen = set(base_fieldnames)
+    for row in resolved_extra_rows:
+        for key in row:
+            if key in seen:
+                continue
+            seen.add(key)
+            extra_fieldnames.append(str(key))
 
     with open(output_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=[
-                "index",
-                "model_name",
-                "label",
-                "score",
-                "score_percentile_rank",
-            ],
+            fieldnames=base_fieldnames + extra_fieldnames,
         )
         writer.writeheader()
         for i, (name, label, score, rank_pct) in enumerate(zip(model_names, labels, scores, pct)):
-            writer.writerow(
-                {
-                    "index": i,
-                    "model_name": name,
-                    "label": label,
-                    "score": float(score),
-                    "score_percentile_rank": float(rank_pct),
-                }
-            )
+            row = {
+                "index": i,
+                "model_name": name,
+                "label": label,
+                "score": float(score),
+                "score_percentile_rank": float(rank_pct),
+            }
+            if resolved_extra_rows:
+                row.update(resolved_extra_rows[i])
+            writer.writerow(row)

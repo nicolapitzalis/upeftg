@@ -1,5 +1,6 @@
 import csv
 from contextlib import contextmanager
+import io
 import json
 import os
 import subprocess
@@ -74,6 +75,26 @@ def working_directory(path: Path):
         yield
     finally:
         os.chdir(prev)
+
+
+class ExperimentCliTests(unittest.TestCase):
+    def test_experiment_commands_forward_help(self):
+        commands = [
+            "paper-qv-reference",
+            "rank-normalization-study",
+            "supervised-results-summary",
+            "imdb-clean-reference",
+            "backdoor-detection-summaries",
+            "supervised-slurm",
+            "prepare-attack-family-leave-one-out",
+            "supervised-cnn-suite",
+        ]
+
+        for command in commands:
+            with self.subTest(command=command):
+                with mock.patch("sys.stdout", new_callable=io.StringIO), self.assertRaises(SystemExit) as cm:
+                    cli_mod.main(["experiment", command, "--help"])
+                self.assertEqual(cm.exception.code, 0)
 
 
 def make_tiny_adapter_dataset(

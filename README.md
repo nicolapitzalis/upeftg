@@ -249,7 +249,7 @@ sbatch ./sbatch/supervised_array.sh
 For most runs, the recommended interface is the thin launcher:
 
 ```bash
-python scripts/run_supervised_slurm.py \
+python -m upeftguard.cli experiment supervised-slurm \
   --manifest-json <MANIFEST_JSON> \
   --feature-file <FEATURE_FILE> \
   --features energy kurtosis l1_norm l2_norm linf_norm mean_abs concentration_of_energy sv_topk stable_rank spectral_entropy effective_rank \
@@ -261,7 +261,7 @@ The launcher submits `sbatch/supervised_array.sh` with the relevant environment 
 Example: multiclass CNN tuning on the pooled `imdb + ag_news` attack-family manifest:
 
 ```bash
-python scripts/run_supervised_slurm.py \
+python -m upeftguard.cli experiment supervised-slurm \
   --manifest-json manifests/multiclass/llama2_7b_ag_news_imdb_attack_family_multiclass_rank256_qv.json \
   --feature-file runs/feature_extract/list2_features-merged-cnn/merged/spectral_features.npy \
   --features energy kurtosis l1_norm l2_norm linf_norm mean_abs concentration_of_energy sv_topk stable_rank spectral_entropy effective_rank \
@@ -279,7 +279,7 @@ python scripts/run_supervised_slurm.py \
   --partition extra
 ```
 
-By default, `scripts/run_supervised_slurm.py` resolves `--worker-cpus` and `--max-concurrent` from the selected partition and tries to use the whole partition. Override them explicitly only when you want to cap resource usage.
+By default, `python -m upeftguard.cli experiment supervised-slurm` resolves `--worker-cpus` and `--max-concurrent` from the selected partition and tries to use the whole partition. Override them explicitly only when you want to cap resource usage.
 
 Add `--dry-run` to preview the submission without queueing jobs.
 
@@ -292,12 +292,34 @@ RUN_DIR=runs/supervised/<RUN_ID> sbatch ./sbatch/supervised_feature_importance_a
 For the leave-one-out CNN sweep across the committed joint manifests:
 
 ```bash
-bash scripts/run_all_leave_one_out_supervised_cnn.sh \
-  --hyperparam_config <REFERENCE_RUN_ID_OR_RUN_DIR> \
-  --dry_run
+python -m upeftguard.cli experiment supervised-cnn-suite \
+  --suite leave-one-out \
+  --hyperparam-config <REFERENCE_RUN_ID_OR_RUN_DIR> \
+  --dry-run
 ```
 
 This launcher scans `manifests/leave_one_out/`, locks every run to the selected CNN winner, and writes outputs under `runs/supervised/leave_one_out_cnn/<RUN_ID>/`.
+
+For the attack-family leave-one-out sweep with the multiclass CNN head:
+
+```bash
+python -m upeftguard.cli experiment supervised-cnn-suite \
+  --suite attack-family-leave-one-out-multiclass \
+  --hyperparam-config cnn_ag_news_imdb_attack_family_multiclass_tuning_5 \
+  --dry-run
+```
+
+This launcher generates a 4-manifest filtered suite that holds out each attack family across both ag_news and imdb, uses `TASK_MODE=attack_family_multiclass`, and writes outputs under `runs/supervised/leave_one_out_attack_family_multiclass_cnn/<RUN_ID>/`.
+
+For the direct binary-head comparison to that attack-family leave-one-out sweep:
+
+```bash
+python -m upeftguard.cli experiment supervised-cnn-suite \
+  --suite attack-family-leave-one-out-binary \
+  --dry-run
+```
+
+This launcher uses the same 4 generated attack-family holdout manifests, defaults to the binary CNN winner from `cnn_ag_news_imdb_attack_family_binary_tuning`, uses `TASK_MODE=binary`, and writes outputs under `runs/supervised/leave_one_out_attack_family_binary_cnn/<RUN_ID>/`. Pass `--hyperparam_config <REFERENCE_RUN_ID_OR_RUN_DIR>` to compare against a different binary-head winner.
 
 The same contract applies to direct CLI runs and Slurm-array runs: supervised always consumes a precomputed feature bundle.
 
@@ -408,6 +430,6 @@ Use `--spectral-qv-sum-mode none|append|only` to exclude, include, or isolate q+
 
 ## Maintenance Scripts
 
-- `scripts/generate_backdoor_detection_summaries.py` is a post-processing helper for completed supervised runs. It expects run ids to follow the current manifest naming conventions under `manifests/zero_shots/`, `manifests/leave_one_out/`, `manifests/rank_exploration/`, `manifests/adapter_exploration/`, and `manifests/architecture_exploration/`.
+- `python -m upeftguard.cli experiment backdoor-detection-summaries` is a post-processing helper for completed supervised runs. It expects run ids to follow the current manifest naming conventions under `manifests/zero_shots/`, `manifests/leave_one_out/`, `manifests/rank_exploration/`, `manifests/adapter_exploration/`, and `manifests/architecture_exploration/`.
 - `python -m upeftguard.utilities.maintenance.backfill_dataset_reference_reports --root <feature_extract_root>` can recreate missing dataset-reference reports for older feature and merge outputs.
 - `python -m upeftguard.utilities.maintenance.backfill_spectral_metadata --root <feature_extract_root>` rewrites older spectral metadata files into the current public/internal sidecar layout.

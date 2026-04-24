@@ -658,6 +658,175 @@ def _raw_metric_text(value: Any) -> str:
     return f"{float(value):.3f}"
 
 
+def _params_text(params: Any) -> str:
+    if not isinstance(params, dict) or not params:
+        return "-"
+    return ", ".join(f"{key}={params[key]}" for key in sorted(params))
+
+
+def _metric_value(row: dict[str, Any], key: str) -> float | None:
+    value = row.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_tuning_selection_summary(report: dict[str, Any]) -> dict[str, Any] | None:
+    tuning = report.get("tuning")
+    if not isinstance(tuning, dict):
+        return None
+    winner = tuning.get("winner")
+    if not isinstance(winner, dict):
+        return None
+
+    candidates = tuning.get("candidates")
+    candidate_rows = [row for row in candidates if isinstance(row, dict)] if isinstance(candidates, list) else []
+    ok_candidates = [
+        row
+        for row in candidate_rows
+        if row.get("status") == "ok" and _metric_value(row, "selection_metric_mean") is not None
+    ]
+    ok_candidates.sort(
+        key=lambda row: (
+            -float(row["selection_metric_mean"]),
+            float(row.get("selection_metric_std") or 0.0),
+            int(row.get("complexity_rank") or 0),
+            int(row.get("task_index") or 0),
+        )
+    )
+
+    cnn_hyperparams = tuning.get("cnn_hyperparams")
+    n_candidates = None
+    if isinstance(cnn_hyperparams, dict):
+        n_candidates = cnn_hyperparams.get("n_candidates")
+    if n_candidates is None:
+        n_candidates = tuning.get("tasks_total")
+    if n_candidates is None and candidate_rows:
+        n_candidates = len(candidate_rows)
+
+    metric_name = (
+        winner.get("selection_metric_name")
+        or tuning.get("metric")
+        or tuning.get("selection_metric_name")
+    )
+
+    summary = {
+        "metric": metric_name,
+        "execution_mode": tuning.get("execution_mode") or winner.get("execution_mode"),
+        "n_candidates": n_candidates,
+        "cv_folds_resolved": tuning.get("cv_folds_resolved"),
+        "estimated_total_fits": tuning.get("estimated_total_fits"),
+        "winner": {
+            "task_index": winner.get("task_index"),
+            "model_name": winner.get("model_name") or tuning.get("model_name"),
+            "params": winner.get("params"),
+            "status": winner.get("status"),
+            "selection_metric_name": metric_name,
+            "selection_metric_mean": winner.get("selection_metric_mean"),
+            "selection_metric_std": winner.get("selection_metric_std"),
+            "accuracy_mean": winner.get("accuracy_mean"),
+            "accuracy_std": winner.get("accuracy_std"),
+            "fold_results": winner.get("fold_results") if isinstance(winner.get("fold_results"), list) else [],
+        },
+        "top_candidates": [
+            {
+                "rank": index + 1,
+                "task_index": row.get("task_index"),
+                "model_name": row.get("model_name"),
+                "params": row.get("params"),
+                "selection_metric_name": row.get("selection_metric_name") or metric_name,
+                "selection_metric_mean": row.get("selection_metric_mean"),
+                "selection_metric_std": row.get("selection_metric_std"),
+                "accuracy_mean": row.get("accuracy_mean"),
+                "accuracy_std": row.get("accuracy_std"),
+            }
+            for index, row in enumerate(ok_candidates[:5])
+        ],
+    }
+    return summary
+
+
+def _append_tuning_selection_section(
+    *,
+    lines: list[str],
+    tuning_selection: dict[str, Any] | None,
+) -> None:
+    if not isinstance(tuning_selection, dict):
+        return
+
+    winner = tuning_selection.get("winner")
+    if not isinstance(winner, dict):
+        return
+
+    lines.append("## Cross-Validation Selection")
+    lines.append("")
+    lines.append("| Model | Task | Candidates | Mode | Metric | CV Mean | CV Std | CV Accuracy |")
+    lines.append("| --- | ---: | ---: | --- | --- | ---: | ---: | ---: |")
+    lines.append(
+        "| {model} | {task_index} | {n_candidates} | {mode} | {metric} | {mean} | {std} | {accuracy} |".format(
+            model=str(winner.get("model_name") or "-"),
+            task_index="-" if winner.get("task_index") is None else int(winner.get("task_index")),
+            n_candidates="-" if tuning_selection.get("n_candidates") is None else int(tuning_selection["n_candidates"]),
+            mode=str(tuning_selection.get("execution_mode") or "-"),
+            metric=str(winner.get("selection_metric_name") or tuning_selection.get("metric") or "-"),
+            mean=_raw_metric_text(winner.get("selection_metric_mean")),
+            std=_raw_metric_text(winner.get("selection_metric_std")),
+            accuracy=_raw_metric_text(winner.get("accuracy_mean")),
+        )
+    )
+    lines.append("")
+
+    params = winner.get("params")
+    if isinstance(params, dict) and params:
+        lines.append(f"Selected params: `{_params_text(params)}`.")
+        lines.append("")
+
+    fold_results = winner.get("fold_results")
+    if isinstance(fold_results, list) and fold_results:
+        lines.append("| Fold | Train N | Valid N | Metric | Accuracy |")
+        lines.append("| ---: | ---: | ---: | ---: | ---: |")
+        for index, row in enumerate(fold_results, start=1):
+            if not isinstance(row, dict):
+                continue
+            metric_value = row.get("selection_metric")
+            if metric_value is None:
+                metric_value = row.get(str(winner.get("selection_metric_name") or ""))
+            lines.append(
+                "| {fold} | {n_train} | {n_valid} | {metric} | {accuracy} |".format(
+                    fold=index,
+                    n_train=int(row.get("n_train", 0)),
+                    n_valid=int(row.get("n_valid", 0)),
+                    metric=_raw_metric_text(metric_value),
+                    accuracy=_raw_metric_text(row.get("accuracy")),
+                )
+            )
+        lines.append("")
+
+    top_candidates = tuning_selection.get("top_candidates")
+    if isinstance(top_candidates, list) and top_candidates:
+        lines.append("### Top CV Candidates")
+        lines.append("")
+        lines.append("| Rank | Task | CV Mean | CV Std | CV Accuracy | Params |")
+        lines.append("| ---: | ---: | ---: | ---: | ---: | --- |")
+        for row in top_candidates:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                "| {rank} | {task_index} | {mean} | {std} | {accuracy} | `{params}` |".format(
+                    rank=int(row.get("rank", 0)),
+                    task_index="-" if row.get("task_index") is None else int(row.get("task_index")),
+                    mean=_raw_metric_text(row.get("selection_metric_mean")),
+                    std=_raw_metric_text(row.get("selection_metric_std")),
+                    accuracy=_raw_metric_text(row.get("accuracy_mean")),
+                    params=_params_text(row.get("params")),
+                )
+            )
+        lines.append("")
+
+
 def _partition_counts_from_report(
     report: dict[str, Any],
     *,
@@ -747,6 +916,20 @@ def _multiclass_partition_summary_from_report(
 ) -> dict[str, Any] | None:
     multiclass_assessment = report.get("multiclass_assessment", {})
     partition = multiclass_assessment.get(partition_name)
+    if not isinstance(partition, dict):
+        return None
+    return dict(partition)
+
+
+def _open_set_partition_summary_from_report(
+    report: dict[str, Any],
+    *,
+    partition_name: str,
+) -> dict[str, Any] | None:
+    open_set_assessment = report.get("open_set_assessment", {})
+    if not isinstance(open_set_assessment, dict):
+        return None
+    partition = open_set_assessment.get(partition_name)
     if not isinstance(partition, dict):
         return None
     return dict(partition)
@@ -957,6 +1140,7 @@ def build_supervised_results_summary(
     if task_mode == _SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS:
         binary_partitions: dict[str, Any] = {}
         class_partitions: dict[str, Any] = {}
+        open_set_partitions: dict[str, Any] = {}
         for partition_name in ("train", "calibration", "inference"):
             binary_partition = _binary_partition_summary_from_report(
                 report,
@@ -970,6 +1154,19 @@ def build_supervised_results_summary(
             )
             if isinstance(class_partition, dict):
                 class_partitions[partition_name] = class_partition
+            open_set_partition = _open_set_partition_summary_from_report(
+                report,
+                partition_name=partition_name,
+            )
+            if isinstance(open_set_partition, dict):
+                open_set_partitions[partition_name] = open_set_partition
+
+        open_set_assessment = report.get("open_set_assessment", {})
+        open_set_config = (
+            open_set_assessment.get("config", {})
+            if isinstance(open_set_assessment, dict)
+            else {}
+        )
 
         return {
             "script_version": SCRIPT_VERSION,
@@ -979,6 +1176,7 @@ def build_supervised_results_summary(
             or report.get("tuning", {}).get("model_name"),
             "task_mode": task_mode,
             "selected_threshold_summary": selected_threshold_summary,
+            "tuning_selection": _build_tuning_selection_summary(report),
             "binary_classification": {
                 "score_definition": report.get("fit_assessment", {}).get("score_definition"),
                 "binary_projection": report.get("fit_assessment", {}).get("binary_projection"),
@@ -988,6 +1186,15 @@ def build_supervised_results_summary(
                 "class_names": list(report.get("task", {}).get("class_names", [])),
                 "partitions": class_partitions,
             },
+            "open_set_unknown": {
+                "config": dict(open_set_config) if isinstance(open_set_config, dict) else {},
+                "partitions": open_set_partitions,
+            },
+            "attack_analysis": (
+                report.get("attack_analysis", {}).get("inference")
+                if isinstance(report.get("attack_analysis"), dict)
+                else None
+            ),
         }
 
     sample_identities = _infer_sample_identities_for_run(
@@ -1055,6 +1262,7 @@ def build_supervised_results_summary(
         "model_name": report.get("tuning", {}).get("winner", {}).get("model_name")
         or report.get("tuning", {}).get("model_name"),
         "selected_threshold_summary": selected_threshold_summary,
+        "tuning_selection": _build_tuning_selection_summary(report),
         "inference_overview": inference_overview,
         "dataset_analysis": dataset_analysis,
         "attack_analysis": attack_analysis,
@@ -1191,6 +1399,72 @@ def _append_multiclass_per_class_table(
     lines.append("")
 
 
+def _append_open_set_overview_table(
+    *,
+    lines: list[str],
+    open_set_unknown: dict[str, Any],
+) -> None:
+    partitions = open_set_unknown.get("partitions", {})
+    if not isinstance(partitions, dict) or not partitions:
+        return
+    lines.append("## Open-Set Unknown Attack")
+    lines.append("")
+    config = open_set_unknown.get("config", {})
+    if isinstance(config, dict) and config:
+        lines.append(
+            "Unknown attack rule: clean below backdoor-score threshold "
+            f"`{_raw_metric_text(config.get('attack_threshold'))}`; otherwise `unknown_attack` "
+            "when known-attack confidence is below "
+            f"`{_raw_metric_text(config.get('known_attack_confidence_threshold'))}`."
+        )
+        lines.append("")
+    lines.append("| Partition | Accuracy | Macro F1 | Micro F1 | Unknown Predictions |")
+    lines.append("| --- | ---: | ---: | ---: | ---: |")
+    for partition_name in ("train", "calibration", "inference"):
+        summary = partitions.get(partition_name)
+        if not isinstance(summary, dict):
+            continue
+        lines.append(
+            "| {partition} | {accuracy} | {macro_f1} | {micro_f1} | {unknown_predictions} |".format(
+                partition=partition_name,
+                accuracy=_raw_metric_text(summary.get("accuracy")),
+                macro_f1=_raw_metric_text(summary.get("macro_f1")),
+                micro_f1=_raw_metric_text(summary.get("micro_f1")),
+                unknown_predictions=int(summary.get("n_unknown_attack_predictions", 0)),
+            )
+        )
+    lines.append("")
+
+
+def _append_open_set_per_class_table(
+    *,
+    lines: list[str],
+    partition_name: str,
+    partition_summary: dict[str, Any],
+) -> None:
+    per_class = partition_summary.get("per_class")
+    if not isinstance(per_class, list) or not per_class:
+        return
+    lines.append(f"## Open-Set Per-Class {partition_name.capitalize()}")
+    lines.append("")
+    lines.append("| Class | Support | Predicted | Precision | Recall | F1 |")
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
+    for row in per_class:
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            "| {class_name} | {support} | {predicted_count} | {precision} | {recall} | {f1} |".format(
+                class_name=str(row.get("class_name", "unknown")),
+                support=int(row.get("support", 0)),
+                predicted_count=int(row.get("predicted_count", 0)),
+                precision=_raw_metric_text(row.get("precision")),
+                recall=_raw_metric_text(row.get("recall")),
+                f1=_raw_metric_text(row.get("f1")),
+            )
+        )
+    lines.append("")
+
+
 def _build_multiclass_supervised_results_markdown(
     *,
     summary: dict[str, Any],
@@ -1202,14 +1476,36 @@ def _build_multiclass_supervised_results_markdown(
     lines.append(f"Run: `{run_dir}`")
     lines.append("")
 
+    _append_tuning_selection_section(
+        lines=lines,
+        tuning_selection=summary.get("tuning_selection"),
+    )
     _append_multiclass_binary_partition_table(
         lines=lines,
         binary_classification=summary.get("binary_classification", {}),
     )
+    attack_analysis = summary.get("attack_analysis", {})
+    attacks = attack_analysis.get("attacks", {}) if isinstance(attack_analysis, dict) else {}
+    if attacks:
+        _append_group_table(
+            lines=lines,
+            title="Per Attack",
+            group_label="Attack",
+            grouped=attacks,
+            note=attack_analysis.get("grouping_rule")
+            if isinstance(attack_analysis, dict)
+            else None,
+        )
     _append_multiclass_overview_table(
         lines=lines,
         class_results=summary.get("class_results", {}),
     )
+    open_set_unknown = summary.get("open_set_unknown", {})
+    if isinstance(open_set_unknown, dict):
+        _append_open_set_overview_table(
+            lines=lines,
+            open_set_unknown=open_set_unknown,
+        )
     partitions = summary.get("class_results", {}).get("partitions", {})
     if isinstance(partitions, dict):
         for partition_name in ("train", "inference"):
@@ -1220,6 +1516,19 @@ def _build_multiclass_supervised_results_markdown(
                     partition_name=partition_name,
                     partition_summary=partition_summary,
                 )
+    open_set_partitions = (
+        open_set_unknown.get("partitions", {})
+        if isinstance(open_set_unknown, dict)
+        else {}
+    )
+    if isinstance(open_set_partitions, dict):
+        partition_summary = open_set_partitions.get("inference")
+        if isinstance(partition_summary, dict):
+            _append_open_set_per_class_table(
+                lines=lines,
+                partition_name="inference",
+                partition_summary=partition_summary,
+            )
 
     return "\n".join(line for line in lines if line is not None).rstrip() + "\n"
 
@@ -1250,6 +1559,11 @@ def build_supervised_results_markdown(
         )
         lines.append(f"Selected-threshold method: `{method}` with accepted FPRs `{fpr_text}`.")
     lines.append("")
+
+    _append_tuning_selection_section(
+        lines=lines,
+        tuning_selection=summary.get("tuning_selection"),
+    )
 
     inference_overview = summary.get("inference_overview")
     if isinstance(inference_overview, dict):
@@ -1349,6 +1663,12 @@ def _summary_payload_for_report(summary: dict[str, Any], markdown_path: Path) ->
         payload["binary_classification"] = summary.get("binary_classification")
     if "class_results" in summary:
         payload["class_results"] = summary.get("class_results")
+    if "open_set_unknown" in summary:
+        payload["open_set_unknown"] = summary.get("open_set_unknown")
+    if "attack_analysis" in summary:
+        payload["attack_analysis"] = summary.get("attack_analysis")
+    if "tuning_selection" in summary:
+        payload["tuning_selection"] = summary.get("tuning_selection")
     return payload
 
 

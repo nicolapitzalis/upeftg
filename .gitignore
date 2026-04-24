@@ -7,14 +7,10 @@ __pycache__/
 venv/
 
 # Project data and logs
-data
+/data
 logs/
 runs/
 *.log
-manifests/*
-!manifests/cnn_hyperparams/
-manifests/cnn_hyperparams/*
-!manifests/cnn_hyperparams/*.json
 
 # Generated artifacts
 *_results*/

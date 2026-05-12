@@ -4,7 +4,7 @@ set -euo pipefail
 if [[ -n "${REPO_ROOT:-}" ]]; then
   REPO_ROOT="$(cd "${REPO_ROOT}" && pwd -P)"
 else
-  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 fi
 cd "${REPO_ROOT}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-${REPO_ROOT}/.mplconfig}"

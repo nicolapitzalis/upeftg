@@ -42,6 +42,7 @@ The environment includes `torch`, which is required for the CNN supervised model
 - `upeftguard/utilities`: compatibility shims for legacy flat utility imports
 - `upeftguard/cli.py`: unified CLI entrypoint
 - `sbatch/`: Slurm submission scripts
+- `scripts/experiments/`: runnable experiment recipes built on top of the CLI and Slurm launchers
 
 ## Manifest Layout
 

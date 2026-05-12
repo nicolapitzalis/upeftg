@@ -4,7 +4,7 @@ set -euo pipefail
 if [[ -n "${REPO_ROOT:-}" ]]; then
   REPO_ROOT="$(cd "${REPO_ROOT}" && pwd -P)"
 else
-  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
 fi
 cd "${REPO_ROOT}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-${REPO_ROOT}/.mplconfig}"
@@ -28,8 +28,8 @@ DRY_RUN=${DRY_RUN:-0}
 CLASS_WEIGHT_LOSS=${CLASS_WEIGHT_LOSS:-0}
 RANK_LABEL_WEIGHT_LOSS=${RANK_LABEL_WEIGHT_LOSS:-0}
 
-RUN_ID=${RUN_ID:-grouped_cnn_tbh_all_architectures}
-MANIFEST_JSON=${MANIFEST_JSON:-${REPO_ROOT}/manifests/architecture_exploration/tbh_all_architectures.json}
+RUN_ID=${RUN_ID:-grouped_cnn_tbh_all_adapters}
+MANIFEST_JSON=${MANIFEST_JSON:-${REPO_ROOT}/manifests/adapter_exploration/llama2_7b_tbh_all_adapters.json}
 FEATURE_FILE=${FEATURE_FILE:-${REPO_ROOT}/runs/feature_extract/list2_features-merged-cnn/merged/spectral_features.npy}
 CNN_HYPERPARAMS=${CNN_HYPERPARAMS:-${REPO_ROOT}/manifests/cnn_hyperparams/cnn_1d_single_dataset_small_grid.json}
 
@@ -88,7 +88,7 @@ if [[ "${RANK_LABEL_WEIGHT_LOSS}" == "1" || "${RANK_LABEL_WEIGHT_LOSS,,}" == "tr
 fi
 
 echo "Submitting ${RUN_ID} from ${MANIFEST_JSON}"
-echo "Note: this uses TBH architectures present in the current CNN feature bundle; roberta is IMDB-only and llama3_8b is not present there."
+echo "Note: LoRA, DoRA, and QLoRA use rank256; LoRA+ and AdaLoRA use the available rank8 TBH runs."
 "${COMMON_ARGS[@]}" \
   --manifest-json "${MANIFEST_JSON}" \
   --run-id "${RUN_ID}"

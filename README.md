@@ -484,6 +484,19 @@ Synthetic role buckets are emitted as normal block names so downstream tooling c
 - `role.qv_sum`
 - `role.other`
 
+For CNN supervised runs, create a layer-sequence aggregation instead of the default flat aggregation:
+
+```bash
+python -m upeftguard.cli util aggregate-features \
+  --feature-file <RUN_ID_OR_PATH> \
+  --output-filename <CNN_RUN_OUT> \
+  --layout layer_sequence \
+  --features energy kurtosis l1_norm l2_norm linf_norm mean_abs concentration_of_energy sv_topk stable_rank spectral_entropy effective_rank \
+  --spectral-qv-sum-mode append
+```
+
+`cnn_1d` expects this `architecture_independent_layer_sequence_aggregation` representation, including the generated `group_mask`, `value_mask`, and `group_names` companion files. Use the resulting `<CNN_RUN_OUT>` as the supervised `--feature-file`.
+
 The aggregated output still writes the usual companion artifacts under `runs/feature_extract/<RUN_OUT>/merged/`:
 - `spectral_features.npy`
 - `spectral_model_names.json`

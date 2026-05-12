@@ -87,6 +87,7 @@ class ExperimentCliTests(unittest.TestCase):
             "backdoor-detection-summaries",
             "supervised-slurm",
             "prepare-attack-family-leave-one-out",
+            "prepare-group-leave-one-out",
             "supervised-cnn-suite",
         ]
 
@@ -5783,6 +5784,7 @@ class TestCliAndPipeline(unittest.TestCase):
         expected_counts = {
             "adaboost": 32,
             "cnn_1d": 64,
+            "cnn_1d_dann": 64,
             "kernel_svm": 40,
             "linear_svm": 12,
             "logistic_regression": 12,
@@ -5792,6 +5794,7 @@ class TestCliAndPipeline(unittest.TestCase):
         expected_policies = {
             "adaboost": "passthrough",
             "cnn_1d": "masked_train_only",
+            "cnn_1d_dann": "masked_train_only",
             "kernel_svm": "standard_scaler",
             "linear_svm": "standard_scaler",
             "logistic_regression": "standard_scaler",
@@ -5806,13 +5809,13 @@ class TestCliAndPipeline(unittest.TestCase):
             self.assertEqual(len(params), expected_count)
             self.assertEqual(normalization_policy(model_name), expected_policies[model_name])
 
-            if model_name == "cnn_1d":
+            if model_name in {"cnn_1d", "cnn_1d_dann"}:
                 if torch is None:
                     with self.assertRaises(ModuleNotFoundError):
                         create(model_name, params=params[0], random_state=42)
                 else:
                     model_obj = create(model_name, params=params[0], random_state=42)
-                    self.assertEqual(type(model_obj).__name__, "CNN1DSupervisedModel")
+                    self.assertIn(type(model_obj).__name__, {"CNN1DSupervisedModel", "CNN1DDANNSupervisedModel"})
                 continue
 
             pipeline = create(model_name, params=params[0], random_state=42)

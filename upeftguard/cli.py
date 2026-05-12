@@ -18,9 +18,19 @@ from .features.spectral import (
     DEFAULT_SPECTRAL_QV_SUM_MODE,
     SUPPORTED_SPECTRAL_ENTRYWISE_DELTA_MODES,
 )
-from .supervised.pipeline import run_supervised_pipeline
+from .supervised.pipeline import (
+    DANN_DEFAULT_LAMBDA_GAMMA,
+    DANN_DEFAULT_LAMBDA_MAX,
+    DANN_DEFAULT_LR_ALPHA,
+    DANN_DEFAULT_LR_BETA,
+    DANN_DEFAULT_SOURCE_RANK,
+    DANN_DEFAULT_TARGET_ADAPTATION_PERCENT,
+    SUPPORTED_SELECTION_METRICS,
+    run_supervised_pipeline,
+)
 from .supervised.registry import default_cnn_hyperparams_path, registered_models
 from .unsupervised.analysis import (
+    run_supervised_cnn_feature_tsne_pipeline,
     run_unsupervised_layer_scatter_pipeline,
     run_unsupervised_rank_feature_values_pipeline,
     run_unsupervised_tsne_pipeline,
@@ -68,6 +78,10 @@ EXPERIMENT_COMMANDS: dict[str, tuple[str, str]] = {
     "prepare-attack-family-leave-one-out": (
         "upeftguard.experiments.attack_family_leave_one_out",
         "Generate attack-family leave-one-out manifests",
+    ),
+    "prepare-group-leave-one-out": (
+        "upeftguard.experiments.group_leave_one_out",
+        "Generate adapter or architecture leave-one-out manifests",
     ),
     "supervised-cnn-suite": (
         "upeftguard.experiments.supervised_cnn_suite",
@@ -265,6 +279,32 @@ def _cmd_run_unsupervised_tsne(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_run_unsupervised_cnn_tsne(args: argparse.Namespace) -> int:
+    output_root = _resolve_output_root(args.output_root, "run_unsupervised_cnn_tsne")
+    result = run_supervised_cnn_feature_tsne_pipeline(
+        run_dir=args.run_dir,
+        output_root=output_root,
+        run_id=args.run_id,
+        perplexity=args.perplexity,
+        learning_rate=args.learning_rate,
+        max_iter=args.max_iter,
+        metric=args.metric,
+        init=args.init,
+        random_state=args.random_state,
+        standardize=args.standardize,
+        point_size=args.point_size,
+        alpha=args.alpha,
+    )
+
+    print("Run complete")
+    print(f"Run dir: {result['run_dir']}")
+    print(f"Report: {result['report']}")
+    print(f"Plots: {result['plot_dir']}")
+    print(f"Embeddings: {result['embedding_dir']}")
+    print(f"Rows: {result['row_metadata']}")
+    return 0
+
+
 def _cmd_run_unsupervised_layer_scatter(args: argparse.Namespace) -> int:
     output_root = _resolve_output_root(args.output_root, "run_unsupervised_layer_scatter")
     result = run_unsupervised_layer_scatter_pipeline(
@@ -349,7 +389,16 @@ def _cmd_run_supervised(args: argparse.Namespace) -> int:
             list(args.multiclass_attack_names) if args.multiclass_attack_names is not None else None
         ),
         cnn_hyperparams=args.cnn_hyperparams,
+        dann_source_rank=args.dann_source_rank,
+        dann_target_adaptation_percent=args.dann_target_adaptation_percent,
+        dann_lambda_max=args.dann_lambda_max,
+        dann_lambda_gamma=args.dann_lambda_gamma,
+        dann_lr_alpha=args.dann_lr_alpha,
+        dann_lr_beta=args.dann_lr_beta,
+        class_weight_loss=args.class_weight_loss,
+        rank_label_weight_loss=args.rank_label_weight_loss,
         skip_feature_importance=args.skip_feature_importance,
+        selection_metric=args.selection_metric,
         feature_file=args.feature_file,
     )
 
@@ -742,6 +791,34 @@ def build_parser() -> argparse.ArgumentParser:
     )
     unsupervised_tsne.set_defaults(func=_cmd_run_unsupervised_tsne, standardize=True)
 
+    unsupervised_cnn_tsne = run_sub.add_parser(
+        "unsupervised-cnn-tsne",
+        help="Run t-SNE over a finalized supervised CNN feature extractor",
+    )
+    unsupervised_cnn_tsne.add_argument(
+        "--run-dir",
+        type=Path,
+        required=True,
+        help="Completed supervised CNN run directory containing reports/tuning_manifest.json and models/best_model.pt",
+    )
+    unsupervised_cnn_tsne.add_argument("--output-root", type=Path, default=Path("runs"))
+    unsupervised_cnn_tsne.add_argument("--run-id", type=str, default=None)
+    unsupervised_cnn_tsne.add_argument("--perplexity", type=float, default=30.0)
+    unsupervised_cnn_tsne.add_argument("--learning-rate", type=_parse_learning_rate, default="auto")
+    unsupervised_cnn_tsne.add_argument("--max-iter", type=int, default=1000)
+    unsupervised_cnn_tsne.add_argument("--metric", type=str, default="euclidean")
+    unsupervised_cnn_tsne.add_argument("--init", choices=["pca", "random"], default="pca")
+    unsupervised_cnn_tsne.add_argument("--random-state", type=int, default=None)
+    unsupervised_cnn_tsne.add_argument("--point-size", type=float, default=28.0)
+    unsupervised_cnn_tsne.add_argument("--alpha", type=float, default=0.85)
+    unsupervised_cnn_tsne.add_argument(
+        "--no-standardize",
+        action="store_false",
+        dest="standardize",
+        help="Disable feature standardization before t-SNE",
+    )
+    unsupervised_cnn_tsne.set_defaults(func=_cmd_run_unsupervised_cnn_tsne, standardize=True)
+
     unsupervised_layer_scatter = run_sub.add_parser(
         "unsupervised-layer-scatter",
         help="Save per-feature layer-vs-value scatter and box plots for a feature bundle",
@@ -887,6 +964,47 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     supervised.add_argument(
+        "--dann-source-rank",
+        type=int,
+        default=DANN_DEFAULT_SOURCE_RANK,
+        help="Source rank expected in the cnn_1d_dann manifest train split.",
+    )
+    supervised.add_argument(
+        "--dann-target-adaptation-percent",
+        "--dann-adaptation-percent",
+        dest="dann_target_adaptation_percent",
+        type=int,
+        default=DANN_DEFAULT_TARGET_ADAPTATION_PERCENT,
+        help=(
+            "Deprecated compatibility option. cnn_1d_dann now derives seen training ranks and "
+            "zero-shot inference ranks from the joint manifest train/infer partitions."
+        ),
+    )
+    supervised.add_argument(
+        "--dann-lambda-max",
+        type=float,
+        default=DANN_DEFAULT_LAMBDA_MAX,
+        help="Maximum gradient-reversal strength for cnn_1d_dann.",
+    )
+    supervised.add_argument(
+        "--dann-lambda-gamma",
+        type=float,
+        default=DANN_DEFAULT_LAMBDA_GAMMA,
+        help="Logistic schedule gamma for cnn_1d_dann gradient reversal.",
+    )
+    supervised.add_argument(
+        "--dann-lr-alpha",
+        type=float,
+        default=DANN_DEFAULT_LR_ALPHA,
+        help="Deprecated compatibility option; cnn_1d_dann now uses a fixed learning rate.",
+    )
+    supervised.add_argument(
+        "--dann-lr-beta",
+        type=float,
+        default=DANN_DEFAULT_LR_BETA,
+        help="Deprecated compatibility option; cnn_1d_dann now uses a fixed learning rate.",
+    )
+    supervised.add_argument(
         "--features",
         nargs="+",
         default=None,
@@ -911,6 +1029,16 @@ def build_parser() -> argparse.ArgumentParser:
     supervised.add_argument("--stream-block-size", type=int, default=131072)
     supervised.add_argument("--dtype", choices=["float32", "float64"], default="float32")
     supervised.add_argument("--cv-folds", type=int, default=5)
+    supervised.add_argument(
+        "--selection-metric",
+        choices=list(SUPPORTED_SELECTION_METRICS),
+        default="task_default",
+        help=(
+            "Metric used to choose the winning hyperparameters. task_default uses roc_auc for binary "
+            "tasks and macro_f1 for multiclass tasks; binary_auroc uses the clean-vs-any-attack "
+            "projection even for multiclass models."
+        ),
+    )
     supervised.add_argument("--random-state", type=int, default=42)
     supervised.add_argument(
         "--train-split",
@@ -929,7 +1057,21 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Apply folder/label-aware splitting instead of global label stratification. "
             "For single manifests this affects both the outer train/inference split and, when enabled, "
-            "the train/calibration split; for joint manifests it applies to calibration only."
+            "the train/calibration split; for joint manifests it applies to calibration when present. "
+            "When cross-validation is used, it also stratifies CV folds by folder and label."
+        ),
+    )
+    supervised.add_argument(
+        "--class-weight-loss",
+        action="store_true",
+        help="For CNN models, use class-balanced weights in the supervised label loss.",
+    )
+    supervised.add_argument(
+        "--rank-label-weight-loss",
+        action="store_true",
+        help=(
+            "For CNN models, weight supervised label loss so each observed (rank, label) bucket "
+            "contributes equally."
         ),
     )
     supervised.add_argument(

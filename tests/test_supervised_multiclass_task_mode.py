@@ -15,22 +15,33 @@ except Exception:
 
 from upeftguard.supervised import pipeline as pipeline_mod
 from upeftguard.supervised import registry as registry_mod
+from upeftguard.supervised.cnn import (
+    compute_balanced_class_loss_config,
+    compute_balanced_rank_label_loss_config,
+)
 from upeftguard.supervised.interfaces import (
     ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,
     ATTACK_FAMILY_MULTICLASS_ATTACKS,
     BINARY_PROJECTION_ONE_MINUS_CLEAN_PROBABILITY,
     SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS,
+    SupervisedFeatureBundle,
     SupervisedPredictionOutputs,
 )
 from upeftguard.supervised.pipeline import (
+    SELECTION_METRIC_BINARY_AUROC,
+    SELECTION_METRIC_MACRO_F1,
     OPEN_SET_UNKNOWN_ATTACK_NAME,
     _apply_open_set_unknown_attack_rule,
+    _build_cv_splits,
     _build_open_set_unknown_attack_config,
+    _folder_label_stratification_keys,
     _labels_from_items,
     _open_set_true_labels,
+    _resolve_selection_metric,
     _resolve_supervised_task_spec,
     run_supervised_pipeline,
 )
+from upeftguard.unsupervised.analysis import run_supervised_cnn_feature_tsne_pipeline
 from upeftguard.utilities.artifacts.spectral_metadata import write_spectral_metadata
 from upeftguard.utilities.core.manifest import ManifestItem, infer_attack_sample_identities
 
@@ -128,6 +139,51 @@ def build_multiclass_joint_rows(
                         "dataset_name": dataset_name,
                         "class_name": class_name,
                         "class_index": class_index,
+                    }
+                )
+
+    return train_entries, infer_entries, rows
+
+
+def build_rank_joint_rows(
+    *,
+    train_ranks: tuple[int, ...],
+    infer_ranks: tuple[int, ...],
+    train_per_label: int = 2,
+    infer_per_label: int = 1,
+) -> tuple[list[str], list[str], list[dict[str, Any]]]:
+    train_entries: list[str] = []
+    infer_entries: list[str] = []
+    rows: list[dict[str, Any]] = []
+
+    for rank in train_ranks:
+        subset_name = f"llama2_7b_toxic_backdoors_hard_rank{int(rank)}_qv"
+        for label in (0, 1):
+            for sample_idx in range(train_per_label):
+                model_name = f"{subset_name}_label{label}_{sample_idx}"
+                train_entries.append(f"{subset_name}/{model_name}")
+                rows.append(
+                    {
+                        "model_name": model_name,
+                        "dataset_name": "tbh",
+                        "class_name": "clean" if label == 0 else "backdoored",
+                        "class_index": label,
+                    }
+                )
+
+    for rank in infer_ranks:
+        subset_name = f"llama2_7b_toxic_backdoors_hard_rank{int(rank)}_qv"
+        for label in (0, 1):
+            for sample_idx in range(infer_per_label):
+                row_index = 100 + sample_idx
+                model_name = f"{subset_name}_label{label}_{row_index}"
+                infer_entries.append(f"{subset_name}/{model_name}")
+                rows.append(
+                    {
+                        "model_name": model_name,
+                        "dataset_name": "tbh",
+                        "class_name": "clean" if label == 0 else "backdoored",
+                        "class_index": label,
                     }
                 )
 
@@ -237,6 +293,142 @@ def build_layer_sequence_bundle(output_dir: Path, rows: list[dict[str, Any]]) ->
 
 
 class TestSupervisedMulticlassTaskMode(unittest.TestCase):
+    def test_split_by_folder_cv_uses_folder_label_strata(self):
+        items: list[ManifestItem] = []
+        labels: list[int] = []
+        for subset_name in ("rank16", "rank256"):
+            for label in (0, 1):
+                for sample_idx in range(6):
+                    items.append(make_manifest_item(subset_name, label, sample_idx))
+                    labels.append(label)
+
+        train_indices = np.arange(len(items), dtype=np.int64)
+        label_array = np.asarray(labels, dtype=np.int32)
+        strata = _folder_label_stratification_keys(
+            items=items,
+            candidate_indices=train_indices,
+            labels=label_array,
+        )
+        splits = _build_cv_splits(
+            train_indices=train_indices,
+            train_labels=strata,
+            cv_folds=3,
+            random_state=7,
+        )
+
+        for split in splits:
+            valid_indices = np.asarray(split["valid_indices"], dtype=np.int64)
+            valid_strata = strata[valid_indices]
+            unique, counts = np.unique(valid_strata, return_counts=True)
+            self.assertEqual(len(unique), 4)
+            self.assertEqual(set(counts.tolist()), {2})
+
+    def test_class_weight_loss_config_balances_binary_counts(self):
+        task_spec = _resolve_supervised_task_spec(task_mode="binary", multiclass_attack_names=None)
+        config = compute_balanced_class_loss_config(
+            np.asarray([0, 0, 0, 1], dtype=np.int32),
+            task_spec=task_spec,
+        )
+
+        self.assertEqual(config["class_counts"], [3, 1])
+        self.assertAlmostEqual(config["binary_pos_weight"], 3.0)
+        self.assertAlmostEqual(config["class_weights"][0], 2.0 / 3.0)
+        self.assertAlmostEqual(config["class_weights"][1], 2.0)
+
+    def test_rank_label_weight_loss_config_balances_rank_label_buckets(self):
+        task_spec = _resolve_supervised_task_spec(task_mode="binary", multiclass_attack_names=None)
+        weights, config = compute_balanced_rank_label_loss_config(
+            np.asarray([0, 0, 0, 1, 1, 1], dtype=np.int32),
+            np.asarray([256, 256, 256, 8, 8, 8], dtype=np.int32),
+            task_spec=task_spec,
+        )
+
+        self.assertEqual(config["class_counts"], [3, 3])
+        self.assertEqual(
+            [(row["rank"], row["label"], row["count"]) for row in config["rank_label_counts"]],
+            [(8, 1, 3), (256, 0, 3)],
+        )
+        self.assertTrue(np.allclose(weights, np.ones(6, dtype=np.float32)))
+
+        weights, config = compute_balanced_rank_label_loss_config(
+            np.asarray([0, 0, 0, 1], dtype=np.int32),
+            np.asarray([256, 256, 256, 8], dtype=np.int32),
+            task_spec=task_spec,
+        )
+        self.assertEqual(
+            [(row["rank"], row["label"], row["count"]) for row in config["rank_label_counts"]],
+            [(8, 1, 1), (256, 0, 3)],
+        )
+        self.assertTrue(np.allclose(weights, np.asarray([2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0, 2.0])))
+
+    def _prepare_rank_dann_manifest(
+        self,
+        tmp_path: Path,
+        *,
+        train_ranks: tuple[int, ...],
+        infer_ranks: tuple[int, ...],
+        run_id: str,
+    ) -> dict[str, Any]:
+        manifest_path = tmp_path / f"{run_id}.json"
+        train_entries, infer_entries, rows = build_rank_joint_rows(
+            train_ranks=train_ranks,
+            infer_ranks=infer_ranks,
+        )
+        write_joint_manifest_by_name(
+            manifest_path,
+            train_entries=train_entries,
+            infer_entries=infer_entries,
+        )
+        feature_path = build_layer_sequence_bundle(tmp_path / f"{run_id}_features", rows)
+        cnn_hyperparams_path = tmp_path / f"{run_id}_cnn_fixed.json"
+        cnn_hyperparams_path.write_text(
+            json.dumps(
+                {
+                    "conv_channels": [32],
+                    "num_conv_layers": [2],
+                    "kernel_size": [3],
+                    "dropout": [0.1],
+                    "learning_rate": [0.001],
+                    "weight_decay": [0.0],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return run_supervised_pipeline(
+            manifest_json=manifest_path,
+            dataset_root=tmp_path,
+            output_root=tmp_path / "runs",
+            run_id=run_id,
+            model_name="cnn_1d_dann",
+            spectral_features=["energy", "stable_rank"],
+            spectral_sv_top_k=1,
+            spectral_moment_source="sv",
+            spectral_qv_sum_mode="append",
+            spectral_entrywise_delta_mode="auto",
+            stream_block_size=131072,
+            dtype_name="float32",
+            cv_folds=2,
+            random_state=42,
+            train_split_percent=100,
+            calibration_split_percent=None,
+            accepted_fpr=None,
+            split_by_folder=False,
+            cv_random_states=[42],
+            n_jobs=1,
+            score_percentiles=[90.0],
+            feature_file=feature_path,
+            tuning_executor="local",
+            slurm_partition="extra",
+            slurm_max_concurrent="auto",
+            slurm_cpus_per_task="auto",
+            finalize_export_shards=1,
+            stage="prepare",
+            run_dir=None,
+            task_index=None,
+            cnn_hyperparams=cnn_hyperparams_path,
+        )
+
     def test_multiclass_label_mapping_uses_fixed_class_order_and_canonical_aliases(self):
         task_spec = _resolve_supervised_task_spec(
             task_mode=SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS,
@@ -438,6 +630,21 @@ class TestSupervisedMulticlassTaskMode(unittest.TestCase):
         self.assertTrue(task_spec.is_binary)
         self.assertEqual(task_spec.selection_metric_name, "roc_auc")
 
+    def test_multiclass_can_select_by_binary_auroc(self):
+        task_spec = _resolve_supervised_task_spec(
+            task_mode=SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS,
+            multiclass_attack_names=list(ATTACK_FAMILY_MULTICLASS_ATTACKS),
+        )
+        self.assertEqual(_resolve_selection_metric(None, task_spec=task_spec), SELECTION_METRIC_MACRO_F1)
+        self.assertEqual(
+            _resolve_selection_metric(SELECTION_METRIC_BINARY_AUROC, task_spec=task_spec),
+            SELECTION_METRIC_BINARY_AUROC,
+        )
+        self.assertEqual(
+            _resolve_selection_metric("roc_auc", task_spec=task_spec),
+            SELECTION_METRIC_BINARY_AUROC,
+        )
+
     def test_cnn_candidate_params_can_be_driven_by_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -488,6 +695,285 @@ class TestSupervisedMulticlassTaskMode(unittest.TestCase):
             )
             grid_params = registry_mod.candidate_params("cnn_1d", cnn_hyperparams=grid_path)
             self.assertEqual(len(grid_params), 2)
+
+    def test_supervised_prepare_builds_cnn_dann_rank_adversarial_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path = tmp_path / "rank_dann_joint_manifest.json"
+            train_entries: list[str] = []
+            infer_entries: list[str] = []
+            rows: list[dict[str, Any]] = []
+
+            for rank in (256, 8):
+                subset_name = f"llama2_7b_toxic_backdoors_hard_rank{rank}_qv"
+                for label in (0, 1):
+                    for sample_idx in range(2):
+                        model_name = f"{subset_name}_label{label}_{sample_idx}"
+                        train_entries.append(f"{subset_name}/{model_name}")
+                        rows.append(
+                            {
+                                "model_name": model_name,
+                                "dataset_name": "tbh",
+                                "class_name": "clean" if label == 0 else "backdoored",
+                                "class_index": label,
+                            }
+                        )
+
+            subset_name = "llama2_7b_toxic_backdoors_hard_rank16_qv"
+            for label in (0, 1):
+                model_name = f"{subset_name}_label{label}_0"
+                infer_entries.append(f"{subset_name}/{model_name}")
+                rows.append(
+                    {
+                        "model_name": model_name,
+                        "dataset_name": "tbh",
+                        "class_name": "clean" if label == 0 else "backdoored",
+                        "class_index": label,
+                    }
+                )
+
+            write_joint_manifest_by_name(
+                manifest_path,
+                train_entries=train_entries,
+                infer_entries=infer_entries,
+            )
+            external_dir = tmp_path / "external_layer_sequence"
+            feature_path = build_layer_sequence_bundle(external_dir, rows)
+            cnn_hyperparams_path = tmp_path / "cnn_fixed.json"
+            cnn_hyperparams_path.write_text(
+                json.dumps(
+                    {
+                        "conv_channels": [32],
+                        "num_conv_layers": [2],
+                        "kernel_size": [3],
+                        "dropout": [0.1],
+                        "learning_rate": [0.001],
+                        "weight_decay": [0.0],
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            prepared = run_supervised_pipeline(
+                manifest_json=manifest_path,
+                dataset_root=tmp_path,
+                output_root=tmp_path / "runs",
+                run_id="rank_dann_prepare",
+                model_name="cnn_1d_dann",
+                spectral_features=["energy", "stable_rank"],
+                spectral_sv_top_k=1,
+                spectral_moment_source="sv",
+                spectral_qv_sum_mode="append",
+                spectral_entrywise_delta_mode="auto",
+                stream_block_size=131072,
+                dtype_name="float32",
+                cv_folds=2,
+                random_state=42,
+                train_split_percent=100,
+                calibration_split_percent=None,
+                accepted_fpr=None,
+                split_by_folder=False,
+                cv_random_states=[42],
+                n_jobs=1,
+                score_percentiles=[90.0],
+                feature_file=feature_path,
+                tuning_executor="local",
+                slurm_partition="extra",
+                slurm_max_concurrent="auto",
+                slurm_cpus_per_task="auto",
+                finalize_export_shards=1,
+                stage="prepare",
+                run_dir=None,
+                task_index=None,
+                cnn_hyperparams=cnn_hyperparams_path,
+            )
+
+            tuning_manifest = load_json(Path(prepared["tuning_manifest"]))
+            domain = tuning_manifest["domain_adaptation"]
+            self.assertTrue(domain["enabled"])
+            self.assertEqual(domain["source_rank"], 256)
+            self.assertEqual(domain["train_ranks"], [256, 8])
+            self.assertEqual(domain["target_train_ranks"], [8])
+            self.assertEqual(domain["zero_shot_inference_ranks"], [16])
+            self.assertEqual(domain["domain_rank_values"], [256, 8])
+            self.assertEqual(domain["domain_class_names"], ["rank_256", "rank_8"])
+            self.assertEqual(domain["label_loss_scope"], "all_training_ranks")
+            self.assertEqual(domain["domain_loss_weight"], 1.0)
+            self.assertEqual(domain["lambda_schedule"]["gamma"], 10.0)
+            self.assertEqual(domain["learning_rate_schedule"]["type"], "fixed")
+            self.assertEqual(tuning_manifest["tuning"]["model_names"], ["cnn_1d_dann"])
+            self.assertEqual(len(tuning_manifest["tuning"]["tasks"]), 1)
+            self.assertEqual(tuning_manifest["tuning"]["execution_mode"], "singleton_no_cv")
+            self.assertEqual(tuning_manifest["tuning"]["tasks"][0]["params"]["source_rank"], 256)
+            self.assertNotIn("dann_target_adaptation_percent", tuning_manifest["tuning"]["tasks"][0]["params"])
+
+            domain_labels = np.load(domain["domain_labels_path"]).astype(np.int64)
+            self.assertEqual(domain_labels.tolist(), [0, 0, 0, 0, 1, 1, 1, 1, -1, -1])
+            self.assertEqual(domain["train_indices"], list(range(8)))
+            self.assertEqual(domain["source_train_indices"], [0, 1, 2, 3])
+            self.assertEqual(domain["target_train_indices"], [4, 5, 6, 7])
+            self.assertEqual(domain["inference_indices"], [8, 9])
+            self.assertEqual(tuning_manifest["data"]["train_indices"], list(range(8)))
+            self.assertEqual(tuning_manifest["data"]["infer_indices"], [8, 9])
+            self.assertFalse(
+                set(tuning_manifest["data"]["train_indices"]) & set(tuning_manifest["data"]["infer_indices"])
+            )
+            self.assertTrue(
+                any("rank-adversarial supervised training" in str(x) for x in tuning_manifest["warnings"])
+            )
+
+    def test_supervised_prepare_rejects_cnn_dann_without_source_rank_in_train(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with self.assertRaisesRegex(ValueError, "source rank"):
+                self._prepare_rank_dann_manifest(
+                    tmp_path,
+                    train_ranks=(8,),
+                    infer_ranks=(16,),
+                    run_id="rank_dann_missing_source",
+                )
+
+    def test_supervised_prepare_rejects_cnn_dann_without_target_train_rank(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with self.assertRaisesRegex(ValueError, "at least one non-source rank"):
+                self._prepare_rank_dann_manifest(
+                    tmp_path,
+                    train_ranks=(256,),
+                    infer_ranks=(16,),
+                    run_id="rank_dann_missing_target_train",
+                )
+
+    def test_supervised_prepare_rejects_cnn_dann_without_zero_shot_inference_rank(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with self.assertRaisesRegex(ValueError, "infer.*empty"):
+                self._prepare_rank_dann_manifest(
+                    tmp_path,
+                    train_ranks=(256, 8),
+                    infer_ranks=(),
+                    run_id="rank_dann_missing_zero_shot",
+                )
+
+    def test_supervised_prepare_rejects_cnn_dann_train_infer_rank_overlap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            with self.assertRaisesRegex(ValueError, "disjoint.*overlap"):
+                self._prepare_rank_dann_manifest(
+                    tmp_path,
+                    train_ranks=(256, 8),
+                    infer_ranks=(8,),
+                    run_id="rank_dann_rank_overlap",
+                )
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_cnn_checkpoint_roundtrip_restores_feature_extractor_embeddings(self):
+        from upeftguard.supervised.cnn import CNN1DSupervisedModel, load_cnn_checkpoint
+
+        rng = np.random.default_rng(321)
+        values = rng.normal(size=(6, 3, 2, 2)).astype(np.float32)
+        group_mask = np.ones((6, 3), dtype=bool)
+        value_mask = np.ones_like(values, dtype=bool)
+        bundle = SupervisedFeatureBundle(
+            values=values,
+            representation_kind=ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,
+            metadata={
+                "representation_kind": ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,
+                "depth_labels": [f"encoder.layer{i}" for i in range(3)],
+                "slot_names": ["self.q", "self.v"],
+                "emitted_feature_names": ["energy", "stable_rank"],
+            },
+            group_mask=group_mask,
+            value_mask=value_mask,
+            group_names=[[f"encoder.layer{i}" for i in range(3)] for _ in range(6)],
+        )
+        labels = np.asarray([0, 1, 0, 1, 0, 1], dtype=np.int32)
+        model = CNN1DSupervisedModel(
+            conv_channels=4,
+            num_conv_layers=1,
+            kernel_size=3,
+            dropout=0.0,
+            learning_rate=0.001,
+            weight_decay=0.0,
+            random_state=11,
+            max_epochs=2,
+            batch_size=3,
+            patience=2,
+        )
+        model.fit(bundle, labels)
+        before = model.extract_features(bundle)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_path = Path(tmp) / "best_model.pt"
+            model.save(checkpoint_path)
+            loaded = load_cnn_checkpoint(checkpoint_path)
+            after = loaded.extract_features(bundle)
+
+        self.assertEqual(before.shape, (6, 8))
+        self.assertEqual(after.shape, before.shape)
+        np.testing.assert_allclose(after, before, rtol=1e-6, atol=1e-6)
+
+    @unittest.skipIf(torch is None, "torch is not installed")
+    def test_cnn_dann_tiny_fit_uses_all_labels_by_default_and_rank_domains(self):
+        from upeftguard.supervised.cnn import CNN1DDANNSupervisedModel, load_cnn_checkpoint
+
+        rng = np.random.default_rng(123)
+        values = rng.normal(size=(8, 4, 2, 3)).astype(np.float32)
+        group_mask = np.ones((8, 4), dtype=bool)
+        value_mask = np.ones_like(values, dtype=bool)
+        bundle = SupervisedFeatureBundle(
+            values=values,
+            representation_kind=ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,
+            metadata={
+                "representation_kind": ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,
+                "depth_labels": [f"encoder.layer{i}" for i in range(4)],
+                "slot_names": ["self.q", "self.v"],
+                "emitted_feature_names": ["energy", "stable_rank", "sv1"],
+            },
+            group_mask=group_mask,
+            value_mask=value_mask,
+            group_names=[[f"encoder.layer{i}" for i in range(4)] for _ in range(8)],
+        )
+        labels = np.asarray([0, 1, 0, 1, 0, 1, 0, 1], dtype=np.int32)
+        domain_labels = np.asarray([0, 0, 0, 0, 1, 1, 2, 2], dtype=np.int64)
+
+        model = CNN1DDANNSupervisedModel(
+            conv_channels=4,
+            num_conv_layers=1,
+            kernel_size=3,
+            dropout=0.0,
+            learning_rate=0.001,
+            weight_decay=0.0,
+            random_state=7,
+            max_epochs=2,
+            batch_size=4,
+            patience=2,
+        )
+        model.fit(
+            bundle,
+            labels,
+            domain_labels=domain_labels,
+            domain_class_names=("rank_256", "rank_8", "rank_16"),
+            domain_rank_values=(256, 8, 16),
+        )
+
+        logits = model.decision_function(bundle)
+        self.assertEqual(logits.shape, (8,))
+        self.assertEqual(model.domain_class_names_, ("rank_256", "rank_8", "rank_16"))
+        self.assertEqual(model._fit_summary["domain_loss_weight"], 1.0)
+        self.assertEqual(model._fit_summary["label_loss_scope"], "all_training_ranks")
+        self.assertEqual(model._fit_summary["history"][-1]["domain_rows"], 8.0)
+        self.assertEqual(model._fit_summary["history"][-1]["label_rows"], 8.0)
+
+        before = model.extract_features(bundle)
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_path = Path(tmp) / "best_model.pt"
+            model.save(checkpoint_path)
+            loaded = load_cnn_checkpoint(checkpoint_path)
+            after = loaded.extract_features(bundle)
+        self.assertEqual(loaded.domain_class_names_, ("rank_256", "rank_8", "rank_16"))
+        self.assertEqual(after.shape, before.shape)
 
     def test_supervised_prepare_uses_fixed_cnn_hyperparams_json(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -712,6 +1198,71 @@ class TestSupervisedMulticlassTaskMode(unittest.TestCase):
             )
             self.assertNotIn("winner_feature_weights_coefficients_csv", artifact_index)
             self.assertFalse((run_dir / "reports" / "winner_feature_weights_coefficients.csv").exists())
+            with self.assertRaisesRegex(ValueError, "requires a CNN winner"):
+                run_supervised_cnn_feature_tsne_pipeline(
+                    run_dir=run_dir,
+                    output_root=tmp_path / "analysis_runs",
+                    run_id="not_cnn",
+                    max_iter=250,
+                )
+
+    def test_supervised_multiclass_pipeline_can_select_binary_auroc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path = tmp_path / "multiclass_binary_auroc_manifest.json"
+            train_entries, infer_entries, rows = build_multiclass_joint_rows(
+                train_per_dataset=2,
+                infer_per_dataset=1,
+            )
+            write_joint_manifest_by_name(
+                manifest_path,
+                train_entries=train_entries,
+                infer_entries=infer_entries,
+            )
+
+            result = run_supervised_pipeline(
+                manifest_json=manifest_path,
+                dataset_root=tmp_path,
+                output_root=tmp_path / "runs",
+                run_id="multiclass_binary_auroc",
+                model_name="logistic_regression",
+                spectral_features=["energy", "kurtosis"],
+                spectral_sv_top_k=1,
+                spectral_moment_source="sv",
+                spectral_qv_sum_mode="none",
+                spectral_entrywise_delta_mode="none",
+                stream_block_size=131072,
+                dtype_name="float32",
+                cv_folds=2,
+                random_state=42,
+                train_split_percent=100,
+                calibration_split_percent=None,
+                accepted_fpr=None,
+                split_by_folder=False,
+                cv_random_states=[42],
+                n_jobs=1,
+                score_percentiles=[90.0],
+                feature_file=build_tabular_bundle(tmp_path / "features", rows),
+                tuning_executor="local",
+                slurm_partition="cpu",
+                slurm_max_concurrent="1",
+                slurm_cpus_per_task="1",
+                finalize_export_shards=1,
+                stage="all",
+                run_dir=None,
+                task_index=None,
+                task_mode=SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS,
+                multiclass_attack_names=list(ATTACK_FAMILY_MULTICLASS_ATTACKS),
+                selection_metric=SELECTION_METRIC_BINARY_AUROC,
+            )
+
+            report = load_json(Path(result["run_dir"]) / "reports" / "supervised_report.json")
+            winner = report["tuning"]["winner"]
+            self.assertEqual(report["tuning"]["metric"], SELECTION_METRIC_BINARY_AUROC)
+            self.assertEqual(winner["selection_metric_name"], SELECTION_METRIC_BINARY_AUROC)
+            self.assertIn("binary_auroc_mean", winner)
+            self.assertIn("macro_f1_mean", winner)
+            self.assertAlmostEqual(winner["selection_metric_mean"], winner["binary_auroc_mean"])
 
     @unittest.skipIf(torch is None, "torch is not installed")
     def test_supervised_multiclass_pipeline_runs_with_cnn(self):
@@ -824,6 +1375,66 @@ class TestSupervisedMulticlassTaskMode(unittest.TestCase):
             self.assertTrue(
                 any("does not yet support feature-importance export" in str(x) for x in report["warnings"])
             )
+
+            tsne_result = run_supervised_cnn_feature_tsne_pipeline(
+                run_dir=run_dir,
+                output_root=tmp_path / "analysis_runs",
+                run_id="multiclass_cnn_feature_tsne",
+                perplexity=5.0,
+                max_iter=250,
+                random_state=7,
+            )
+            tsne_run_dir = Path(tsne_result["run_dir"])
+            tsne_report = load_json(Path(tsne_result["report"]))
+            tsne_artifacts = load_json(tsne_run_dir / "artifact_index.json")
+            embeddings = np.load(tsne_run_dir / "features" / "cnn_feature_embeddings.npy")
+            labels = np.load(tsne_run_dir / "features" / "cnn_feature_embedding_labels.npy")
+            rows = load_csv_rows(tsne_run_dir / "reports" / "cnn_feature_embedding_rows.csv")
+
+            self.assertEqual(embeddings.shape[0], report["data_info"]["n_train"] + report["data_info"]["n_inference"])
+            self.assertEqual(labels.shape[0], embeddings.shape[0])
+            self.assertEqual(len(rows), embeddings.shape[0])
+            clean_rows = [row for row in rows if row["task_label_name"] == "clean"]
+            backdoor_rows = [row for row in rows if row["task_label_name"] != "clean"]
+            self.assertTrue(clean_rows)
+            self.assertTrue(backdoor_rows)
+            self.assertTrue(all(row["effective_attack_name"] == "clean" for row in clean_rows))
+            self.assertTrue(
+                any(row["attack_name"] != "clean" and row["effective_attack_name"] == "clean" for row in clean_rows)
+            )
+            self.assertTrue(all(row["effective_attack_name"] == row["attack_name"] for row in backdoor_rows))
+            self.assertIn("head_projection", rows[0])
+            self.assertIn("head_margin", rows[0])
+            self.assertIn("prediction_entropy", rows[0])
+            self.assertEqual(tsne_report["analysis"], "supervised_cnn_feature_tsne")
+            self.assertEqual({view["view"] for view in tsne_report["views"]}, {"combined", "train", "inference"})
+            expected_attack_plot_counts = {
+                "combined": sum(row["binary_label"] == "1" for row in rows),
+                "train": sum(row["partition"] == "train" and row["binary_label"] == "1" for row in rows),
+                "inference": sum(row["partition"] == "inference" and row["binary_label"] == "1" for row in rows),
+            }
+            self.assertIn("cnn_feature_embeddings", tsne_artifacts)
+            self.assertIn("cnn_feature_tsne_report", tsne_artifacts)
+            self.assertIn("cnn_feature_score_plots", tsne_artifacts)
+            self.assertIn("cnn_feature_margin_plots", tsne_artifacts)
+            self.assertIn("cnn_feature_head_projection_plots", tsne_artifacts)
+            self.assertTrue(Path(tsne_report["artifacts"]["tsne_plot_dir"]).name == "tsne")
+            self.assertTrue(Path(tsne_report["artifacts"]["plot_dir"]).name == "cnn_feature_extractor")
+            behavior_plots = tsne_report["behavior_plots"]
+            self.assertTrue(Path(behavior_plots["scores"]["backdoor_score_histogram"]).exists())
+            self.assertTrue(Path(behavior_plots["scores"]["backdoor_score_ecdf"]).exists())
+            self.assertTrue(Path(behavior_plots["scores"]["backdoor_score_by_partition_and_label"]).exists())
+            self.assertTrue(Path(behavior_plots["margins"]["head_margin_histogram"]).exists())
+            self.assertTrue(Path(behavior_plots["head_projection"]["head_projection_scatter"]).exists())
+            for view in tsne_report["views"]:
+                self.assertIn("embedding_csv", view)
+                self.assertTrue(Path(view["embedding_csv"]).exists())
+                self.assertEqual(view["attack_plot_field"], "attack_name")
+                self.assertEqual(view["attack_plot_scope"], "backdoor_rows_only")
+                self.assertEqual(view["attack_plot_n_samples"], expected_attack_plot_counts[view["view"]])
+                coordinate_rows = load_csv_rows(Path(view["embedding_csv"]))
+                self.assertIn("effective_attack_name", coordinate_rows[0])
+                self.assertTrue(Path(view["plots"]["partition"]).exists())
 
 
 if __name__ == "__main__":

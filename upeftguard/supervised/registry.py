@@ -37,6 +37,8 @@ CNN_1D_HYPERPARAM_NAMES = (
     "learning_rate",
     "weight_decay",
 )
+CNN_1D_MODEL_NAME = "cnn_1d"
+CNN_1D_DANN_MODEL_NAME = "cnn_1d_dann"
 _CNN_1D_INTEGER_HYPERPARAMS = {"conv_channels", "num_conv_layers", "kernel_size"}
 _CNN_1D_FLOAT_HYPERPARAMS = {"dropout", "learning_rate", "weight_decay"}
 
@@ -189,6 +191,41 @@ def _create_cnn_1d(
         weight_decay=float(params["weight_decay"]),
         random_state=int(random_state),
         task_spec=task_spec,
+        class_weight_loss=bool(params.get("class_weight_loss", False)),
+        rank_label_weight_loss=bool(params.get("rank_label_weight_loss", False)),
+    )
+
+
+def _create_cnn_1d_dann(
+    params: dict[str, Any],
+    random_state: int,
+    task_spec: SupervisedTaskSpec | None,
+) -> Any:
+    from .cnn import CNN1DDANNSupervisedModel
+
+    return CNN1DDANNSupervisedModel(
+        conv_channels=int(params["conv_channels"]),
+        num_conv_layers=int(params["num_conv_layers"]),
+        kernel_size=int(params["kernel_size"]),
+        stride=1,
+        dilation=1,
+        dropout=float(params["dropout"]),
+        use_residual=True,
+        normalization="layernorm",
+        pooling="mean_max",
+        include_total_layer_count=True,
+        depth_feature_mode="both",
+        learning_rate=float(params["learning_rate"]),
+        weight_decay=float(params["weight_decay"]),
+        random_state=int(random_state),
+        task_spec=task_spec,
+        source_rank=int(params.get("source_rank", 256)),
+        dann_lambda_max=float(params.get("dann_lambda_max", 1.0)),
+        dann_lambda_gamma=float(params.get("dann_lambda_gamma", 10.0)),
+        dann_lr_alpha=float(params.get("dann_lr_alpha", 10.0)),
+        dann_lr_beta=float(params.get("dann_lr_beta", 0.75)),
+        class_weight_loss=bool(params.get("class_weight_loss", False)),
+        rank_label_weight_loss=bool(params.get("rank_label_weight_loss", False)),
     )
 
 
@@ -314,14 +351,24 @@ _REGISTRY: dict[str, ModelDefinition] = {
         ),
         supported_representation_kinds=TABULAR_REPRESENTATION_KINDS,
     ),
-    "cnn_1d": ModelDefinition(
-        name="cnn_1d",
+    CNN_1D_MODEL_NAME: ModelDefinition(
+        name=CNN_1D_MODEL_NAME,
         backend="cnn",
         complexity_rank=6,
         normalization_policy="masked_train_only",
         normalization_factory=_passthrough,
         param_grid=(),
         estimator_factory=_create_cnn_1d,
+        supported_representation_kinds=(ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,),
+    ),
+    CNN_1D_DANN_MODEL_NAME: ModelDefinition(
+        name=CNN_1D_DANN_MODEL_NAME,
+        backend="cnn",
+        complexity_rank=7,
+        normalization_policy="masked_train_only",
+        normalization_factory=_passthrough,
+        param_grid=(),
+        estimator_factory=_create_cnn_1d_dann,
         supported_representation_kinds=(ARCHITECTURE_INDEPENDENT_LAYER_SEQUENCE_KIND,),
     ),
 }
@@ -347,7 +394,7 @@ def candidate_params(
 ) -> list[dict[str, Any]]:
     if name not in _REGISTRY:
         raise ValueError(f"Unknown supervised model '{name}'. Registered: {sorted(_REGISTRY.keys())}")
-    if name == "cnn_1d":
+    if name in {CNN_1D_MODEL_NAME, CNN_1D_DANN_MODEL_NAME}:
         axes, _metadata = resolve_cnn_hyperparams(cnn_hyperparams)
         return [dict(params) for params in _grid(**axes)]
     return [dict(params) for params in _REGISTRY[name].param_grid]

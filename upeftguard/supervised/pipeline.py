@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 from time import perf_counter
 from typing import Any
 
@@ -84,6 +85,8 @@ from .interfaces import (
     TABULAR_SPECTRAL_REPRESENTATION_KIND,
 )
 from .registry import (
+    CNN_1D_DANN_MODEL_NAME,
+    CNN_1D_MODEL_NAME,
     candidate_params,
     create,
     model_backend,
@@ -107,6 +110,23 @@ OPEN_SET_KNOWN_ATTACK_MISS_RATE = 0.05
 GROUP_MASK_SUFFIX = "_group_mask.npy"
 VALUE_MASK_SUFFIX = "_value_mask.npy"
 GROUP_NAMES_SUFFIX = "_group_names.json"
+DANN_DEFAULT_SOURCE_RANK = 256
+DANN_DEFAULT_LAMBDA_MAX = 1.0
+DANN_DEFAULT_LAMBDA_GAMMA = 10.0
+DANN_DEFAULT_LR_ALPHA = 10.0
+DANN_DEFAULT_LR_BETA = 0.75
+DANN_DEFAULT_TARGET_ADAPTATION_PERCENT = 80
+SELECTION_METRIC_TASK_DEFAULT = "task_default"
+SELECTION_METRIC_ROC_AUC = "roc_auc"
+SELECTION_METRIC_MACRO_F1 = "macro_f1"
+SELECTION_METRIC_BINARY_AUROC = "binary_auroc"
+SUPPORTED_SELECTION_METRICS = (
+    SELECTION_METRIC_TASK_DEFAULT,
+    SELECTION_METRIC_ROC_AUC,
+    SELECTION_METRIC_MACRO_F1,
+    SELECTION_METRIC_BINARY_AUROC,
+)
+_RANK_TOKEN_RE = re.compile(r"(?:^|_)rank(\d+(?:\.\d+)?)(?:_|$)", re.IGNORECASE)
 
 
 def _default_binary_task_spec() -> SupervisedTaskSpec:
@@ -172,6 +192,26 @@ def _resolve_supervised_task_spec(
     if resolved_task_mode == SUPERVISED_TASK_MODE_ATTACK_FAMILY_MULTICLASS:
         return _resolve_attack_family_multiclass_task_spec(multiclass_attack_names)
     raise ValueError(f"Unsupported supervised task_mode={resolved_task_mode!r}")
+
+
+def _resolve_selection_metric(
+    selection_metric: str | None,
+    *,
+    task_spec: SupervisedTaskSpec,
+) -> str:
+    raw_metric = str(selection_metric or SELECTION_METRIC_TASK_DEFAULT).strip().lower()
+    if raw_metric in {"", "default", SELECTION_METRIC_TASK_DEFAULT}:
+        return str(task_spec.selection_metric_name)
+    if raw_metric not in SUPPORTED_SELECTION_METRICS:
+        raise ValueError(
+            f"Unsupported supervised selection metric {selection_metric!r}; expected one of "
+            f"{list(SUPPORTED_SELECTION_METRICS)}"
+        )
+    if raw_metric == SELECTION_METRIC_MACRO_F1 and task_spec.is_binary:
+        raise ValueError("--selection-metric macro_f1 is only supported for multiclass supervised tasks")
+    if raw_metric == SELECTION_METRIC_ROC_AUC:
+        return SELECTION_METRIC_ROC_AUC if task_spec.is_binary else SELECTION_METRIC_BINARY_AUROC
+    return raw_metric
 
 
 def _task_spec_from_payload(payload: Any) -> SupervisedTaskSpec:
@@ -1136,6 +1176,193 @@ def _build_calibration_stratified_split(
     return fit_train_indices, calibration_indices, warnings, split_summary
 
 
+def _rank_label_buckets(
+    *,
+    candidate_indices: np.ndarray,
+    ranks: np.ndarray,
+    labels: np.ndarray,
+) -> dict[tuple[int, int], list[int]]:
+    candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+    ranks_np = np.asarray(ranks, dtype=np.int64).reshape(-1)
+    labels_np = np.asarray(labels, dtype=np.int32).reshape(-1)
+    return {
+        (rank, label): [
+            int(i)
+            for i in candidate_indices.tolist()
+            if int(ranks_np[int(i)]) == int(rank) and int(labels_np[int(i)]) == int(label)
+        ]
+        for rank in sorted({int(ranks_np[int(i)]) for i in candidate_indices.tolist()})
+        for label in sorted(
+            {
+                int(labels_np[int(i)])
+                for i in candidate_indices.tolist()
+                if int(ranks_np[int(i)]) == int(rank)
+            }
+        )
+    }
+
+
+def _rank_label_stratification_keys(
+    *,
+    candidate_indices: np.ndarray,
+    ranks: np.ndarray,
+    labels: np.ndarray,
+) -> np.ndarray:
+    ranks_np = np.asarray(ranks, dtype=np.int64).reshape(-1)
+    labels_np = np.asarray(labels, dtype=np.int32).reshape(-1)
+    return np.asarray(
+        [
+            f"rank_{int(ranks_np[int(i)])}_label_{int(labels_np[int(i)])}"
+            for i in np.asarray(candidate_indices, dtype=np.int64).tolist()
+        ],
+        dtype=object,
+    )
+
+
+def _rank_label_stratification_warning(
+    *,
+    candidate_indices: np.ndarray,
+    ranks: np.ndarray,
+    labels: np.ndarray,
+    split_name: str,
+) -> str | None:
+    keys = _rank_label_stratification_keys(
+        candidate_indices=candidate_indices,
+        ranks=ranks,
+        labels=labels,
+    )
+    unique, counts = np.unique(keys, return_counts=True)
+    if unique.size < 2:
+        return (
+            f"cnn_1d_dann could not use rank-label stratification for {split_name}: "
+            "fewer than two rank-label buckets; falling back to label-only stratification"
+        )
+    min_count = int(np.min(counts))
+    if min_count < 2:
+        return (
+            f"cnn_1d_dann could not use rank-label stratification for {split_name}: "
+            f"smallest rank-label bucket has {min_count} row; falling back to label-only stratification"
+        )
+    return None
+
+
+def _folder_label_stratification_keys(
+    *,
+    items: list[Any],
+    candidate_indices: np.ndarray,
+    labels: np.ndarray,
+) -> np.ndarray:
+    labels_np = np.asarray(labels, dtype=np.int32).reshape(-1)
+    return np.asarray(
+        [
+            f"folder_{_split_folder_name(items[int(i)])}_label_{int(labels_np[int(i)])}"
+            for i in np.asarray(candidate_indices, dtype=np.int64).tolist()
+        ],
+        dtype=object,
+    )
+
+
+def _folder_label_stratification_warning(
+    *,
+    items: list[Any],
+    candidate_indices: np.ndarray,
+    labels: np.ndarray,
+    split_name: str,
+) -> str | None:
+    keys = _folder_label_stratification_keys(
+        items=items,
+        candidate_indices=candidate_indices,
+        labels=labels,
+    )
+    unique, counts = np.unique(keys, return_counts=True)
+    if unique.size < 2:
+        return (
+            f"Could not use folder-label stratification for {split_name}: "
+            "fewer than two folder-label buckets; falling back to label-only stratification"
+        )
+    min_count = int(np.min(counts))
+    if min_count < 2:
+        return (
+            f"Could not use folder-label stratification for {split_name}: "
+            f"smallest folder-label bucket has {min_count} row; falling back to label-only stratification"
+        )
+    return None
+
+
+def _build_calibration_rank_label_split(
+    *,
+    candidate_indices: np.ndarray,
+    ranks: np.ndarray,
+    labels: np.ndarray,
+    calibration_split_percent: int,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray, list[str], dict[str, Any]]:
+    candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+    bucket_to_indices = _rank_label_buckets(
+        candidate_indices=candidate_indices,
+        ranks=ranks,
+        labels=labels,
+    )
+    if len(bucket_to_indices) < 2:
+        raise ValueError("Rank-label calibration split requires at least two rank-label buckets")
+
+    rng = np.random.default_rng(random_state)
+    fit_parts: list[np.ndarray] = []
+    calibration_parts: list[np.ndarray] = []
+    adjusted_buckets: list[str] = []
+    per_bucket_rows: list[dict[str, Any]] = []
+
+    for rank, label in sorted(bucket_to_indices):
+        bucket_indices = np.asarray(bucket_to_indices[(rank, label)], dtype=np.int64)
+        calibration_count, adjusted = _resolve_holdout_subset_count(
+            bucket_size=int(bucket_indices.size),
+            subset_percent=calibration_split_percent,
+            bucket_name=f"rank {int(rank)} [label {int(label)}]",
+            split_name="Rank-label --calibration-split",
+            subset_label="calibration",
+        )
+        fit_count = int(bucket_indices.size) - calibration_count
+        if adjusted:
+            adjusted_buckets.append(f"rank {int(rank)} [label {int(label)}]")
+
+        shuffled = bucket_indices[rng.permutation(bucket_indices.shape[0])]
+        fit_parts.append(shuffled[:fit_count])
+        calibration_parts.append(shuffled[fit_count:])
+        per_bucket_rows.append(
+            {
+                "rank": int(rank),
+                "label": int(label),
+                "total": int(bucket_indices.size),
+                "n_fit_train": int(fit_count),
+                "n_calibration": int(calibration_count),
+            }
+        )
+
+    fit_train_indices = np.sort(np.concatenate(fit_parts).astype(np.int64, copy=False))
+    calibration_indices = np.sort(np.concatenate(calibration_parts).astype(np.int64, copy=False))
+
+    warnings: list[str] = []
+    if adjusted_buckets:
+        adjusted_preview = ", ".join(adjusted_buckets[:5])
+        warnings.append(
+            "Adjusted rounded calibration counts to keep at least one sample in both fit-train and "
+            f"calibration for rank-label buckets: {adjusted_preview}"
+        )
+
+    split_summary = _build_calibration_split_summary(
+        labels=labels,
+        fit_train_indices=fit_train_indices,
+        calibration_indices=calibration_indices,
+        calibration_split_percent=calibration_split_percent,
+        random_state=random_state,
+        strategy="train_partition_rank_label_holdout",
+    )
+    split_summary["split_by_folder"] = False
+    split_summary["split_by_rank_label"] = True
+    split_summary["rank_label_buckets"] = per_bucket_rows
+    return fit_train_indices, calibration_indices, warnings, split_summary
+
+
 def _build_calibration_folder_label_split(
     *,
     items: list[Any],
@@ -1422,6 +1649,206 @@ def _slice_supervised_features(features: np.ndarray | SupervisedFeatureBundle, i
     return np.asarray(features[resolved_indices], dtype=np.float32)
 
 
+def _is_dann_model_name(model_name: str) -> bool:
+    return str(model_name) == CNN_1D_DANN_MODEL_NAME
+
+
+def _parse_rank_from_model_name(model_name: str) -> int:
+    match = _RANK_TOKEN_RE.search(str(model_name))
+    if match is None:
+        raise ValueError(f"Could not parse a rank token from model name: {model_name!r}")
+    return int(float(match.group(1)))
+
+
+def _domain_class_name_for_rank(rank: int) -> str:
+    return f"rank_{int(rank)}"
+
+
+def _build_dann_domain_adaptation_config(
+    *,
+    model_names: list[str],
+    all_items: list[Any],
+    train_indices: np.ndarray,
+    infer_indices: np.ndarray,
+    labels_values: np.ndarray,
+    labels_known: np.ndarray,
+    mode: str,
+    source_rank: int,
+    target_adaptation_percent: int,
+    lambda_max: float,
+    lambda_gamma: float,
+    lr_alpha: float,
+    lr_beta: float,
+    random_state: int,
+    output_dir: Path,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    if CNN_1D_DANN_MODEL_NAME not in model_names:
+        return None, []
+    if str(mode) != "joint":
+        raise ValueError(
+            "cnn_1d_dann requires a joint manifest whose train split contains the seen ranks "
+            "and whose infer split contains disjoint zero-shot ranks"
+        )
+
+    ranks = np.asarray([_parse_rank_from_model_name(item.model_name) for item in all_items], dtype=np.int64)
+    train_indices_np = np.asarray(train_indices, dtype=np.int64)
+    infer_indices_np = np.asarray(infer_indices, dtype=np.int64)
+    if train_indices_np.size == 0:
+        raise ValueError("cnn_1d_dann requires at least one manifest train row")
+    if infer_indices_np.size == 0:
+        raise ValueError("cnn_1d_dann requires at least one zero-shot inference row")
+
+    labels_known_np = np.asarray(labels_known, dtype=bool).reshape(-1)
+    if not bool(np.all(labels_known_np[train_indices_np])):
+        raise ValueError("cnn_1d_dann requires known labels for every manifest train row")
+
+    observed_train_ranks = sorted({int(ranks[int(i)]) for i in train_indices_np.tolist()})
+    if int(source_rank) not in observed_train_ranks:
+        raise ValueError(
+            "cnn_1d_dann requires the configured source rank in the manifest train split; "
+            f"{int(source_rank)}; observed train ranks={observed_train_ranks}"
+        )
+    target_train_ranks = [rank for rank in observed_train_ranks if rank != int(source_rank)]
+    if not target_train_ranks:
+        raise ValueError(
+            "cnn_1d_dann requires at least one non-source rank in the manifest train split"
+        )
+    train_ranks = [int(source_rank), *target_train_ranks]
+
+    zero_shot_inference_ranks = sorted({int(ranks[int(i)]) for i in infer_indices_np.tolist()})
+    if not zero_shot_inference_ranks:
+        raise ValueError("cnn_1d_dann requires at least one zero-shot inference rank")
+    overlapping_ranks = sorted(set(train_ranks) & set(zero_shot_inference_ranks))
+    if overlapping_ranks:
+        raise ValueError(
+            "cnn_1d_dann requires manifest infer ranks to be disjoint from manifest train ranks; "
+            f"overlap={overlapping_ranks}"
+        )
+
+    domain_rank_values = [int(source_rank), *target_train_ranks]
+    rank_to_domain_index = {int(rank): int(idx) for idx, rank in enumerate(domain_rank_values)}
+    domain_labels = np.full(int(ranks.shape[0]), -1, dtype=np.int64)
+    for idx in train_indices_np.tolist():
+        domain_labels[int(idx)] = int(rank_to_domain_index[int(ranks[int(idx)])])
+    domain_labels_path = output_dir / "supervised_domain_rank_labels.npy"
+    np.save(domain_labels_path, domain_labels)
+
+    labels_np = np.asarray(labels_values, dtype=np.int32).reshape(-1)
+    source_train_indices = np.asarray(
+        [int(i) for i in train_indices_np.tolist() if int(ranks[int(i)]) == int(source_rank)],
+        dtype=np.int64,
+    )
+    target_train_indices = np.asarray(
+        [int(i) for i in train_indices_np.tolist() if int(ranks[int(i)]) != int(source_rank)],
+        dtype=np.int64,
+    )
+
+    config = {
+        "enabled": True,
+        "model_name": CNN_1D_DANN_MODEL_NAME,
+        "source_rank": int(source_rank),
+        "train_ranks": [int(x) for x in train_ranks],
+        "target_train_ranks": [int(x) for x in target_train_ranks],
+        "zero_shot_inference_ranks": [int(x) for x in zero_shot_inference_ranks],
+        "domain_rank_values": [int(x) for x in domain_rank_values],
+        "domain_class_names": [_domain_class_name_for_rank(rank) for rank in domain_rank_values],
+        "rank_to_domain_index": {str(rank): int(idx) for rank, idx in rank_to_domain_index.items()},
+        "source_domain_index": int(rank_to_domain_index[int(source_rank)]),
+        "train_indices": [int(x) for x in train_indices_np.tolist()],
+        "source_train_indices": [int(x) for x in source_train_indices.tolist()],
+        "target_train_indices": [int(x) for x in target_train_indices.tolist()],
+        "inference_indices": [int(x) for x in infer_indices_np.tolist()],
+        "train_rank_label_counts": [
+            {
+                "rank": int(rank),
+                "label": int(label),
+                "count": int(np.sum((ranks[train_indices_np] == int(rank)) & (labels_np[train_indices_np] == int(label)))),
+            }
+            for rank in train_ranks
+            for label in sorted({int(labels_np[int(i)]) for i in train_indices_np.tolist() if int(ranks[int(i)]) == int(rank)})
+        ],
+        "domain_labels_path": str(domain_labels_path),
+        "label_loss_scope": "all_training_ranks",
+        "domain_loss": "multiclass_rank_cross_entropy",
+        "domain_loss_weight": 1.0,
+        "lambda_schedule": {
+            "type": "dann_paper_logistic",
+            "lambda_max": float(lambda_max),
+            "gamma": float(lambda_gamma),
+        },
+        "learning_rate_schedule": {
+            "type": "fixed",
+        },
+    }
+    warnings = [
+        "cnn_1d_dann is using manifest-defined rank-adversarial supervised training: every train "
+        "row contributes label loss and rank-domain loss; manifest infer rows are zero-shot ranks "
+        "excluded from training, normalization, calibration, and threshold fitting"
+    ]
+    if int(target_adaptation_percent) != int(DANN_DEFAULT_TARGET_ADAPTATION_PERCENT):
+        warnings.append(
+            "Ignored deprecated --dann-target-adaptation-percent because cnn_1d_dann now derives "
+            "seen and zero-shot ranks from the joint manifest train/infer partitions"
+        )
+    if float(lr_alpha) != float(DANN_DEFAULT_LR_ALPHA) or float(lr_beta) != float(DANN_DEFAULT_LR_BETA):
+        warnings.append(
+            "Ignored deprecated --dann-lr-alpha/--dann-lr-beta because cnn_1d_dann now uses "
+            "a fixed learning rate"
+        )
+    return config, warnings
+
+
+def _resolve_dann_fit_inputs(
+    *,
+    manifest: dict[str, Any],
+    train_indices: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    domain_cfg = manifest.get("domain_adaptation")
+    if not isinstance(domain_cfg, dict) or not bool(domain_cfg.get("enabled")):
+        raise ValueError("cnn_1d_dann task is missing prepared domain_adaptation metadata")
+
+    labels_path = domain_cfg.get("domain_labels_path")
+    if not isinstance(labels_path, str) or not labels_path:
+        raise ValueError("cnn_1d_dann domain_adaptation metadata is missing domain_labels_path")
+    domain_labels_all = np.load(labels_path).astype(np.int64)
+    fit_indices = np.asarray(train_indices, dtype=np.int64)
+    if fit_indices.size == 0:
+        raise ValueError("cnn_1d_dann resolved zero training rows for fitting")
+    if int(np.max(fit_indices)) >= int(domain_labels_all.shape[0]):
+        raise ValueError("cnn_1d_dann training indices exceed the domain-label array length")
+    if bool(np.any(domain_labels_all[fit_indices] < 0)):
+        raise ValueError(
+            "cnn_1d_dann resolved fit rows without training-rank domain labels; "
+            "check that only manifest train rows are used for fitting"
+        )
+
+    fit_kwargs = {
+        "domain_labels": domain_labels_all[fit_indices],
+        "domain_class_names": [str(x) for x in domain_cfg.get("domain_class_names", [])],
+        "domain_rank_values": [int(x) for x in domain_cfg.get("domain_rank_values", [])],
+    }
+    return fit_indices, fit_kwargs
+
+
+def _resolve_rank_label_fit_kwargs(
+    *,
+    params: dict[str, Any],
+    rank_values: np.ndarray | None,
+    fit_indices: np.ndarray,
+) -> dict[str, Any]:
+    if not bool(params.get("rank_label_weight_loss", False)):
+        return {}
+    if rank_values is None:
+        raise ValueError("rank_label_weight_loss requires prepared rank values")
+    ranks_np = np.asarray(rank_values, dtype=np.int64).reshape(-1)
+    fit_indices_np = np.asarray(fit_indices, dtype=np.int64)
+    if fit_indices_np.size == 0:
+        raise ValueError("rank_label_weight_loss resolved zero training rows for fitting")
+    if int(np.max(fit_indices_np)) >= int(ranks_np.shape[0]):
+        raise ValueError("rank_label_weight_loss training indices exceed the rank-value array length")
+    return {"rank_labels": ranks_np[fit_indices_np]}
+
+
 def _tabular_array_or_raise(features: np.ndarray | SupervisedFeatureBundle) -> np.ndarray:
     if isinstance(features, SupervisedFeatureBundle):
         raise ValueError("This operation requires a tabular feature matrix, but the run uses a structured bundle")
@@ -1444,6 +1871,7 @@ def _compatible_model_names_for_representation(
         name
         for name in registered
         if str(representation_kind) in supported_representation_kinds(name)
+        and name != CNN_1D_DANN_MODEL_NAME
     ]
     incompatible = [name for name in registered if name not in compatible]
     if requested_model_name == "all":
@@ -2186,37 +2614,67 @@ def _evaluate_fold(
     random_state: int,
     n_jobs: int,
     task_spec: SupervisedTaskSpec,
+    selection_metric_name: str,
+    domain_adaptation: dict[str, Any] | None = None,
+    rank_values: np.ndarray | None = None,
 ) -> dict[str, Any]:
     model = create(model_name, params=params, random_state=random_state, task_spec=task_spec)
-    train_features = _slice_supervised_features(features, train_indices)
     valid_features = _slice_supervised_features(features, valid_indices)
     backend = model_backend(model_name)
     if backend == "cnn":
+        fit_kwargs: dict[str, Any] = {}
+        fit_indices = np.asarray(train_indices, dtype=np.int64)
+        if _is_dann_model_name(model_name):
+            fit_indices, fit_kwargs = _resolve_dann_fit_inputs(
+                manifest={"domain_adaptation": domain_adaptation},
+                train_indices=train_indices,
+            )
+        fit_kwargs.update(
+            _resolve_rank_label_fit_kwargs(
+                params=params,
+                rank_values=rank_values,
+                fit_indices=fit_indices,
+            )
+        )
+        train_features = _slice_supervised_features(features, fit_indices)
         model.fit(
             train_features,
-            labels[train_indices],
+            labels[fit_indices],
             validation_data=(valid_features, labels[valid_indices]),
             n_jobs=n_jobs,
+            **fit_kwargs,
         )
     else:
+        train_features = _slice_supervised_features(features, train_indices)
         model.fit(train_features, labels[train_indices])
     outputs = _predict_task_outputs(model, valid_features, task_spec=task_spec)
     result = {
         "n_train": int(train_indices.size),
         "n_valid": int(valid_indices.size),
-        "selection_metric_name": str(task_spec.selection_metric_name),
+        "selection_metric_name": str(selection_metric_name),
     }
     if task_spec.is_binary:
         auc = float(roc_auc_score(labels[valid_indices], outputs.backdoor_scores))
-        result["selection_metric"] = auc
         result["roc_auc"] = auc
+        result["binary_auroc"] = auc
+        result["selection_metric"] = auc
         return result
 
     y_valid = np.asarray(labels[valid_indices], dtype=np.int32).reshape(-1)
+    y_valid_binary = task_spec.project_known_labels_to_binary(y_valid)
+    binary_auroc = float(roc_auc_score(y_valid_binary, outputs.backdoor_scores))
     macro_f1 = float(f1_score(y_valid, outputs.predicted_labels, average="macro"))
     accuracy = float(accuracy_score(y_valid, outputs.predicted_labels))
     support_unique, support_counts = np.unique(y_valid, return_counts=True)
-    result["selection_metric"] = macro_f1
+    if selection_metric_name == SELECTION_METRIC_BINARY_AUROC:
+        result["selection_metric"] = binary_auroc
+    elif selection_metric_name == SELECTION_METRIC_MACRO_F1:
+        result["selection_metric"] = macro_f1
+    else:
+        raise ValueError(
+            f"Unsupported selection metric {selection_metric_name!r} for multiclass supervised evaluation"
+        )
+    result["binary_auroc"] = binary_auroc
     result["macro_f1"] = macro_f1
     result["accuracy"] = accuracy
     result["class_support"] = [
@@ -2238,6 +2696,9 @@ def _evaluate_candidate(
     cv_split_groups: list[dict[str, Any]],
     n_jobs: int,
     task_spec: SupervisedTaskSpec,
+    selection_metric_name: str,
+    domain_adaptation: dict[str, Any] | None = None,
+    rank_values: np.ndarray | None = None,
 ) -> dict[str, Any]:
     eval_jobs: list[tuple[int, dict[str, Any]]] = []
     for group in cv_split_groups:
@@ -2261,6 +2722,9 @@ def _evaluate_candidate(
                 random_state=seed,
                 n_jobs=n_jobs,
                 task_spec=task_spec,
+                selection_metric_name=selection_metric_name,
+                domain_adaptation=domain_adaptation,
+                rank_values=rank_values,
             )
             row["cv_random_state"] = int(seed)
             evaluated.append((seed, row))
@@ -2276,6 +2740,9 @@ def _evaluate_candidate(
                 random_state=seed,
                 n_jobs=n_jobs,
                 task_spec=task_spec,
+                selection_metric_name=selection_metric_name,
+                domain_adaptation=domain_adaptation,
+                rank_values=rank_values,
             )
             for seed, split in eval_jobs
         )
@@ -2286,7 +2753,6 @@ def _evaluate_candidate(
             evaluated.append((seed, row_with_seed))
 
     fold_rows = [row for _, row in evaluated]
-    selection_metric_name = str(task_spec.selection_metric_name)
     selection_scores = [float(row["selection_metric"]) for row in fold_rows if row.get("selection_metric") is not None]
 
     seed_results: list[dict[str, Any]] = []
@@ -2308,9 +2774,16 @@ def _evaluate_candidate(
         if task_spec.is_binary:
             seed_result["roc_auc_mean"] = seed_result["selection_metric_mean"]
             seed_result["roc_auc_std"] = seed_result["selection_metric_std"]
+            seed_result["binary_auroc_mean"] = seed_result["selection_metric_mean"]
+            seed_result["binary_auroc_std"] = seed_result["selection_metric_std"]
         else:
+            binary_auroc_scores = [
+                float(row["binary_auroc"]) for row in seed_fold_rows if row.get("binary_auroc") is not None
+            ]
             macro_f1_scores = [float(row["macro_f1"]) for row in seed_fold_rows if row.get("macro_f1") is not None]
             accuracy_scores = [float(row["accuracy"]) for row in seed_fold_rows if row.get("accuracy") is not None]
+            seed_result["binary_auroc_mean"] = float(np.mean(binary_auroc_scores)) if binary_auroc_scores else None
+            seed_result["binary_auroc_std"] = float(np.std(binary_auroc_scores)) if binary_auroc_scores else None
             seed_result["macro_f1_mean"] = float(np.mean(macro_f1_scores)) if macro_f1_scores else None
             seed_result["macro_f1_std"] = float(np.std(macro_f1_scores)) if macro_f1_scores else None
             seed_result["accuracy_mean"] = float(np.mean(accuracy_scores)) if accuracy_scores else None
@@ -2333,9 +2806,14 @@ def _evaluate_candidate(
     if task_spec.is_binary:
         result["roc_auc_mean"] = result["selection_metric_mean"]
         result["roc_auc_std"] = result["selection_metric_std"]
+        result["binary_auroc_mean"] = result["selection_metric_mean"]
+        result["binary_auroc_std"] = result["selection_metric_std"]
     else:
+        binary_auroc_scores = [float(row["binary_auroc"]) for row in fold_rows if row.get("binary_auroc") is not None]
         macro_f1_scores = [float(row["macro_f1"]) for row in fold_rows if row.get("macro_f1") is not None]
         accuracy_scores = [float(row["accuracy"]) for row in fold_rows if row.get("accuracy") is not None]
+        result["binary_auroc_mean"] = float(np.mean(binary_auroc_scores)) if binary_auroc_scores else None
+        result["binary_auroc_std"] = float(np.std(binary_auroc_scores)) if binary_auroc_scores else None
         result["macro_f1_mean"] = float(np.mean(macro_f1_scores)) if macro_f1_scores else None
         result["macro_f1_std"] = float(np.std(macro_f1_scores)) if macro_f1_scores else None
         result["accuracy_mean"] = float(np.mean(accuracy_scores)) if accuracy_scores else None
@@ -2666,6 +3144,15 @@ def _prepare_supervised_run(
     task_mode: str,
     multiclass_attack_names: list[str] | None,
     cnn_hyperparams: Path | None,
+    dann_source_rank: int,
+    dann_target_adaptation_percent: int,
+    dann_lambda_max: float,
+    dann_lambda_gamma: float,
+    dann_lr_alpha: float,
+    dann_lr_beta: float,
+    class_weight_loss: bool = False,
+    rank_label_weight_loss: bool = False,
+    selection_metric: str | None = None,
 ) -> dict[str, Any]:
     manifest_json = resolve_manifest_path(manifest_json)
     if not manifest_json.exists():
@@ -2680,11 +3167,17 @@ def _prepare_supervised_run(
             "Supervised pipeline requires --features. Specify the feature groups to select from the "
             "extracted feature bundle."
         )
-    if cnn_hyperparams is not None and model_name not in {"cnn_1d", "all"}:
-        raise ValueError("--cnn-hyperparams is only supported when --model is cnn_1d or all")
+    if cnn_hyperparams is not None and model_name not in {CNN_1D_MODEL_NAME, CNN_1D_DANN_MODEL_NAME, "all"}:
+        raise ValueError("--cnn-hyperparams is only supported when --model is cnn_1d, cnn_1d_dann, or all")
+    if bool(class_weight_loss) and bool(rank_label_weight_loss):
+        raise ValueError("--class-weight-loss and --rank-label-weight-loss are mutually exclusive")
     task_spec = _resolve_supervised_task_spec(
         task_mode=task_mode,
         multiclass_attack_names=multiclass_attack_names,
+    )
+    selection_metric_name = _resolve_selection_metric(
+        selection_metric,
+        task_spec=task_spec,
     )
 
     mode = _detect_manifest_mode(manifest_json)
@@ -2829,13 +3322,19 @@ def _prepare_supervised_run(
             "Filtered incompatible supervised models for representation_kind="
             f"{representation_kind!r}: skipped {incompatible_model_names}"
         )
+    cnn_model_selected = any(name in {CNN_1D_MODEL_NAME, CNN_1D_DANN_MODEL_NAME} for name in model_names)
+    cnn_rank_label_weight_loss = bool(rank_label_weight_loss and cnn_model_selected)
+    if bool(rank_label_weight_loss) and not cnn_model_selected:
+        extractor_warnings.append(
+            "Ignored --rank-label-weight-loss because no CNN model is selected for this supervised run"
+        )
     resolved_cnn_hyperparam_axes: dict[str, list[Any]] | None = None
     cnn_hyperparams_info: dict[str, Any] | None = None
-    if "cnn_1d" in model_names:
+    if cnn_model_selected:
         resolved_cnn_hyperparam_axes, cnn_hyperparams_info = resolve_cnn_hyperparams(cnn_hyperparams)
     elif cnn_hyperparams is not None:
         extractor_warnings.append(
-            "Ignored --cnn-hyperparams because cnn_1d is not selected for this supervised run"
+            "Ignored --cnn-hyperparams because no CNN model is selected for this supervised run"
         )
 
     labels_values, labels_known, labels_raw = _labels_from_items(
@@ -2868,11 +3367,6 @@ def _prepare_supervised_run(
                 "--train-split values below 100 are only supported for single manifests; "
                 "joint manifests already define train and inference partitions"
             )
-        if split_by_folder and calibration_split_percent is None:
-            raise ValueError(
-                "--split-by-folder requires --calibration-split for joint manifests; "
-                "joint manifests already define the outer train and inference partitions"
-            )
         split_summary = {
             "strategy": "manifest_defined",
             "split_by_folder": False,
@@ -2891,11 +3385,72 @@ def _prepare_supervised_run(
 
     train_pool_indices = np.asarray(train_indices, dtype=np.int64)
     fit_train_indices = np.asarray(train_pool_indices, dtype=np.int64)
+    domain_adaptation_config, domain_warnings = _build_dann_domain_adaptation_config(
+        model_names=model_names,
+        all_items=all_items,
+        train_indices=train_pool_indices,
+        infer_indices=infer_indices,
+        labels_values=labels_values,
+        labels_known=labels_known,
+        mode=mode,
+        source_rank=int(dann_source_rank),
+        target_adaptation_percent=int(dann_target_adaptation_percent),
+        lambda_max=float(dann_lambda_max),
+        lambda_gamma=float(dann_lambda_gamma),
+        lr_alpha=float(dann_lr_alpha),
+        lr_beta=float(dann_lr_beta),
+        random_state=int(random_state),
+        output_dir=ctx.features_dir,
+    )
+    if domain_adaptation_config is not None:
+        if isinstance(split_summary, dict):
+            split_summary = dict(split_summary)
+            split_summary["strategy"] = "manifest_defined_with_dann_rank_adversarial_zero_shot"
+            split_summary["n_train"] = int(train_pool_indices.size)
+            split_summary["n_inference"] = int(infer_indices.size)
+            split_summary["train_ranks"] = list(domain_adaptation_config["train_ranks"])
+            split_summary["target_train_ranks"] = list(domain_adaptation_config["target_train_ranks"])
+            split_summary["zero_shot_inference_ranks"] = list(
+                domain_adaptation_config["zero_shot_inference_ranks"]
+            )
+            split_summary["train_label_counts"] = _label_count_rows(labels_values[train_pool_indices])
+            split_summary["inference_label_counts"] = _label_count_rows(
+                labels_values[infer_indices][labels_known[infer_indices]]
+            )
+
     calibration_indices = np.asarray([], dtype=np.int64)
     calibration_summary: dict[str, Any] | None = None
     calibration_warnings: list[str] = []
     if calibration_split_percent is not None:
-        if split_by_folder:
+        if domain_adaptation_config is not None:
+            all_rank_values = np.asarray(
+                [_parse_rank_from_model_name(item.model_name) for item in all_items],
+                dtype=np.int64,
+            )
+            rank_label_warning = _rank_label_stratification_warning(
+                candidate_indices=train_pool_indices,
+                ranks=all_rank_values,
+                labels=labels_values,
+                split_name="calibration",
+            )
+            if rank_label_warning is None:
+                fit_train_indices, calibration_indices, calibration_warnings, calibration_summary = _build_calibration_rank_label_split(
+                    candidate_indices=train_pool_indices,
+                    ranks=all_rank_values,
+                    labels=labels_values,
+                    calibration_split_percent=calibration_split_percent,
+                    random_state=random_state,
+                )
+            else:
+                calibration_warnings.append(rank_label_warning)
+                fit_train_indices, calibration_indices, fallback_warnings, calibration_summary = _build_calibration_stratified_split(
+                    candidate_indices=train_pool_indices,
+                    labels=labels_values,
+                    calibration_split_percent=calibration_split_percent,
+                    random_state=random_state,
+                )
+                calibration_warnings.extend(fallback_warnings)
+        elif split_by_folder:
             fit_train_indices, calibration_indices, calibration_warnings, calibration_summary = _build_calibration_folder_label_split(
                 items=all_items,
                 candidate_indices=train_pool_indices,
@@ -2931,15 +3486,30 @@ def _prepare_supervised_run(
         model_candidate_params = candidate_params(
             selected_model,
             cnn_hyperparams=(
-                resolved_cnn_hyperparam_axes if selected_model == "cnn_1d" else None
+                resolved_cnn_hyperparam_axes
+                if selected_model in {CNN_1D_MODEL_NAME, CNN_1D_DANN_MODEL_NAME}
+                else None
             ),
         )
         for params in model_candidate_params:
+            task_params = dict(params)
+            if selected_model in {CNN_1D_MODEL_NAME, CNN_1D_DANN_MODEL_NAME} and bool(class_weight_loss):
+                task_params["class_weight_loss"] = True
+            if selected_model in {CNN_1D_MODEL_NAME, CNN_1D_DANN_MODEL_NAME} and bool(cnn_rank_label_weight_loss):
+                task_params["rank_label_weight_loss"] = True
+            if selected_model == CNN_1D_DANN_MODEL_NAME:
+                task_params.update(
+                    {
+                        "source_rank": int(dann_source_rank),
+                        "dann_lambda_max": float(dann_lambda_max),
+                        "dann_lambda_gamma": float(dann_lambda_gamma),
+                    }
+                )
             tasks.append(
                 {
                     "task_index": int(task_index),
                     "model_name": selected_model,
-                    "params": dict(params),
+                    "params": task_params,
                     "complexity_rank": int(complexity),
                     "normalization_policy": normalization_policy(selected_model),
                 }
@@ -2956,16 +3526,81 @@ def _prepare_supervised_run(
             "Skipped cross-validation because tuning search contains a single candidate; "
             "singleton_no_cv execution mode will fit only during finalize"
         ]
+        cv_stratification_summary = {
+            "strategy": None,
+            "split_by_folder": False,
+            "split_by_rank_label": False,
+        }
         estimated_total_fits = 1
     else:
-        cv_folds_resolved, cv_warnings = _sanitize_cv_folds(fit_train_labels, cv_folds)
+        cv_stratification_labels = fit_train_labels
+        cv_stratification_summary = {
+            "strategy": "label",
+            "split_by_folder": False,
+            "split_by_rank_label": False,
+        }
+        cv_warnings: list[str] = []
+        if split_by_folder:
+            folder_label_warning = _folder_label_stratification_warning(
+                items=all_items,
+                candidate_indices=fit_train_indices,
+                labels=labels_values,
+                split_name="cross-validation",
+            )
+            if folder_label_warning is None:
+                cv_stratification_labels = _folder_label_stratification_keys(
+                    items=all_items,
+                    candidate_indices=fit_train_indices,
+                    labels=labels_values,
+                )
+                cv_stratification_summary = {
+                    "strategy": "folder_label",
+                    "split_by_folder": True,
+                    "split_by_rank_label": False,
+                    "folder_count": int(
+                        len(
+                            {
+                                _split_folder_name(all_items[int(idx)])
+                                for idx in fit_train_indices.tolist()
+                            }
+                        )
+                    ),
+                }
+            else:
+                cv_warnings.append(folder_label_warning)
+        elif domain_adaptation_config is not None:
+            all_rank_values = np.asarray(
+                [_parse_rank_from_model_name(item.model_name) for item in all_items],
+                dtype=np.int64,
+            )
+            rank_label_warning = _rank_label_stratification_warning(
+                candidate_indices=fit_train_indices,
+                ranks=all_rank_values,
+                labels=labels_values,
+                split_name="cross-validation",
+            )
+            if rank_label_warning is None:
+                cv_stratification_labels = _rank_label_stratification_keys(
+                    candidate_indices=fit_train_indices,
+                    ranks=all_rank_values,
+                    labels=labels_values,
+                )
+                cv_stratification_summary = {
+                    "strategy": "rank_label",
+                    "split_by_folder": False,
+                    "split_by_rank_label": True,
+                }
+            else:
+                cv_warnings.append(rank_label_warning)
+        cv_folds_resolved, fold_warnings = _sanitize_cv_folds(cv_stratification_labels, cv_folds)
+        cv_warnings.extend(fold_warnings)
         for state in dedup_states:
             cv_split_groups.append(
                 {
                     "random_state": int(state),
                     "cv_splits": _build_cv_splits(
                         train_indices=fit_train_indices,
-                        train_labels=fit_train_labels,
+                        train_labels=cv_stratification_labels,
                         cv_folds=cv_folds_resolved,
                         random_state=int(state),
                     ),
@@ -2989,6 +3624,15 @@ def _prepare_supervised_run(
     model_names_path = ctx.features_dir / "supervised_model_names.json"
     with open(model_names_path, "w", encoding="utf-8") as f:
         json.dump([item.model_name for item in all_items], f, indent=2)
+
+    rank_values_path: Path | None = None
+    if bool(cnn_rank_label_weight_loss):
+        rank_values = np.asarray(
+            [_parse_rank_from_model_name(item.model_name) for item in all_items],
+            dtype=np.int64,
+        )
+        rank_values_path = ctx.features_dir / "supervised_rank_values.npy"
+        np.save(rank_values_path, rank_values)
 
     slurm_cpus = resolve_slurm_cpus_per_task(slurm_cpus_per_task)
     slurm_concurrency = resolve_slurm_max_concurrent(slurm_max_concurrent, slurm_cpus)
@@ -3017,6 +3661,7 @@ def _prepare_supervised_run(
             "labels_value_path": str(labels_value_path),
             "labels_known_path": str(labels_known_path),
             "model_names_path": str(model_names_path),
+            "rank_values_path": str(rank_values_path) if rank_values_path is not None else None,
         },
         "extractor": {
             "name": "spectral",
@@ -3025,15 +3670,18 @@ def _prepare_supervised_run(
             "warnings": extractor_warnings,
             "metadata_path": str(Path(artifacts["metadata_path"])),
         },
+        "domain_adaptation": domain_adaptation_config,
         "tuning": {
             "executor": tuning_executor,
             "model_name": model_name,
             "model_names": model_names,
-            "metric": str(task_spec.selection_metric_name),
+            "metric": str(selection_metric_name),
             "n_jobs": int(n_jobs),
             "random_state": int(random_state),
             "train_split_percent": int(train_split_percent),
             "split_by_folder": bool(split_by_folder),
+            "class_weight_loss": bool(class_weight_loss),
+            "rank_label_weight_loss": bool(cnn_rank_label_weight_loss),
             "calibration_split_percent": (
                 int(calibration_split_percent) if calibration_split_percent is not None else None
             ),
@@ -3042,6 +3690,7 @@ def _prepare_supervised_run(
             "cv_folds_resolved": int(cv_folds_resolved),
             "execution_mode": execution_mode,
             "estimated_total_fits": int(estimated_total_fits),
+            "cv_stratification": cv_stratification_summary,
             "cnn_hyperparams": cnn_hyperparams_info,
             "cv_splits": cv_splits,
             "cv_split_groups": cv_split_groups,
@@ -3074,6 +3723,7 @@ def _prepare_supervised_run(
             cv_warnings
             + split_warnings
             + calibration_warnings
+            + domain_warnings
             + list(extractor_warnings)
             + grid_warnings
         ),
@@ -3117,6 +3767,10 @@ def _run_supervised_worker(
     task = tasks[task_index]
     task_spec = _task_spec_from_manifest(manifest)
     tuning_cfg = manifest["tuning"]
+    selection_metric_name = _resolve_selection_metric(
+        tuning_cfg.get("metric"),
+        task_spec=task_spec,
+    )
     execution_mode = str(tuning_cfg.get("execution_mode", "cross_validation"))
     if execution_mode == "singleton_no_cv":
         start = perf_counter()
@@ -3128,7 +3782,7 @@ def _run_supervised_worker(
             "normalization_policy": str(task["normalization_policy"]),
             "status": "ok",
             "execution_mode": execution_mode,
-            "selection_metric_name": str(task_spec.selection_metric_name),
+            "selection_metric_name": str(selection_metric_name),
             "selection_metric_mean": None,
             "selection_metric_std": None,
             "fold_results": [],
@@ -3138,7 +3792,11 @@ def _run_supervised_worker(
         if task_spec.is_binary:
             result["roc_auc_mean"] = None
             result["roc_auc_std"] = None
+            result["binary_auroc_mean"] = None
+            result["binary_auroc_std"] = None
         else:
+            result["binary_auroc_mean"] = None
+            result["binary_auroc_std"] = None
             result["macro_f1_mean"] = None
             result["macro_f1_std"] = None
             result["accuracy_mean"] = None
@@ -3159,6 +3817,10 @@ def _run_supervised_worker(
 
     features = _load_features_for_tuning_manifest(manifest)
     labels = np.load(manifest["data"]["labels_value_path"]).astype(np.int32)
+    rank_values = None
+    rank_values_path = manifest["data"].get("rank_values_path")
+    if isinstance(rank_values_path, str) and rank_values_path:
+        rank_values = np.load(rank_values_path).astype(np.int64)
     if "cv_split_groups" in tuning_cfg:
         cv_split_groups = list(tuning_cfg["cv_split_groups"])
     else:
@@ -3179,6 +3841,9 @@ def _run_supervised_worker(
             cv_split_groups=cv_split_groups,
             n_jobs=resolved_n_jobs,
             task_spec=task_spec,
+            selection_metric_name=selection_metric_name,
+            domain_adaptation=manifest.get("domain_adaptation"),
+            rank_values=rank_values,
         )
     except Exception as exc:  # pragma: no cover - failure path asserted via output file shape
         result = {
@@ -3190,7 +3855,7 @@ def _run_supervised_worker(
             "status": "error",
             "error": str(exc),
             "execution_mode": execution_mode,
-            "selection_metric_name": str(task_spec.selection_metric_name),
+            "selection_metric_name": str(selection_metric_name),
             "selection_metric_mean": None,
             "selection_metric_std": None,
             "fold_results": [],
@@ -3199,7 +3864,11 @@ def _run_supervised_worker(
         if task_spec.is_binary:
             result["roc_auc_mean"] = None
             result["roc_auc_std"] = None
+            result["binary_auroc_mean"] = None
+            result["binary_auroc_std"] = None
         else:
+            result["binary_auroc_mean"] = None
+            result["binary_auroc_std"] = None
             result["macro_f1_mean"] = None
             result["macro_f1_std"] = None
             result["accuracy_mean"] = None
@@ -3416,6 +4085,10 @@ def _prepare_supervised_finalize(
     features = _load_features_for_tuning_manifest(manifest)
     labels_value = np.load(manifest["data"]["labels_value_path"]).astype(np.int32)
     labels_known = np.load(manifest["data"]["labels_known_path"]).astype(bool)
+    rank_values = None
+    rank_values_path = manifest["data"].get("rank_values_path")
+    if isinstance(rank_values_path, str) and rank_values_path:
+        rank_values = np.load(rank_values_path).astype(np.int64)
     with open(manifest["data"]["model_names_path"], "r", encoding="utf-8") as f:
         model_names = [str(x) for x in json.load(f)]
     manifest_items = _load_manifest_items_for_tuning_manifest(manifest)
@@ -3448,10 +4121,26 @@ def _prepare_supervised_finalize(
     )
     winner_backend = model_backend(str(winner["model_name"]))
     if winner_backend == "cnn":
+        fit_kwargs: dict[str, Any] = {}
+        fit_indices = np.asarray(train_indices, dtype=np.int64)
+        if _is_dann_model_name(str(winner["model_name"])):
+            fit_indices, fit_kwargs = _resolve_dann_fit_inputs(
+                manifest=manifest,
+                train_indices=train_indices,
+            )
+        fit_kwargs.update(
+            _resolve_rank_label_fit_kwargs(
+                params=dict(winner["params"]),
+                rank_values=rank_values,
+                fit_indices=fit_indices,
+            )
+        )
+        x_fit = _slice_supervised_features(features, fit_indices)
         model.fit(
-            x_train,
-            y_train,
+            x_fit,
+            labels_value[fit_indices],
             n_jobs=int(manifest["tuning"].get("n_jobs", 1)),
+            **fit_kwargs,
         )
     else:
         model.fit(x_train, y_train)
@@ -3850,9 +4539,13 @@ def _prepare_supervised_finalize(
             "model_name": manifest["tuning"]["model_name"],
             "model_names": manifest["tuning"].get("model_names", [manifest["tuning"]["model_name"]]),
             "cnn_hyperparams": manifest["tuning"].get("cnn_hyperparams"),
+            "domain_adaptation": manifest.get("domain_adaptation"),
             "execution_mode": manifest["tuning"].get("execution_mode", "cross_validation"),
+            "class_weight_loss": bool(manifest["tuning"].get("class_weight_loss", False)),
+            "rank_label_weight_loss": bool(manifest["tuning"].get("rank_label_weight_loss", False)),
             "cv_random_states": manifest["tuning"].get("cv_random_states", [manifest["tuning"]["random_state"]]),
             "cv_folds_resolved": manifest["tuning"]["cv_folds_resolved"],
+            "cv_stratification": manifest["tuning"].get("cv_stratification"),
             "estimated_total_fits": manifest["tuning"].get("estimated_total_fits"),
             "executor": manifest["tuning"]["executor"],
             "tasks_total": len(manifest["tuning"]["tasks"]),
@@ -3919,15 +4612,19 @@ def _prepare_supervised_finalize(
         "model_name": manifest["tuning"]["model_name"],
         "model_names": manifest["tuning"].get("model_names", [manifest["tuning"]["model_name"]]),
         "cnn_hyperparams": manifest["tuning"].get("cnn_hyperparams"),
+        "domain_adaptation": manifest.get("domain_adaptation"),
         "execution_mode": manifest["tuning"].get("execution_mode", "cross_validation"),
         "train_split_percent": int(manifest["tuning"].get("train_split_percent", 100)),
         "calibration_split_percent": manifest["tuning"].get("calibration_split_percent"),
         "accepted_fprs": threshold_selection_cfg.get("accepted_fprs"),
         "accepted_fpr": threshold_selection_cfg.get("accepted_fpr"),
         "split_by_folder": bool(manifest["tuning"].get("split_by_folder", False)),
+        "class_weight_loss": bool(manifest["tuning"].get("class_weight_loss", False)),
+        "rank_label_weight_loss": bool(manifest["tuning"].get("rank_label_weight_loss", False)),
         "data_split": manifest["data"].get("split"),
         "calibration_split": manifest["data"].get("calibration_split"),
         "cv_random_states": manifest["tuning"].get("cv_random_states", [manifest["tuning"]["random_state"]]),
+        "cv_stratification": manifest["tuning"].get("cv_stratification"),
         "score_percentiles": [float(x) for x in score_percentiles],
         "winner": winner,
         "threshold_selection": selected_threshold_summary,
@@ -4170,7 +4867,16 @@ def run_supervised_pipeline(
     task_mode: str = SUPERVISED_TASK_MODE_BINARY,
     multiclass_attack_names: list[str] | None = None,
     cnn_hyperparams: Path | None = None,
+    dann_source_rank: int = DANN_DEFAULT_SOURCE_RANK,
+    dann_target_adaptation_percent: int = DANN_DEFAULT_TARGET_ADAPTATION_PERCENT,
+    dann_lambda_max: float = DANN_DEFAULT_LAMBDA_MAX,
+    dann_lambda_gamma: float = DANN_DEFAULT_LAMBDA_GAMMA,
+    dann_lr_alpha: float = DANN_DEFAULT_LR_ALPHA,
+    dann_lr_beta: float = DANN_DEFAULT_LR_BETA,
+    class_weight_loss: bool = False,
+    rank_label_weight_loss: bool = False,
     skip_feature_importance: bool = False,
+    selection_metric: str | None = None,
 ) -> dict[str, Any]:
     if stage in {"all", "prepare"} and manifest_json is None:
         raise ValueError("--manifest-json is required for stage=all and stage=prepare")
@@ -4223,6 +4929,15 @@ def run_supervised_pipeline(
             task_mode=task_mode,
             multiclass_attack_names=multiclass_attack_names,
             cnn_hyperparams=cnn_hyperparams,
+            dann_source_rank=int(dann_source_rank),
+            dann_target_adaptation_percent=int(dann_target_adaptation_percent),
+            dann_lambda_max=float(dann_lambda_max),
+            dann_lambda_gamma=float(dann_lambda_gamma),
+            dann_lr_alpha=float(dann_lr_alpha),
+            dann_lr_beta=float(dann_lr_beta),
+            class_weight_loss=bool(class_weight_loss),
+            rank_label_weight_loss=bool(rank_label_weight_loss),
+            selection_metric=selection_metric,
         )
 
     if stage == "worker":
@@ -4291,6 +5006,15 @@ def run_supervised_pipeline(
         task_mode=task_mode,
         multiclass_attack_names=multiclass_attack_names,
         cnn_hyperparams=cnn_hyperparams,
+        dann_source_rank=int(dann_source_rank),
+        dann_target_adaptation_percent=int(dann_target_adaptation_percent),
+        dann_lambda_max=float(dann_lambda_max),
+        dann_lambda_gamma=float(dann_lambda_gamma),
+        dann_lr_alpha=float(dann_lr_alpha),
+        dann_lr_beta=float(dann_lr_beta),
+        class_weight_loss=bool(class_weight_loss),
+        rank_label_weight_loss=bool(rank_label_weight_loss),
+        selection_metric=selection_metric,
     )
     resolved_run_dir = Path(prepared["run_dir"])
 

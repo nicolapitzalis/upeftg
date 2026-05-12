@@ -408,7 +408,14 @@ class TestPaperQvReferenceExperiment(unittest.TestCase):
             self.assertEqual(metrics["feature_dim"], 15)
             self.assertEqual(split_manifest["test_stratify_kind"], "dataset_name_x_label")
             self.assertEqual(split_manifest["calibration_stratify_kind"], "dataset_name_x_label")
-            self.assertEqual(reference_summary["n_reference_clean_samples"], 10)
+            expected_reference_indices = [
+                int(idx) for idx in split_manifest["fit_indices"] if int(source["labels"][int(idx)]) == 0
+            ]
+            self.assertEqual(detector_payload["reference_bank_indices"], expected_reference_indices)
+            self.assertEqual(reference_summary["source_partition"], "fit")
+            self.assertEqual(reference_summary["reference_bank_indices"], expected_reference_indices)
+            self.assertEqual(reference_summary["n_reference_clean_samples"], len(expected_reference_indices))
+            self.assertLess(reference_summary["n_reference_clean_samples"], 10)
 
             for csv_path in [outputs["calibration_scores_csv"], outputs["test_scores_csv"]]:
                 self.assertTrue(Path(csv_path).exists())
@@ -416,6 +423,62 @@ class TestPaperQvReferenceExperiment(unittest.TestCase):
             artifact_index = load_json_file(outputs["run_dir"] / "artifact_index.json")
             self.assertEqual(artifact_index["derived_feature_file"], str(derived_feature_path))
             self.assertEqual(artifact_index["detector_model"], str(outputs["detector_model_path"]))
+
+    def test_run_paper_qv_reference_experiment_uses_joint_manifest_holdout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = write_synthetic_source_bundle(tmp_path)
+            runs_root = tmp_path / "runs"
+
+            train_indices = [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18]
+            infer_indices = [4, 9, 14, 19]
+            manifest_path = tmp_path / "holdout_synthetic_attack.json"
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "train": [source["model_names"][idx] for idx in train_indices],
+                        "infer": [source["model_names"][idx] for idx in infer_indices],
+                    },
+                    f,
+                    indent=2,
+                )
+
+            outputs = run_paper_qv_reference_experiment(
+                feature_file=Path("synthetic_source"),
+                feature_root=source["feature_root"],
+                feature_output_run="synthetic_paper_qv_manifest",
+                output_root=runs_root,
+                run_id="paper_qv_manifest_run",
+                manifest_json=manifest_path,
+                random_state=11,
+                calibration_split_percent=25,
+            )
+
+            split_manifest = load_json_file(outputs["split_manifest_path"])
+            reference_summary = load_json_file(outputs["reference_bank_summary_path"])
+            metrics = load_json_file(outputs["metrics_path"])
+            detector_payload = joblib.load(outputs["detector_model_path"])
+
+            self.assertEqual(split_manifest["split_strategy"], "manifest_defined")
+            self.assertEqual(split_manifest["manifest_json"], str(manifest_path.resolve()))
+            self.assertEqual(split_manifest["train_indices"], train_indices)
+            self.assertEqual(split_manifest["test_indices"], infer_indices)
+            self.assertEqual(split_manifest["test_stratify_kind"], "manifest_defined")
+            self.assertEqual(split_manifest["calibration_stratify_kind"], "dataset_name_x_label")
+            self.assertTrue(set(split_manifest["fit_indices"]).issubset(set(train_indices)))
+            self.assertTrue(set(split_manifest["calibration_indices"]).issubset(set(train_indices)))
+            self.assertFalse(set(split_manifest["test_indices"]) & set(split_manifest["fit_indices"]))
+            self.assertFalse(set(split_manifest["test_indices"]) & set(split_manifest["calibration_indices"]))
+
+            expected_reference_indices = [
+                int(idx) for idx in split_manifest["fit_indices"] if int(source["labels"][int(idx)]) == 0
+            ]
+            self.assertEqual(detector_payload["reference_bank_indices"], expected_reference_indices)
+            self.assertEqual(reference_summary["source_partition"], "fit")
+            self.assertEqual(reference_summary["reference_bank_indices"], expected_reference_indices)
+            self.assertEqual(reference_summary["n_reference_clean_samples"], len(expected_reference_indices))
+            self.assertEqual(metrics["split_strategy"], "manifest_defined")
+            self.assertEqual(metrics["test"]["n_samples"], len(infer_indices))
 
 
 if __name__ == "__main__":

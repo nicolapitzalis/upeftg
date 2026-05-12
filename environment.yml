@@ -1,0 +1,14 @@
+name: upeftg
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - safetensors
+  - huggingface_hub
+  - joblib
+  - pytorch
+  - pip

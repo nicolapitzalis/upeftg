@@ -58,12 +58,15 @@ SPECTRAL_MOMENT_SOURCE=${SPECTRAL_MOMENT_SOURCE:-sv}
 SPECTRAL_QV_SUM_MODE=${SPECTRAL_QV_SUM_MODE:-none}
 SPECTRAL_ENTRYWISE_DELTA_MODE=${SPECTRAL_ENTRYWISE_DELTA_MODE:-auto}
 CV_FOLDS=${CV_FOLDS:-5}
+SELECTION_METRIC=${SELECTION_METRIC:-task_default}
 CV_SEEDS=${CV_SEEDS:-"42 43 44"}
 RANDOM_STATE=${RANDOM_STATE:-42}
 TRAIN_SPLIT=${TRAIN_SPLIT:-100}
 CALIBRATION_SPLIT=${CALIBRATION_SPLIT:-}
 ACCEPTED_FPR=${ACCEPTED_FPR:-}
 SPLIT_BY_FOLDER=${SPLIT_BY_FOLDER:-0}
+CLASS_WEIGHT_LOSS=${CLASS_WEIGHT_LOSS:-0}
+RANK_LABEL_WEIGHT_LOSS=${RANK_LABEL_WEIGHT_LOSS:-0}
 SCORE_PERCENTILES=${SCORE_PERCENTILES:-}
 SLURM_PARTITION=${SLURM_PARTITION:-extra}
 SLURM_MAX_CONCURRENT_REQUEST=${SLURM_MAX_CONCURRENT_REQUEST:-auto}
@@ -114,6 +117,14 @@ SPLIT_BY_FOLDER_FLAG=""
 if [[ "${SPLIT_BY_FOLDER}" == "1" || "${SPLIT_BY_FOLDER,,}" == "true" ]]; then
   SPLIT_BY_FOLDER_FLAG="--split-by-folder"
 fi
+CLASS_WEIGHT_LOSS_FLAG=""
+if [[ "${CLASS_WEIGHT_LOSS}" == "1" || "${CLASS_WEIGHT_LOSS,,}" == "true" ]]; then
+  CLASS_WEIGHT_LOSS_FLAG="--class-weight-loss"
+fi
+RANK_LABEL_WEIGHT_LOSS_FLAG=""
+if [[ "${RANK_LABEL_WEIGHT_LOSS}" == "1" || "${RANK_LABEL_WEIGHT_LOSS,,}" == "true" ]]; then
+  RANK_LABEL_WEIGHT_LOSS_FLAG="--rank-label-weight-loss"
+fi
 
 CALIBRATION_ARGS=()
 if [[ -n "${CALIBRATION_SPLIT}" || -n "${ACCEPTED_FPR}" ]]; then
@@ -151,6 +162,7 @@ PREPARE_ARGS=(
   --spectral-qv-sum-mode "${SPECTRAL_QV_SUM_MODE}"
   --spectral-entrywise-delta-mode "${SPECTRAL_ENTRYWISE_DELTA_MODE}"
   --cv-folds "${CV_FOLDS}"
+  --selection-metric "${SELECTION_METRIC}"
   --random-state "${RANDOM_STATE}"
   --train-split "${TRAIN_SPLIT}"
   --feature-file "${FEATURE_FILE}"
@@ -161,6 +173,12 @@ PREPARE_ARGS=(
 )
 if [[ -n "${SPLIT_BY_FOLDER_FLAG}" ]]; then
   PREPARE_ARGS+=("${SPLIT_BY_FOLDER_FLAG}")
+fi
+if [[ -n "${CLASS_WEIGHT_LOSS_FLAG}" ]]; then
+  PREPARE_ARGS+=("${CLASS_WEIGHT_LOSS_FLAG}")
+fi
+if [[ -n "${RANK_LABEL_WEIGHT_LOSS_FLAG}" ]]; then
+  PREPARE_ARGS+=("${RANK_LABEL_WEIGHT_LOSS_FLAG}")
 fi
 if [[ "${#MULTICLASS_ATTACK_NAME_VALUES[@]}" -gt 0 ]]; then
   PREPARE_ARGS+=(--multiclass-attack-names "${MULTICLASS_ATTACK_NAME_VALUES[@]}")
@@ -275,6 +293,9 @@ echo "Train split: ${TRAIN_SPLIT}"
 echo "Calibration split: ${CALIBRATION_SPLIT:-disabled}"
 echo "Accepted FPR: ${ACCEPTED_FPR:-disabled}"
 echo "Split by folder: ${SPLIT_BY_FOLDER}"
+echo "Selection metric: ${SELECTION_METRIC}"
+echo "Class-weight loss: ${CLASS_WEIGHT_LOSS}"
+echo "Rank-label weight loss: ${RANK_LABEL_WEIGHT_LOSS}"
 if [[ -n "${SCORE_PERCENTILES}" ]]; then
   echo "Score percentiles: ${SCORE_PERCENTILES}"
 else

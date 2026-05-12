@@ -23,6 +23,11 @@ from ..utilities.artifacts.dataset_references import (
     write_dataset_reference_report,
 )
 from ..utilities.artifacts.spectral_metadata import write_spectral_metadata
+from ..utilities.core.manifest import (
+    ManifestItem,
+    parse_joint_manifest_json_by_model_name,
+    resolve_manifest_path,
+)
 from ..utilities.core.run_context import create_run_context
 from ..utilities.core.serialization import json_ready
 
@@ -81,12 +86,15 @@ class DerivedFeatureBundle:
 
 @dataclass(frozen=True)
 class SplitAssignments:
+    split_strategy: str
+    train_indices: np.ndarray
     fit_indices: np.ndarray
     calibration_indices: np.ndarray
     test_indices: np.ndarray
     test_stratify_kind: str
     calibration_stratify_kind: str
     warnings: list[str]
+    manifest_json: Path | None = None
 
 
 def _feature_block_name(feature_name: str) -> str:
@@ -601,6 +609,8 @@ def build_split_assignments(
         stratify=calibration_stratify,
     )
     return SplitAssignments(
+        split_strategy="random_stratified_holdout",
+        train_indices=np.asarray(sorted(int(x) for x in train_val_indices), dtype=np.int64),
         fit_indices=np.asarray(sorted(int(x) for x in fit_indices), dtype=np.int64),
         calibration_indices=np.asarray(sorted(int(x) for x in calibration_indices), dtype=np.int64),
         test_indices=np.asarray(sorted(int(x) for x in test_indices), dtype=np.int64),
@@ -610,15 +620,176 @@ def build_split_assignments(
     )
 
 
+def _feature_bundle_row_index_by_model_name(bundle: LoadedFeatureBundle) -> dict[str, int]:
+    index: dict[str, int] = {}
+    duplicates: list[str] = []
+    for row_index, raw_name in enumerate(bundle.model_names):
+        model_name = str(raw_name)
+        if model_name in index:
+            duplicates.append(model_name)
+            continue
+        index[model_name] = int(row_index)
+    if duplicates:
+        preview = ", ".join(sorted(set(duplicates))[:5])
+        raise ValueError(
+            "Feature bundle contains duplicate model names; cannot align a manifest safely. "
+            f"Examples: {preview}"
+        )
+    return index
+
+
+def _manifest_partition_indices(
+    *,
+    bundle: LoadedFeatureBundle,
+    items: Sequence[ManifestItem],
+    partition_name: str,
+) -> np.ndarray:
+    name_to_index = _feature_bundle_row_index_by_model_name(bundle)
+    missing = [str(item.model_name) for item in items if str(item.model_name) not in name_to_index]
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise ValueError(
+            f"Manifest {partition_name} partition references {len(missing)} model(s) not present "
+            f"in the feature bundle. Examples: {preview}"
+        )
+
+    indices = np.asarray([name_to_index[str(item.model_name)] for item in items], dtype=np.int64)
+    if np.unique(indices).size != indices.size:
+        raise ValueError(f"Manifest {partition_name} partition maps to duplicate feature rows")
+
+    if bundle.labels is not None:
+        labels = np.asarray(bundle.labels, dtype=np.int32)
+        mismatches: list[str] = []
+        for item, row_index in zip(items, indices.tolist()):
+            if item.label is None:
+                continue
+            actual = int(labels[int(row_index)])
+            expected = int(item.label)
+            if actual != expected:
+                mismatches.append(f"{item.model_name}: manifest={expected}, bundle={actual}")
+        if mismatches:
+            preview = "; ".join(mismatches[:5])
+            raise ValueError(
+                f"Manifest {partition_name} labels disagree with feature bundle labels. Examples: {preview}"
+            )
+    return np.asarray(sorted(int(x) for x in indices.tolist()), dtype=np.int64)
+
+
+def build_manifest_split_assignments(
+    *,
+    bundle: LoadedFeatureBundle,
+    manifest_json: Path,
+    random_state: int,
+    calibration_split_percent: int,
+) -> SplitAssignments:
+    if bundle.labels is None:
+        raise ValueError("The input bundle must provide binary labels for paper-style detector fitting")
+    labels = np.asarray(bundle.labels, dtype=np.int32)
+    if not np.all(np.isin(labels, np.asarray([0, 1], dtype=np.int32))):
+        raise ValueError("Paper-style detector fitting requires labels in {0, 1}")
+
+    resolved_manifest = resolve_manifest_path(manifest_json)
+    train_items, infer_items = parse_joint_manifest_json_by_model_name(manifest_path=resolved_manifest)
+    train_indices = _manifest_partition_indices(
+        bundle=bundle,
+        items=train_items,
+        partition_name="train",
+    )
+    test_indices = _manifest_partition_indices(
+        bundle=bundle,
+        items=infer_items,
+        partition_name="infer",
+    )
+    overlap = sorted(set(train_indices.tolist()) & set(test_indices.tolist()))
+    if overlap:
+        preview = ", ".join(str(x) for x in overlap[:5])
+        raise ValueError(f"Manifest train and infer partitions overlap after feature alignment: {preview}")
+
+    calibration_fraction = float(calibration_split_percent) / 100.0
+    if not 0.0 < calibration_fraction < 1.0:
+        raise ValueError(
+            f"calibration_split_percent must be between 1 and 99, got {calibration_split_percent}"
+        )
+
+    candidate_vectors = build_candidate_stratify_vectors(bundle)
+    warnings: list[str] = []
+    calibration_kind, calibration_stratify = choose_stratify_vector(
+        candidate_vectors=candidate_vectors,
+        indices=train_indices,
+        split_fraction=calibration_fraction,
+    )
+    if calibration_stratify is None:
+        warnings.append(
+            "Falling back to an unstratified manifest train/calibration split because no candidate "
+            "stratification was feasible"
+        )
+
+    fit_indices, calibration_indices = train_test_split(
+        train_indices,
+        test_size=calibration_fraction,
+        random_state=int(random_state) + 1,
+        shuffle=True,
+        stratify=calibration_stratify,
+    )
+    return SplitAssignments(
+        split_strategy="manifest_defined",
+        train_indices=np.asarray(sorted(int(x) for x in train_indices.tolist()), dtype=np.int64),
+        fit_indices=np.asarray(sorted(int(x) for x in fit_indices), dtype=np.int64),
+        calibration_indices=np.asarray(sorted(int(x) for x in calibration_indices), dtype=np.int64),
+        test_indices=np.asarray(sorted(int(x) for x in test_indices.tolist()), dtype=np.int64),
+        test_stratify_kind="manifest_defined",
+        calibration_stratify_kind=str(calibration_kind),
+        warnings=warnings,
+        manifest_json=resolved_manifest,
+    )
+
+
+def build_experiment_split_assignments(
+    *,
+    bundle: LoadedFeatureBundle,
+    manifest_json: Path | None,
+    random_state: int,
+    test_split_percent: int,
+    calibration_split_percent: int,
+) -> SplitAssignments:
+    if manifest_json is not None:
+        return build_manifest_split_assignments(
+            bundle=bundle,
+            manifest_json=manifest_json,
+            random_state=random_state,
+            calibration_split_percent=calibration_split_percent,
+        )
+    return build_split_assignments(
+        bundle=bundle,
+        random_state=random_state,
+        test_split_percent=test_split_percent,
+        calibration_split_percent=calibration_split_percent,
+    )
+
+
+def clean_reference_indices(labels: np.ndarray, candidate_indices: np.ndarray) -> np.ndarray:
+    labels_np = np.asarray(labels, dtype=np.int32).reshape(-1)
+    candidate_np = np.asarray(candidate_indices, dtype=np.int64).reshape(-1)
+    return np.asarray(
+        [int(idx) for idx in candidate_np.tolist() if int(labels_np[int(idx)]) == 0],
+        dtype=np.int64,
+    )
+
+
 def compute_reference_bank_stats(
     raw_features: np.ndarray,
     labels: np.ndarray,
+    *,
+    reference_indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     labels = np.asarray(labels, dtype=np.int32).reshape(-1)
-    clean_mask = labels == 0
-    if not bool(np.any(clean_mask)):
+    if reference_indices is None:
+        clean_indices = np.asarray(np.flatnonzero(labels == 0), dtype=np.int64)
+    else:
+        clean_indices = clean_reference_indices(labels, np.asarray(reference_indices, dtype=np.int64))
+    if clean_indices.size == 0:
         raise ValueError("Reference-bank fitting requires at least one clean sample (label == 0)")
-    clean_values = np.asarray(raw_features[clean_mask], dtype=np.float64)
+    clean_values = np.asarray(raw_features[clean_indices], dtype=np.float64)
     mean = np.asarray(np.mean(clean_values, axis=0), dtype=np.float64)
     std = np.asarray(np.std(clean_values, axis=0), dtype=np.float64)
     std = np.where(std > 0.0, std, 1.0)
@@ -880,6 +1051,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional experiment run id. Defaults to the shared run-context timestamp format.",
     )
     parser.add_argument(
+        "--manifest-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional joint train/infer manifest. When provided, train defines the detector training pool "
+            "and infer defines the held-out test partition."
+        ),
+    )
+    parser.add_argument(
+        "--manifest-root",
+        type=Path,
+        default=None,
+        help="Optional directory of joint manifests to run sequentially.",
+    )
+    parser.add_argument(
+        "--manifest-glob",
+        type=str,
+        default="*.json",
+        help="Glob used with --manifest-root.",
+    )
+    parser.add_argument(
         "--random-state",
         type=int,
         default=DEFAULT_RANDOM_STATE,
@@ -907,6 +1099,7 @@ def run_paper_qv_reference_experiment(
     feature_output_run: str | None = None,
     output_root: Path = DEFAULT_OUTPUT_ROOT,
     run_id: str | None = None,
+    manifest_json: Path | None = None,
     random_state: int = DEFAULT_RANDOM_STATE,
     test_split_percent: int = DEFAULT_TEST_SPLIT_PERCENT,
     calibration_split_percent: int = DEFAULT_CALIBRATION_SPLIT_PERCENT,
@@ -927,7 +1120,20 @@ def run_paper_qv_reference_experiment(
         run_id=run_id,
     )
 
-    benign_mean, benign_std = compute_reference_bank_stats(derived.features, np.asarray(bundle.labels, dtype=np.int32))
+    splits = build_experiment_split_assignments(
+        bundle=bundle,
+        manifest_json=manifest_json,
+        random_state=int(random_state),
+        test_split_percent=int(test_split_percent),
+        calibration_split_percent=int(calibration_split_percent),
+    )
+    labels = np.asarray(bundle.labels, dtype=np.int32)
+    reference_indices = clean_reference_indices(labels, splits.fit_indices)
+    benign_mean, benign_std = compute_reference_bank_stats(
+        derived.features,
+        labels,
+        reference_indices=splits.fit_indices,
+    )
     entropy_mask = entropy_feature_mask(derived.feature_names)
     normalized_features = normalize_paper_features(
         derived.features,
@@ -935,16 +1141,10 @@ def run_paper_qv_reference_experiment(
         benign_std=benign_std,
         entropy_mask=entropy_mask,
     )
-    splits = build_split_assignments(
-        bundle=bundle,
-        random_state=int(random_state),
-        test_split_percent=int(test_split_percent),
-        calibration_split_percent=int(calibration_split_percent),
-    )
 
-    fit_labels = np.asarray(bundle.labels[splits.fit_indices], dtype=np.int32)
-    calibration_labels = np.asarray(bundle.labels[splits.calibration_indices], dtype=np.int32)
-    test_labels = np.asarray(bundle.labels[splits.test_indices], dtype=np.int32)
+    fit_labels = np.asarray(labels[splits.fit_indices], dtype=np.int32)
+    calibration_labels = np.asarray(labels[splits.calibration_indices], dtype=np.int32)
+    test_labels = np.asarray(labels[splits.test_indices], dtype=np.int32)
     model, normalized_weights = fit_paper_weighted_sum_detector(
         normalized_features[splits.fit_indices],
         fit_labels,
@@ -975,6 +1175,9 @@ def run_paper_qv_reference_experiment(
         "selection_method": str(selected_threshold["selection_method"]),
         "feature_file": str(bundle.feature_file.resolve()),
         "derived_feature_file": str(derived.feature_path.resolve()),
+        "split_strategy": splits.split_strategy,
+        "manifest_json": str(splits.manifest_json) if splits.manifest_json is not None else None,
+        "reference_bank_indices": [int(x) for x in reference_indices.tolist()],
         "random_state": int(random_state),
         "test_split_percent": int(test_split_percent),
         "calibration_split_percent": int(calibration_split_percent),
@@ -1005,6 +1208,13 @@ def run_paper_qv_reference_experiment(
         "selected_metric_suffixes": list(PAPER_QV_SELECTED_SUFFIXES),
         "feature_mapping": dict(PAPER_QV_FEATURE_MAPPING),
         "weights_by_metric": _weights_by_metric(derived.feature_names, normalized_weights),
+        "split_strategy": splits.split_strategy,
+        "manifest_json": str(splits.manifest_json) if splits.manifest_json is not None else None,
+        "reference_bank": {
+            "source_partition": "fit",
+            "n_clean_samples": int(reference_indices.size),
+            "indices": [int(x) for x in reference_indices.tolist()],
+        },
         "fit": {
             "n_samples": int(splits.fit_indices.size),
             "label_counts": _label_counts(fit_labels.tolist()),
@@ -1033,28 +1243,38 @@ def run_paper_qv_reference_experiment(
         ctx.reports_dir / SPLIT_MANIFEST_FILENAME,
         {
             "script_version": SCRIPT_VERSION,
+            "split_strategy": splits.split_strategy,
+            "manifest_json": str(splits.manifest_json) if splits.manifest_json is not None else None,
             "random_state": int(random_state),
             "test_split_percent": int(test_split_percent),
             "calibration_split_percent": int(calibration_split_percent),
             "test_stratify_kind": splits.test_stratify_kind,
             "calibration_stratify_kind": splits.calibration_stratify_kind,
             "warnings": list(splits.warnings),
+            "train_indices": [int(x) for x in splits.train_indices.tolist()],
             "fit_indices": [int(x) for x in splits.fit_indices.tolist()],
             "calibration_indices": [int(x) for x in splits.calibration_indices.tolist()],
             "test_indices": [int(x) for x in splits.test_indices.tolist()],
+            "train_label_counts": _label_counts(labels[splits.train_indices].tolist()),
             "fit_label_counts": _label_counts(fit_labels.tolist()),
             "calibration_label_counts": _label_counts(calibration_labels.tolist()),
             "test_label_counts": _label_counts(test_labels.tolist()),
+            "reference_bank_indices": [int(x) for x in reference_indices.tolist()],
         },
     )
-    clean_mask = np.asarray(bundle.labels, dtype=np.int32) == 0
     reference_bank_summary_path = _write_json(
         ctx.reports_dir / REFERENCE_BANK_SUMMARY_FILENAME,
         {
             "script_version": SCRIPT_VERSION,
             "source_feature_file": str(bundle.feature_file.resolve()),
-            "n_reference_clean_samples": int(np.sum(clean_mask)),
-            "source_label_counts": _label_counts(np.asarray(bundle.labels, dtype=np.int32).tolist()),
+            "source_partition": "fit",
+            "split_strategy": splits.split_strategy,
+            "manifest_json": str(splits.manifest_json) if splits.manifest_json is not None else None,
+            "n_reference_clean_samples": int(reference_indices.size),
+            "reference_bank_indices": [int(x) for x in reference_indices.tolist()],
+            "source_label_counts": _label_counts(labels.tolist()),
+            "train_label_counts": _label_counts(labels[splits.train_indices].tolist()),
+            "fit_label_counts": _label_counts(fit_labels.tolist()),
             "mean_zero_count": int(np.sum(np.isclose(benign_mean, 0.0))),
             "safe_std_unit_count": int(np.sum(np.isclose(benign_std, 1.0))),
             "score_summary_fit": _score_summary(fit_scores),
@@ -1100,6 +1320,8 @@ def run_paper_qv_reference_experiment(
             "feature_root": str(Path(feature_root).expanduser().resolve()),
             "feature_output_run": str(derived.output_dir.parent.name),
             "output_root": str(Path(output_root).expanduser().resolve()),
+            "split_strategy": splits.split_strategy,
+            "manifest_json": str(splits.manifest_json) if splits.manifest_json is not None else None,
             "random_state": int(random_state),
             "test_split_percent": int(test_split_percent),
             "calibration_split_percent": int(calibration_split_percent),
@@ -1120,15 +1342,49 @@ def run_paper_qv_reference_experiment(
     }
 
 
+def _manifest_paths_from_root(manifest_root: Path, manifest_glob: str) -> list[Path]:
+    resolved_root = manifest_root.expanduser().resolve()
+    if not resolved_root.is_dir():
+        raise FileNotFoundError(f"Manifest root not found: {resolved_root}")
+    paths = sorted(path.resolve() for path in resolved_root.glob(str(manifest_glob)) if path.is_file())
+    if not paths:
+        raise FileNotFoundError(f"No manifests matched {manifest_glob!r} under {resolved_root}")
+    return paths
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.manifest_root is not None:
+        if args.manifest_json is not None:
+            parser.error("--manifest-json and --manifest-root are mutually exclusive")
+        manifest_paths = _manifest_paths_from_root(args.manifest_root, args.manifest_glob)
+        print(f"Running paper-style q+v reference detector for {len(manifest_paths)} manifest(s)")
+        for manifest_path in manifest_paths:
+            child_run_id = f"{args.run_id}_{manifest_path.stem}" if args.run_id else manifest_path.stem
+            outputs = run_paper_qv_reference_experiment(
+                feature_file=args.feature_file,
+                feature_root=args.feature_root,
+                feature_output_run=args.feature_output_run,
+                output_root=args.output_root,
+                run_id=child_run_id,
+                manifest_json=manifest_path,
+                random_state=args.random_state,
+                test_split_percent=args.test_split_percent,
+                calibration_split_percent=args.calibration_split_percent,
+            )
+            print(f"manifest: {manifest_path}")
+            for key, path in outputs.items():
+                print(f"{key}: {path}")
+        return 0
+
     outputs = run_paper_qv_reference_experiment(
         feature_file=args.feature_file,
         feature_root=args.feature_root,
         feature_output_run=args.feature_output_run,
         output_root=args.output_root,
         run_id=args.run_id,
+        manifest_json=args.manifest_json,
         random_state=args.random_state,
         test_split_percent=args.test_split_percent,
         calibration_split_percent=args.calibration_split_percent,

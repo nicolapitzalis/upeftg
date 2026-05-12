@@ -9,8 +9,9 @@ import shlex
 import subprocess
 from typing import Any, Sequence
 
-from .attack_family_leave_one_out import prepare_manifests
-from ..supervised.pipeline import run_supervised_pipeline
+from .attack_family_leave_one_out import prepare_manifests as prepare_attack_family_manifests
+from .group_leave_one_out import prepare_manifests as prepare_group_leave_one_out_manifests
+from ..supervised.pipeline import SUPPORTED_SELECTION_METRICS, run_supervised_pipeline
 
 
 DEFAULT_MULTICLASS_ATTACK_NAMES = ("RIPPLE", "insertsent", "stybkd", "syntactic")
@@ -28,6 +29,9 @@ class SuiteDefaults:
     hyperparam_config: str = ""
     skip_feature_importance: bool = False
     attack_family_generated_subdir: str | None = None
+    group_leave_one_out: str | None = None
+    group_source_manifest: Path | None = None
+    group_generated_subdir: str | None = None
 
 
 def _repo_root() -> Path:
@@ -63,6 +67,16 @@ def _resolve_feature_spec(path: str | Path, *, repo_root: Path) -> Path:
         return raw.resolve()
     if len(raw.parts) == 1:
         return (repo_root / "runs" / "feature_extract" / raw / "merged" / "spectral_features.npy").resolve()
+    return (repo_root / raw).resolve()
+
+
+def _resolve_cnn_hyperparams_spec(path: str | Path, *, repo_root: Path) -> Path:
+    raw = Path(path).expanduser()
+    if raw.is_absolute():
+        return raw.resolve()
+    if len(raw.parts) == 1:
+        filename = raw.name if raw.suffix else f"{raw.name}.json"
+        return (repo_root / "manifests" / "cnn_hyperparams" / filename).resolve()
     return (repo_root / raw).resolve()
 
 
@@ -111,6 +125,28 @@ def _suite_defaults(suite: str, repo_root: Path) -> SuiteDefaults:
             skip_feature_importance=True,
             attack_family_generated_subdir="leave_one_out_attack_family_binary",
         )
+    if suite == "adapter-leave-one-out":
+        return SuiteDefaults(
+            manifest_root=repo_root / "runs" / "generated_manifests" / "leave_one_out_adapter",
+            run_id_prefix="leave_one_out_adapter_cnn",
+            suite_label="Adapter leave-one-out",
+            suite_label_lower="adapter leave-one-out",
+            skip_feature_importance=True,
+            group_leave_one_out="adapter",
+            group_source_manifest=repo_root / "manifests" / "adapter_exploration" / "llama2_7b_tbh_all_adapters.json",
+            group_generated_subdir="leave_one_out_adapter",
+        )
+    if suite == "architecture-leave-one-out":
+        return SuiteDefaults(
+            manifest_root=repo_root / "runs" / "generated_manifests" / "leave_one_out_architecture",
+            run_id_prefix="leave_one_out_architecture_cnn",
+            suite_label="Architecture leave-one-out",
+            suite_label_lower="architecture leave-one-out",
+            skip_feature_importance=True,
+            group_leave_one_out="architecture",
+            group_source_manifest=repo_root / "manifests" / "architecture_exploration" / "tbh_all_architectures.json",
+            group_generated_subdir="leave_one_out_architecture",
+        )
     if suite == "tbh-tba-zero-shot":
         return SuiteDefaults(
             manifest_root=repo_root / "manifests" / "zero_shots" / "attack_wise",
@@ -145,8 +181,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run a supervised CNN transfer suite by preparing each target run, "
-            "locking it to a reference CNN winner, and submitting one worker plus "
-            "one dependent finalize Slurm job per manifest."
+            "then submitting worker and dependent finalize Slurm jobs per manifest. "
+            "Use --hyperparam-config to freeze to a reference winner, or "
+            "--cnn-hyperparams to run a fresh CNN grid per held-out manifest."
         )
     )
     parser.add_argument(
@@ -154,6 +191,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             "zero-shot",
             "leave-one-out",
+            "adapter-leave-one-out",
+            "architecture-leave-one-out",
             "attack-family-leave-one-out-binary",
             "attack-family-leave-one-out-multiclass",
             "tbh-tba-zero-shot",
@@ -162,6 +201,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("SUPERVISED_CNN_SUITE", "zero-shot"),
     )
     parser.add_argument("--hyperparam-config", "--hyperparam_config", dest="hyperparam_config", default=None)
+    parser.add_argument(
+        "--cnn-hyperparams",
+        "--cnn_hyperparams",
+        dest="cnn_hyperparams",
+        type=Path,
+        default=None,
+        help=(
+            "CNN hyperparameter grid JSON. When set, each held-out manifest runs its own grid search "
+            "instead of freezing a reference winner."
+        ),
+    )
     parser.add_argument("--manifest-root", "--zero-shot-manifest-root", dest="manifest_root", type=Path, default=None)
     parser.add_argument("--manifest-filter", "--manifest_filter", dest="manifest_filter", default=None)
     parser.add_argument("--run-id-prefix", dest="run_id_prefix", default=None)
@@ -184,6 +234,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--split-by-folder", dest="split_by_folder", action="store_true", default=None)
     parser.add_argument("--no-split-by-folder", dest="split_by_folder", action="store_false")
     parser.add_argument("--cv-folds", type=int, default=None)
+    parser.add_argument(
+        "--selection-metric",
+        choices=list(SUPPORTED_SELECTION_METRICS),
+        default=None,
+        help=(
+            "Metric used to choose the winning hyperparameters. Use binary_auroc to train multiclass "
+            "but select by clean-vs-any-attack AUROC."
+        ),
+    )
     parser.add_argument("--cv-seeds", nargs="+", type=int, default=None)
     parser.add_argument("--spectral-sv-top-k", type=int, default=None)
     parser.add_argument("--spectral-moment-source", choices=["entrywise", "sv", "both"], default=None)
@@ -199,6 +258,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-dry-run", dest="dry_run", action="store_false")
     parser.add_argument("--skip-feature-importance", dest="skip_feature_importance", action="store_true", default=None)
     parser.add_argument("--keep-feature-importance", dest="skip_feature_importance", action="store_false")
+    parser.add_argument("--rank-label-weight-loss", action="store_true", default=None)
+    parser.add_argument("--no-rank-label-weight-loss", dest="rank_label_weight_loss", action="store_false")
     parser.add_argument(
         "--source-leave-one-out-manifest-root",
         type=Path,
@@ -209,7 +270,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--generated-manifest-root",
         type=Path,
         default=None,
-        help="Output root for generated attack-family leave-one-out manifests.",
+        help="Output root for generated attack-family, adapter, or architecture leave-one-out manifests.",
+    )
+    parser.add_argument(
+        "--source-group-manifest",
+        type=Path,
+        default=None,
+        help="Source grouped manifest for adapter/architecture generated leave-one-out suites.",
     )
     return parser
 
@@ -274,6 +341,7 @@ def _read_reference_defaults(reference_run_dir: Path) -> dict[str, Any]:
         "spectral_entrywise_delta_mode": str(extractor_params.get("spectral_entrywise_delta_mode", "dense")),
         "cv_folds": int(tuning.get("cv_folds_requested", 5)),
         "cv_seeds": [int(x) for x in tuning.get("cv_random_states", [42])],
+        "selection_metric": str(tuning.get("metric", "task_default")),
         "calibration_split": threshold_selection.get("calibration_split_percent"),
         "accepted_fprs": [float(x) for x in accepted_fprs],
         "split_by_folder": bool(threshold_selection.get("split_by_folder", False)),
@@ -296,15 +364,28 @@ def _lock_tuning_manifest(
     reference_run_id: str,
     reference_task_index: int,
     winner_params: dict[str, Any],
+    extra_task_params: dict[str, Any] | None = None,
 ) -> None:
     payload = json.loads(tuning_manifest_path.read_text(encoding="utf-8"))
+    extra_task_params = dict(extra_task_params or {})
+
+    def params_match_reference(task_params: Any) -> bool:
+        if not isinstance(task_params, dict):
+            return False
+        comparable = dict(task_params)
+        for key in extra_task_params:
+            comparable.pop(key, None)
+        return comparable == winner_params and all(
+            task_params.get(key) == value for key, value in extra_task_params.items()
+        )
+
     tasks = payload.get("tuning", {}).get("tasks", [])
     matches = [
         task
         for task in tasks
         if isinstance(task, dict)
         and str(task.get("model_name")) == "cnn_1d"
-        and task.get("params") == winner_params
+        and params_match_reference(task.get("params"))
     ]
     if len(matches) > 1:
         raise ValueError(
@@ -326,8 +407,9 @@ def _lock_tuning_manifest(
         selected = dict(template)
         selected["model_name"] = "cnn_1d"
         selected["params"] = dict(winner_params)
-        selected.setdefault("complexity_rank", 6)
-        selected.setdefault("normalization_policy", "masked_train_only")
+    selected["params"] = {**dict(selected.get("params", {})), **extra_task_params}
+    selected.setdefault("complexity_rank", 6)
+    selected.setdefault("normalization_policy", "masked_train_only")
 
     selected["task_index"] = 0
     payload["tuning"]["tasks"] = [selected]
@@ -346,7 +428,7 @@ def _lock_tuning_manifest(
         "source_run_id": reference_run_id,
         "source_task_index": int(reference_task_index),
         "model_name": "cnn_1d",
-        "params": dict(winner_params),
+        "params": {**dict(winner_params), **extra_task_params},
     }
 
     warnings = [
@@ -372,15 +454,24 @@ def _lock_tuning_manifest(
     )
 
 
-def _runtime_defaults(tuning_manifest_path: Path) -> tuple[int, list[float]]:
+def _runtime_defaults(tuning_manifest_path: Path) -> tuple[int, int, list[float]]:
     payload = json.loads(tuning_manifest_path.read_text(encoding="utf-8"))
     runtime = payload.get("runtime", {})
     if not isinstance(runtime, dict):
         runtime = {}
     return (
         int(runtime.get("slurm_cpus_per_task", 4)),
+        int(runtime.get("slurm_max_concurrent", 1)),
         [float(x) for x in runtime.get("score_percentiles", [])],
     )
+
+
+def _tuning_task_count(tuning_manifest_path: Path) -> int:
+    payload = json.loads(tuning_manifest_path.read_text(encoding="utf-8"))
+    tasks = payload.get("tuning", {}).get("tasks", [])
+    if not isinstance(tasks, list) or not tasks:
+        raise ValueError(f"Tuning manifest has no tasks: {tuning_manifest_path}")
+    return int(len(tasks))
 
 
 def _submit_sbatch(command: list[str], *, repo_root: Path) -> str:
@@ -401,19 +492,35 @@ def _wrap_command(parts: Sequence[str]) -> str:
     )
 
 
-def _split_by_folder_from(args: argparse.Namespace, reference_defaults: dict[str, Any]) -> bool:
+def _split_by_folder_from(
+    args: argparse.Namespace,
+    reference_defaults: dict[str, Any] | None,
+) -> bool:
     if args.split_by_folder is not None:
         return bool(args.split_by_folder)
     env_value = _env_bool("SPLIT_BY_FOLDER")
     if env_value is not None:
         return env_value
-    return bool(reference_defaults["split_by_folder"])
+    if reference_defaults is not None:
+        return bool(reference_defaults["split_by_folder"])
+    return False
+
+
+def _reference_default(
+    reference_defaults: dict[str, Any] | None,
+    key: str,
+    fallback: Any,
+) -> Any:
+    if reference_defaults is not None and key in reference_defaults:
+        return reference_defaults[key]
+    return fallback
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
     repo_root = _repo_root()
     suite_defaults = _suite_defaults(args.suite, repo_root)
+    generated_manifest_root_for_suite: Path | None = None
 
     if suite_defaults.attack_family_generated_subdir is not None:
         source_root = _resolve_path(
@@ -428,11 +535,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             or (repo_root / "runs" / "generated_manifests" / suite_defaults.attack_family_generated_subdir),
             base=repo_root,
         )
-        prepare_manifests(source_root, generated_root)
+        prepare_attack_family_manifests(source_root, generated_root)
+        generated_manifest_root_for_suite = generated_root
+
+    if suite_defaults.group_leave_one_out is not None:
+        source_manifest = _resolve_path(
+            args.source_group_manifest
+            or os.environ.get("SOURCE_GROUP_MANIFEST")
+            or suite_defaults.group_source_manifest,
+            base=repo_root,
+        )
+        generated_root = _resolve_path(
+            args.generated_manifest_root
+            or os.environ.get("GENERATED_MANIFEST_ROOT")
+            or (repo_root / "runs" / "generated_manifests" / suite_defaults.group_generated_subdir),
+            base=repo_root,
+        )
+        prepare_group_leave_one_out_manifests(
+            source_manifest,
+            generated_root,
+            group_by=suite_defaults.group_leave_one_out,
+        )
+        generated_manifest_root_for_suite = generated_root
 
     manifest_root = _resolve_path(
         args.manifest_root
         or os.environ.get("ZERO_SHOT_MANIFEST_ROOT")
+        or generated_manifest_root_for_suite
         or suite_defaults.manifest_root,
         base=repo_root,
     )
@@ -456,20 +585,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     slurm_log_dir.mkdir(parents=True, exist_ok=True)
 
+    cnn_hyperparams_raw = args.cnn_hyperparams or os.environ.get("CNN_HYPERPARAMS")
+    cnn_hyperparams = (
+        _resolve_cnn_hyperparams_spec(cnn_hyperparams_raw, repo_root=repo_root)
+        if cnn_hyperparams_raw
+        else None
+    )
+    tuning_mode = "per-holdout-grid" if cnn_hyperparams is not None else "fixed-reference"
+
     hyperparam_config = (
         args.hyperparam_config
         or os.environ.get("HYPERPARAM_CONFIG")
         or suite_defaults.hyperparam_config
     )
-    if not hyperparam_config:
-        raise SystemExit("--hyperparam-config is required.")
-    reference_run_id, reference_run_dir = _resolve_reference_run_dir(str(hyperparam_config), repo_root)
-    reference_defaults = _read_reference_defaults(reference_run_dir)
+    if tuning_mode == "fixed-reference" and not hyperparam_config:
+        raise SystemExit("--hyperparam-config is required unless --cnn-hyperparams is set.")
+
+    reference_run_id: str | None = None
+    reference_defaults: dict[str, Any] | None = None
+    if hyperparam_config:
+        reference_run_id, reference_run_dir = _resolve_reference_run_dir(str(hyperparam_config), repo_root)
+        reference_defaults = _read_reference_defaults(reference_run_dir)
 
     if not manifest_root.is_dir():
         raise SystemExit(f"{suite_defaults.suite_label} manifest root not found: {manifest_root}")
     if not conda_sh.exists():
         raise SystemExit(f"Conda activation script not found: {conda_sh}")
+    if cnn_hyperparams is not None and not cnn_hyperparams.exists():
+        raise SystemExit(f"CNN hyperparams file not found: {cnn_hyperparams}")
 
     manifest_filter = (
         args.manifest_filter
@@ -500,36 +643,47 @@ def main(argv: Sequence[str] | None = None) -> int:
     if task_mode == "attack_family_multiclass" and not multiclass_attack_names:
         multiclass_attack_names = list(DEFAULT_MULTICLASS_ATTACK_NAMES)
 
-    feature_file = args.feature_file or os.environ.get("FEATURE_FILE") or reference_defaults["feature_file"]
+    feature_file = (
+        args.feature_file
+        or os.environ.get("FEATURE_FILE")
+        or _reference_default(reference_defaults, "feature_file", None)
+    )
+    if not feature_file:
+        raise SystemExit("--feature-file is required when --cnn-hyperparams is set without --hyperparam-config.")
     features = (
         list(args.features)
         if args.features is not None
-        else (_env_words("FEATURES") or list(reference_defaults["features"]))
+        else (_env_words("FEATURES") or list(_reference_default(reference_defaults, "features", [])))
     )
     if not features:
-        raise SystemExit("FEATURES must include at least one feature group.")
-    model = str(args.model or os.environ.get("MODEL") or reference_defaults["winner_model_name"])
-    spectral_sv_top_k = int(args.spectral_sv_top_k or os.environ.get("SV_TOP_K") or reference_defaults["spectral_sv_top_k"])
+        raise SystemExit("--features is required when --cnn-hyperparams is set without --hyperparam-config.")
+    model = str(args.model or os.environ.get("MODEL") or _reference_default(reference_defaults, "winner_model_name", "cnn_1d"))
+    spectral_sv_top_k = int(args.spectral_sv_top_k or os.environ.get("SV_TOP_K") or _reference_default(reference_defaults, "spectral_sv_top_k", 8))
     spectral_moment_source = str(
         args.spectral_moment_source
         or os.environ.get("SPECTRAL_MOMENT_SOURCE")
-        or reference_defaults["spectral_moment_source"]
+        or _reference_default(reference_defaults, "spectral_moment_source", "both")
     )
     spectral_qv_sum_mode = str(
         args.spectral_qv_sum_mode
         or os.environ.get("SPECTRAL_QV_SUM_MODE")
-        or reference_defaults["spectral_qv_sum_mode"]
+        or _reference_default(reference_defaults, "spectral_qv_sum_mode", "append")
     )
     spectral_entrywise_delta_mode = str(
         args.spectral_entrywise_delta_mode
         or os.environ.get("SPECTRAL_ENTRYWISE_DELTA_MODE")
-        or reference_defaults["spectral_entrywise_delta_mode"]
+        or _reference_default(reference_defaults, "spectral_entrywise_delta_mode", "dense")
     )
-    cv_folds = int(args.cv_folds or os.environ.get("CV_FOLDS") or reference_defaults["cv_folds"])
+    cv_folds = int(args.cv_folds or os.environ.get("CV_FOLDS") or _reference_default(reference_defaults, "cv_folds", 5))
+    selection_metric = str(
+        args.selection_metric
+        or os.environ.get("SELECTION_METRIC")
+        or _reference_default(reference_defaults, "selection_metric", "task_default")
+    )
     cv_seeds = (
         list(args.cv_seeds)
         if args.cv_seeds is not None
-        else [int(x) for x in (_env_words("CV_SEEDS") or reference_defaults["cv_seeds"])]
+        else [int(x) for x in (_env_words("CV_SEEDS") or _reference_default(reference_defaults, "cv_seeds", [42]))]
     )
     if not cv_seeds:
         raise SystemExit("CV_SEEDS must include at least one value.")
@@ -537,19 +691,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     calibration_split_raw = (
         args.calibration_split
         if args.calibration_split is not None
-        else os.environ.get("CALIBRATION_SPLIT", reference_defaults["calibration_split"])
+        else os.environ.get("CALIBRATION_SPLIT", _reference_default(reference_defaults, "calibration_split", None))
     )
     calibration_split = None if calibration_split_raw in {None, ""} else int(calibration_split_raw)
     accepted_fpr = (
         list(args.accepted_fpr)
         if args.accepted_fpr is not None
-        else [float(x) for x in (_env_words("ACCEPTED_FPR") or reference_defaults["accepted_fprs"])]
+        else [float(x) for x in (_env_words("ACCEPTED_FPR") or _reference_default(reference_defaults, "accepted_fprs", []))]
     )
     if calibration_split is None and not accepted_fpr:
         accepted_fpr = None
     if (calibration_split is None) != (accepted_fpr is None):
         raise SystemExit("CALIBRATION_SPLIT and ACCEPTED_FPR must either both be set or both be empty.")
     split_by_folder = _split_by_folder_from(args, reference_defaults)
+    rank_label_weight_loss = _truthy(
+        args.rank_label_weight_loss
+        if args.rank_label_weight_loss is not None
+        else _env_bool("RANK_LABEL_WEIGHT_LOSS"),
+        default=False,
+    )
     dry_run = _truthy(args.dry_run if args.dry_run is not None else _env_bool("DRY_RUN"), default=False)
     skip_feature_importance = _truthy(
         args.skip_feature_importance
@@ -574,9 +734,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print(f"Repository root: {repo_root}")
     print(f"{suite_label} manifest root: {manifest_root}")
-    print(f"Reference run: {reference_run_id}")
-    print(f"Reference feature file: {feature_file}")
-    print(f"Reference winner task_index: {reference_defaults['winner_task_index']}")
+    print(f"Tuning mode: {tuning_mode}")
+    if reference_run_id is not None:
+        print(f"Reference run: {reference_run_id}")
+        print(f"Reference winner task_index: {reference_defaults['winner_task_index'] if reference_defaults else 'unknown'}")
+    if cnn_hyperparams is not None:
+        print(f"CNN hyperparams: {cnn_hyperparams}")
+    print(f"Feature file: {feature_file}")
     print(f"Model: {model}")
     print(f"Task mode: {task_mode}")
     if multiclass_attack_names:
@@ -587,11 +751,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"SPECTRAL_QV_SUM_MODE: {spectral_qv_sum_mode}")
     print(f"SPECTRAL_ENTRYWISE_DELTA_MODE: {spectral_entrywise_delta_mode}")
     print(f"CV_FOLDS: {cv_folds}")
+    print(f"SELECTION_METRIC: {selection_metric}")
     print(f"CV_SEEDS: {' '.join(str(x) for x in cv_seeds)}")
     print(f"TRAIN_SPLIT: {train_split}")
     print(f"CALIBRATION_SPLIT: {calibration_split if calibration_split is not None else 'none'}")
     print(f"ACCEPTED_FPR: {' '.join(str(x) for x in accepted_fpr) if accepted_fpr else 'none'}")
     print(f"SPLIT_BY_FOLDER: {1 if split_by_folder else 0}")
+    print(f"RANK_LABEL_WEIGHT_LOSS: {1 if rank_label_weight_loss else 0}")
     print(f"Manifest count: {len(manifests)}")
     if manifest_filter:
         print(f"Manifest filter: {manifest_filter}")
@@ -607,8 +773,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if dry_run:
             print("  prepare: python -m upeftguard.cli run supervised --stage prepare ...")
-            print(f"  freeze:  reference winner from {reference_run_id}")
-            print("  worker:  sbatch single-task worker")
+            if tuning_mode == "fixed-reference":
+                print(f"  freeze:  reference winner from {reference_run_id}")
+                print("  worker:  sbatch single-task worker")
+            else:
+                print(f"  grid:    CNN hyperparams from {cnn_hyperparams}")
+                print("  worker:  sbatch worker array over all grid tasks")
             print("  finalize: sbatch dependent finalize")
             continue
 
@@ -645,26 +815,34 @@ def main(argv: Sequence[str] | None = None) -> int:
             task_index=None,
             task_mode=task_mode,
             multiclass_attack_names=multiclass_attack_names or None,
-            cnn_hyperparams=None,
+            cnn_hyperparams=cnn_hyperparams,
+            rank_label_weight_loss=rank_label_weight_loss,
             skip_feature_importance=False,
+            selection_metric=selection_metric,
         )
 
         run_dir = output_root / "supervised" / run_id
         tuning_manifest_path = run_dir / "reports" / "tuning_manifest.json"
-        _lock_tuning_manifest(
-            tuning_manifest_path=tuning_manifest_path,
-            reference_run_id=reference_run_id,
-            reference_task_index=int(reference_defaults["winner_task_index"]),
-            winner_params=dict(reference_defaults["winner_params"]),
-        )
+        if tuning_mode == "fixed-reference":
+            assert reference_run_id is not None
+            assert reference_defaults is not None
+            _lock_tuning_manifest(
+                tuning_manifest_path=tuning_manifest_path,
+                reference_run_id=reference_run_id,
+                reference_task_index=int(reference_defaults["winner_task_index"]),
+                winner_params=dict(reference_defaults["winner_params"]),
+                extra_task_params=({"rank_label_weight_loss": True} if rank_label_weight_loss else None),
+            )
 
-        default_cpus, default_score_percentiles = _runtime_defaults(tuning_manifest_path)
+        default_cpus, default_max_concurrent, default_score_percentiles = _runtime_defaults(tuning_manifest_path)
         worker_cpus = int(
             args.worker_cpus_per_task
             or os.environ.get("SLURM_CPUS_PER_TASK_OVERRIDE")
             or default_cpus
             or 4
         )
+        worker_task_count = 1 if tuning_mode == "fixed-reference" else _tuning_task_count(tuning_manifest_path)
+        worker_max_concurrent = int(max(1, min(worker_task_count, int(default_max_concurrent or worker_task_count))))
         finalize_extra_args: list[str] = []
         if score_percentiles:
             finalize_extra_args.extend(["--score-percentiles", *[str(float(x)) for x in score_percentiles]])
@@ -702,6 +880,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 str(worker_cpus),
             ]
         )
+        if tuning_mode == "per-holdout-grid":
+            worker_wrap = worker_wrap.replace("--task-index 0", "--task-index ${SLURM_ARRAY_TASK_ID}")
         finalize_wrap = _wrap_command(
             [
                 "source",
@@ -726,25 +906,42 @@ def main(argv: Sequence[str] | None = None) -> int:
                 *finalize_extra_args,
             ]
         )
-        worker_job_id = _submit_sbatch(
-            [
-                "sbatch",
-                "--parsable",
-                "--partition",
-                slurm_partition,
-                "--cpus-per-task",
-                str(worker_cpus),
-                "--job-name",
-                f"upeftguard_supervised_worker_{slurm_safe_run_id}",
-                "--output",
-                str(slurm_log_dir / f"supervised_worker_{slurm_safe_run_id}_%j.out"),
-                "--error",
-                str(slurm_log_dir / f"supervised_worker_{slurm_safe_run_id}_%j.err"),
-                "--wrap",
-                worker_wrap,
-            ],
-            repo_root=repo_root,
-        )
+        worker_command = [
+            "sbatch",
+            "--parsable",
+            "--partition",
+            slurm_partition,
+            "--cpus-per-task",
+            str(worker_cpus),
+            "--job-name",
+            f"upeftguard_supervised_worker_{slurm_safe_run_id}",
+            "--output",
+            str(
+                slurm_log_dir
+                / (
+                    f"supervised_worker_{slurm_safe_run_id}_%j.out"
+                    if tuning_mode == "fixed-reference"
+                    else f"supervised_worker_{slurm_safe_run_id}_%A_%a.out"
+                )
+            ),
+            "--error",
+            str(
+                slurm_log_dir
+                / (
+                    f"supervised_worker_{slurm_safe_run_id}_%j.err"
+                    if tuning_mode == "fixed-reference"
+                    else f"supervised_worker_{slurm_safe_run_id}_%A_%a.err"
+                )
+            ),
+            "--wrap",
+            worker_wrap,
+        ]
+        if tuning_mode == "per-holdout-grid":
+            worker_command[worker_command.index("--job-name"):worker_command.index("--job-name")] = [
+                "--array",
+                f"0-{worker_task_count - 1}%{worker_max_concurrent}",
+            ]
+        worker_job_id = _submit_sbatch(worker_command, repo_root=repo_root)
         finalize_job_id = _submit_sbatch(
             [
                 "sbatch",
@@ -767,7 +964,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             repo_root=repo_root,
         )
         print(f"  prepared run_dir {run_dir}")
-        print(f"  locked to reference winner from {reference_run_id}")
+        if tuning_mode == "fixed-reference":
+            print(f"  locked to reference winner from {reference_run_id}")
+        else:
+            print(f"  kept CNN grid with {worker_task_count} task(s)")
         print(f"  worker job id: {worker_job_id}")
         print(f"  finalize job id: {finalize_job_id}")
         submitted += 1

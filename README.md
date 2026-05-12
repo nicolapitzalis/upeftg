@@ -12,20 +12,21 @@ Legacy top-level scripts (`prepare_data.py`, `cluster_z_space.py`, `gmm_train_in
 
 ## Environment
 
-Use the `upeftg` conda environment:
+Create the `upeftg` conda environment from the repository environment file:
 
 ```bash
-source /home/n.pitzalis/miniconda3/etc/profile.d/conda.sh
+conda env create -f environment.yml
 conda activate upeftg
 ```
 
-Required packages include:
-- `numpy`
-- `scipy`
-- `scikit-learn`
-- `matplotlib`
-- `safetensors`
-- `huggingface_hub`
+If the environment already exists, update it with:
+
+```bash
+conda env update -f environment.yml --prune
+conda activate upeftg
+```
+
+The environment includes `torch`, which is required for the CNN supervised models.
 
 ## Package Layout
 
@@ -55,6 +56,46 @@ Experiment manifests are grouped under `manifests/` by study:
 - `single_datasets`
 - `others`
 
+Two manifest structures are supported.
+
+Single-pool manifests use one `path` section. The supervised pipeline can split this pool into train/inference partitions with `--train-split`:
+
+```json
+{
+  "path": [
+    {
+      "path": "llama2_7b_toxic_backdoors_hard_rank256_qv/llama2_7b_toxic_backdoors_hard_rank256_qv_label0_",
+      "indices": [0, 249]
+    },
+    {
+      "path": "llama2_7b_toxic_backdoors_hard_rank256_qv/llama2_7b_toxic_backdoors_hard_rank256_qv_label1_",
+      "indices": [0, 249]
+    }
+  ]
+}
+```
+
+Joint manifests use separate `train` and `infer` sections. These manifests already define the train/inference split, so supervised runs should keep `--train-split 100`:
+
+```json
+{
+  "train": [
+    {
+      "path": "llama2_7b_toxic_backdoors_hard_rank256_qv/llama2_7b_toxic_backdoors_hard_rank256_qv_label0_",
+      "indices": [0, 249]
+    }
+  ],
+  "infer": [
+    {
+      "path": "llama2_7b_toxic_backdoors_alpaca_rank256_qv/llama2_7b_toxic_backdoors_alpaca_rank256_qv_label0_",
+      "indices": [0, 249]
+    }
+  ]
+}
+```
+
+Each section can contain explicit model paths as strings, or structured entries with `path` plus `indices`. A structured `path` is a prefix that expands across the inclusive index range.
+
 ## Run Artifacts
 
 All commands write run artifacts under:
@@ -79,7 +120,29 @@ Default dataset root: `/models/$USER/unsupervised-peftguard/data`
 
 Override it with `UPEFTGUARD_DATA_ROOT` or `UPEFTGUARD_STORAGE_ROOT` if needed.
 
-### 1. Clustering pipeline
+### 1. Dataset utility
+
+```bash
+python -m upeftguard.cli util download-dataset --show-list
+python -m upeftguard.cli util download-dataset \
+  --dataset llama2_7b_toxic_backdoors_alpaca_rank256_qv \
+  --show-list
+python -m upeftguard.cli util download-dataset \
+  --dataset llama2_7b_imdb_insertsent_rank256_qv \
+  --all
+python -m upeftguard.cli util download-dataset \
+  --dataset llama2_7b_imdb_insertsent_rank256_qv \
+  --clean 100 --backdoored 60
+python -m upeftguard.cli util download-dataset \
+  --dataset llama2_7b_imdb_syntactic_rank256_qv \
+  --backdoored 150 152
+```
+
+Use `--show-list` without `--dataset` to discover folder names, or with `--dataset` to inspect the clean/backdoor indices available inside a specific folder. Use `--all` to download the full clean+backdoor contents of the selected folder. `--dataset` is required for any download.
+
+Downloads land under `/models/$USER/unsupervised-peftguard/data` by default.
+
+### 2. Clustering pipeline
 
 ```bash
 python -m upeftguard.cli run clustering \
@@ -94,7 +157,7 @@ python -m upeftguard.cli run clustering \
   --use-offline-label-metrics
 ```
 
-### 2. GMM train/inference pipeline (canonical)
+### 3. GMM train/inference pipeline (canonical)
 
 ```bash
 python -m upeftguard.cli run gmm-train-inference \
@@ -113,7 +176,7 @@ Notes:
 - Threshold percentiles are computed from **all train scores**.
 - Canonical report: `gmm_train_inference_report.json`.
 
-### 3. Feature extraction
+### 4. Feature extraction
 
 ```bash
 python -m upeftguard.cli feature extract \
@@ -155,7 +218,7 @@ Each feature extraction run is standalone. The array launcher always writes one 
 
 Feature extraction does not append into an existing run. If you want to combine two completed feature runs, use `util merge-features` as a separate step.
 
-### 4. Unsupervised t-SNE over features
+### 5. Unsupervised t-SNE over features
 
 ```bash
 python -m upeftguard.cli run unsupervised-tsne \
@@ -174,7 +237,7 @@ Useful options:
 - `--perplexities`, `--learning-rates`, `--max-iters-grid`, `--metrics`, `--inits`, and `--random-states` to sweep multiple t-SNE settings in one run.
 - Bare `--feature-file` names resolve under `runs/feature_extract/<RUN_ID>/merged/` and automatically pick up sibling `spectral_model_names.json`, optional `spectral_labels.npy`, and optional `spectral_metadata.json`.
 
-### 5. Layer scatter plots over features
+### 6. Layer scatter plots over features
 
 ```bash
 python -m upeftguard.cli run unsupervised-layer-scatter \
@@ -190,7 +253,7 @@ Notes:
 - Each emitted feature now produces two images: a scatter figure with side-by-side `clean` and `backdoor` panels, plus a paired boxplot figure with one `clean` box and one `backdoor` box for each layer.
 - The run also saves `all_features_boxplots.png`, a single multi-panel summary figure that tiles the boxplots for all emitted features together.
 
-### 6. Supervised pipeline
+### 7. Supervised pipeline
 
 ```bash
 python -m upeftguard.cli run supervised \
@@ -245,6 +308,8 @@ sbatch ./sbatch/supervised_array.sh
 - `CNN_HYPERPARAMS=/abs/path/to/hyperparams.json`
 - `SLURM_CPUS_PER_TASK_REQUEST=<N>`
 - `SLURM_MAX_CONCURRENT_REQUEST=<N>`
+
+`python -m upeftguard.cli run supervised` is the canonical supervised pipeline. For cluster runs, `sbatch/supervised_array.sh` is the generic Slurm driver, and `python -m upeftguard.cli experiment supervised-slurm` is a convenience launcher that submits that driver with the right environment variables.
 
 For most runs, the recommended interface is the thin launcher:
 
@@ -321,6 +386,26 @@ python -m upeftguard.cli experiment supervised-cnn-suite \
 
 This launcher uses the same 4 generated attack-family holdout manifests, defaults to the binary CNN winner from `cnn_ag_news_imdb_attack_family_binary_tuning`, uses `TASK_MODE=binary`, and writes outputs under `runs/supervised/leave_one_out_attack_family_binary_cnn/<RUN_ID>/`. Pass `--hyperparam_config <REFERENCE_RUN_ID_OR_RUN_DIR>` to compare against a different binary-head winner.
 
+For adapter-family and architecture-family leave-one-out sweeps:
+
+```bash
+python -m upeftguard.cli experiment supervised-cnn-suite \
+  --suite adapter-leave-one-out \
+  --cnn-hyperparams cnn_1d_single_dataset_small_grid \
+  --feature-file <FEATURE_FILE> \
+  --features energy kurtosis l1_norm l2_norm linf_norm mean_abs concentration_of_energy sv_topk stable_rank spectral_entropy effective_rank \
+  --dry-run
+
+python -m upeftguard.cli experiment supervised-cnn-suite \
+  --suite architecture-leave-one-out \
+  --cnn-hyperparams cnn_1d_single_dataset_small_grid \
+  --feature-file <FEATURE_FILE> \
+  --features energy kurtosis l1_norm l2_norm linf_norm mean_abs concentration_of_energy sv_topk stable_rank spectral_entropy effective_rank \
+  --dry-run
+```
+
+These launchers generate grouped joint manifests from `manifests/adapter_exploration/llama2_7b_tbh_all_adapters.json` and `manifests/architecture_exploration/tbh_all_architectures.json`, train on all groups except the held-out adapter or architecture, run a fresh CNN grid for each held-out group, and write outputs under `runs/supervised/leave_one_out_adapter_cnn/<RUN_ID>/` or `runs/supervised/leave_one_out_architecture_cnn/<RUN_ID>/`. Passing `--hyperparam-config <REFERENCE_RUN_ID_OR_RUN_DIR>` without `--cnn-hyperparams` keeps the old fixed-reference-winner behavior; passing both uses the reference only for defaults such as feature/extractor settings while still running the per-holdout grid.
+
 The same contract applies to direct CLI runs and Slurm-array runs: supervised always consumes a precomputed feature bundle.
 
 ```bash
@@ -331,28 +416,6 @@ python -m upeftguard.cli run supervised \
   --features energy kurtosis l1_norm l2_norm linf_norm mean_abs concentration_of_energy sv_topk stable_rank spectral_entropy effective_rank \
   --tuning-executor slurm_array
 ```
-
-### 7. Dataset utility
-
-```bash
-python -m upeftguard.cli util download-dataset --show-list
-python -m upeftguard.cli util download-dataset \
-  --dataset llama2_7b_toxic_backdoors_alpaca_rank256_qv \
-  --show-list
-python -m upeftguard.cli util download-dataset \
-  --dataset llama2_7b_imdb_insertsent_rank256_qv \
-  --all
-python -m upeftguard.cli util download-dataset \
-  --dataset llama2_7b_imdb_insertsent_rank256_qv \
-  --clean 100 --backdoored 60
-python -m upeftguard.cli util download-dataset \
-  --dataset llama2_7b_imdb_syntactic_rank256_qv \
-  --backdoored 150 152
-```
-
-Use `--show-list` without `--dataset` to discover folder names, or with `--dataset` to inspect the clean/backdoor indices available inside a specific folder. Use `--all` to download the full clean+backdoor contents of the selected folder. `--dataset` is required for any download.
-
-Downloads land under `/models/$USER/unsupervised-peftguard/data` by default.
 
 ### 8. Feature merge utility
 

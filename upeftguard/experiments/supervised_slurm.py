@@ -9,6 +9,8 @@ import subprocess
 import sys
 from typing import Sequence
 
+from ..supervised.pipeline import SUPPORTED_SELECTION_METRICS
+
 
 DEFAULT_MULTICLASS_ATTACK_NAMES = ["RIPPLE", "insertsent", "stybkd", "syntactic"]
 
@@ -81,12 +83,15 @@ def _parser() -> argparse.ArgumentParser:
         help="Maximum concurrent tuning workers. Default: use all nodes in the selected partition.",
     )
     parser.add_argument("--cv-folds", type=int, default=5)
+    parser.add_argument("--selection-metric", choices=list(SUPPORTED_SELECTION_METRICS), default="task_default")
     parser.add_argument("--cv-seeds", nargs="+", type=int, default=[42])
     parser.add_argument("--random-state", type=int, default=42)
     parser.add_argument("--train-split", type=int, default=100)
     parser.add_argument("--calibration-split", type=int, default=None)
     parser.add_argument("--accepted-fpr", nargs="+", type=float, default=None)
     parser.add_argument("--split-by-folder", action="store_true")
+    parser.add_argument("--class-weight-loss", action="store_true")
+    parser.add_argument("--rank-label-weight-loss", action="store_true")
     parser.add_argument("--score-percentiles", nargs="+", type=float, default=None)
     parser.add_argument("--spectral-sv-top-k", type=int, default=8)
     parser.add_argument(
@@ -154,6 +159,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--multiclass-attack-names is required for attack_family_multiclass")
     if (args.calibration_split is None) != (args.accepted_fpr is None):
         raise SystemExit("--calibration-split and --accepted-fpr must either both be set or both be omitted")
+    if bool(args.class_weight_loss) and bool(args.rank_label_weight_loss):
+        raise SystemExit("--class-weight-loss and --rank-label-weight-loss are mutually exclusive")
 
     run_id = args.run_id or _default_run_id(
         manifest_json=manifest_json,
@@ -184,10 +191,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             "SPECTRAL_QV_SUM_MODE": str(args.spectral_qv_sum_mode),
             "SPECTRAL_ENTRYWISE_DELTA_MODE": str(args.spectral_entrywise_delta_mode),
             "CV_FOLDS": str(int(args.cv_folds)),
+            "SELECTION_METRIC": str(args.selection_metric),
             "CV_SEEDS": " ".join(str(int(x)) for x in args.cv_seeds),
             "RANDOM_STATE": str(int(args.random_state)),
             "TRAIN_SPLIT": str(int(args.train_split)),
             "SPLIT_BY_FOLDER": "1" if bool(args.split_by_folder) else "0",
+            "CLASS_WEIGHT_LOSS": "1" if bool(args.class_weight_loss) else "0",
+            "RANK_LABEL_WEIGHT_LOSS": "1" if bool(args.rank_label_weight_loss) else "0",
             "SLURM_PARTITION": str(args.partition),
             "SLURM_CPUS_PER_TASK_REQUEST": (
                 str(int(args.worker_cpus)) if args.worker_cpus is not None else "auto"
@@ -219,6 +229,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if cnn_hyperparams is not None:
         print(f"  cnn_hyperparams={cnn_hyperparams}")
     print(f"  feature_file={feature_file}")
+    print(f"  selection_metric={args.selection_metric}")
+    print(f"  class_weight_loss={bool(args.class_weight_loss)}")
+    print(f"  rank_label_weight_loss={bool(args.rank_label_weight_loss)}")
     print(
         "  worker_cpus="
         + (str(args.worker_cpus) if args.worker_cpus is not None else "auto(use all CPUs on a partition node)")

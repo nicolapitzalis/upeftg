@@ -9,6 +9,7 @@ from unittest import mock
 
 from upeftguard.experiments import attack_family_leave_one_out as GENERATOR_MODULE
 from upeftguard.experiments import backdoor_detection_summaries as SUMMARY_MODULE
+from upeftguard.experiments import group_leave_one_out as GROUP_GENERATOR_MODULE
 from upeftguard.experiments import supervised_cnn_suite as SUITE_MODULE
 from upeftguard.utilities.core.manifest import (
     infer_attack_sample_identities,
@@ -150,6 +151,88 @@ class TestLeaveOneOutSuite(unittest.TestCase):
                 self.assertEqual(infer_positive_attack_names, {heldout_attack})
                 self.assertEqual(sum(1 for item in train_items if item.label == 0), 250)
                 self.assertEqual(sum(1 for item in infer_items if item.label == 0), 250)
+
+    def test_adapter_leave_one_out_generator_holds_out_each_adapter_family(self):
+        expected_names = {
+            "holdout_adapter_adalora.json",
+            "holdout_adapter_dora.json",
+            "holdout_adapter_lora.json",
+            "holdout_adapter_lora_plus.json",
+            "holdout_adapter_qlora.json",
+        }
+        expected_groups = {"adalora", "dora", "lora", "lora+", "qlora"}
+        source_manifest = REPO_ROOT / "manifests" / "adapter_exploration" / "llama2_7b_tbh_all_adapters.json"
+
+        payloads = GROUP_GENERATOR_MODULE.build_leave_one_out_manifests(
+            source_manifest,
+            group_by="adapter",
+        )
+        self.assertEqual(set(payloads), expected_groups)
+        for heldout_group, payload in payloads.items():
+            self.assertEqual(len(payload["infer"]), 2, msg=heldout_group)
+            self.assertEqual(len(payload["train"]), 8, msg=heldout_group)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "adapter_loo"
+            generated_paths = GROUP_GENERATOR_MODULE.prepare_manifests(
+                source_manifest,
+                output_root,
+                group_by="adapter",
+            )
+
+            self.assertEqual({path.name for path in generated_paths}, expected_names)
+            for manifest_path in generated_paths:
+                train_items, infer_items = parse_joint_manifest_json_by_model_name(manifest_path=manifest_path)
+                train_identities = infer_attack_sample_identities(train_items)
+                infer_identities = infer_attack_sample_identities(infer_items)
+                train_groups = {
+                    GROUP_GENERATOR_MODULE.adapter_group_name(identity)
+                    for identity in train_identities
+                }
+                infer_groups = {
+                    GROUP_GENERATOR_MODULE.adapter_group_name(identity)
+                    for identity in infer_identities
+                }
+                self.assertEqual(len(infer_groups), 1, msg=str(manifest_path))
+                heldout_group = next(iter(infer_groups))
+                self.assertEqual(train_groups, expected_groups - {heldout_group})
+                self.assertEqual(sum(1 for item in infer_items if item.label == 0), 250)
+                self.assertEqual(sum(1 for item in infer_items if item.label == 1), 250)
+
+    def test_architecture_leave_one_out_generator_holds_out_each_architecture(self):
+        expected_names = {
+            "holdout_architecture_flan_t5_xl.json",
+            "holdout_architecture_llama2_13b.json",
+            "holdout_architecture_llama2_7b.json",
+            "holdout_architecture_qwen1.5_7b.json",
+        }
+        expected_groups = {"flan_t5_xl", "llama2_13b", "llama2_7b", "qwen1.5_7b"}
+        source_manifest = REPO_ROOT / "manifests" / "architecture_exploration" / "tbh_all_architectures.json"
+
+        payloads = GROUP_GENERATOR_MODULE.build_leave_one_out_manifests(
+            source_manifest,
+            group_by="architecture",
+        )
+        self.assertEqual(set(payloads), expected_groups)
+        for heldout_group, payload in payloads.items():
+            self.assertEqual(len(payload["infer"]), 2, msg=heldout_group)
+            self.assertEqual(len(payload["train"]), 6, msg=heldout_group)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_root = Path(tmp) / "architecture_loo"
+            generated_paths = GROUP_GENERATOR_MODULE.prepare_manifests(
+                source_manifest,
+                output_root,
+                group_by="architecture",
+            )
+
+            self.assertEqual({path.name for path in generated_paths}, expected_names)
+            for manifest_path in generated_paths:
+                train_items, infer_items = parse_joint_manifest_json_by_model_name(manifest_path=manifest_path)
+                self.assertEqual(len(infer_items), 500, msg=str(manifest_path))
+                self.assertEqual(len(train_items), 1500, msg=str(manifest_path))
+                self.assertEqual(sum(1 for item in infer_items if item.label == 0), 250)
+                self.assertEqual(sum(1 for item in infer_items if item.label == 1), 250)
 
     def test_discover_leave_one_out_run_specs_matches_committed_manifests(self):
         run_specs = SUMMARY_MODULE.discover_leave_one_out_run_specs(REPO_ROOT)
@@ -353,6 +436,255 @@ class TestLeaveOneOutSuite(unittest.TestCase):
                 )
 
             self.assertEqual(rc, 0)
+
+    def test_supervised_cnn_suite_adapter_leave_one_out_dry_run_generates_group_manifests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            manifest_dir = repo_root / "manifests" / "adapter_exploration"
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(
+                manifest_dir / "llama2_7b_tbh_all_adapters.json",
+                {
+                    "path": [
+                        {"path": "llama2_7b_toxic_backdoors_hard_rank256_qv/llama2_7b_toxic_backdoors_hard_rank256_qv_label0_", "indices": [0, 1]},
+                        {"path": "llama2_7b_toxic_backdoors_hard_rank256_qv/llama2_7b_toxic_backdoors_hard_rank256_qv_label1_", "indices": [0, 1]},
+                        {"path": "llama2_7b_dora_toxic_backdoors_hard_rank256_qv/llama2_7b_dora_toxic_backdoors_hard_rank256_qv_label0_", "indices": [0, 1]},
+                        {"path": "llama2_7b_dora_toxic_backdoors_hard_rank256_qv/llama2_7b_dora_toxic_backdoors_hard_rank256_qv_label1_", "indices": [0, 1]},
+                    ]
+                },
+            )
+
+            reference_dir = repo_root / "runs" / "supervised" / "reference_cnn"
+            reports_dir = reference_dir / "reports"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            params = {
+                "conv_channels": 64,
+                "dropout": 0.1,
+                "kernel_size": 5,
+                "learning_rate": 0.0003,
+                "num_conv_layers": 3,
+                "weight_decay": 0.0,
+            }
+            _write_json(reference_dir / "run_config.json", {"pipeline": "supervised"})
+            _write_json(
+                reports_dir / "supervised_report.json",
+                {
+                    "tuning": {
+                        "winner": {
+                            "model_name": "cnn_1d",
+                            "task_index": 3,
+                            "params": params,
+                        }
+                    }
+                },
+            )
+            _write_json(
+                reports_dir / "tuning_manifest.json",
+                {
+                    "extractor": {
+                        "params": {
+                            "spectral_features": ["energy"],
+                            "spectral_sv_top_k": 8,
+                            "spectral_moment_source": "both",
+                            "spectral_qv_sum_mode": "append",
+                            "spectral_entrywise_delta_mode": "dense",
+                        },
+                        "metadata": {"external_feature_source": "toy_features"},
+                    },
+                    "threshold_selection": {},
+                    "tuning": {"cv_folds_requested": 2, "cv_random_states": [42]},
+                },
+            )
+            conda_sh = repo_root / "conda.sh"
+            conda_sh.write_text("# test\n", encoding="utf-8")
+            generated_root = repo_root / "custom_generated" / "adapter_loo"
+
+            with mock.patch.object(SUITE_MODULE, "_repo_root", return_value=repo_root):
+                rc = SUITE_MODULE.main(
+                    [
+                        "--suite",
+                        "adapter-leave-one-out",
+                        "--hyperparam-config",
+                        "reference_cnn",
+                        "--conda-sh",
+                        str(conda_sh),
+                        "--generated-manifest-root",
+                        str(generated_root),
+                        "--dry-run",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                {path.name for path in generated_root.glob("*.json")},
+                {"holdout_adapter_dora.json", "holdout_adapter_lora.json"},
+            )
+
+    def test_supervised_cnn_suite_adapter_leave_one_out_dry_run_accepts_per_holdout_grid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            manifest_dir = repo_root / "manifests" / "adapter_exploration"
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(
+                manifest_dir / "llama2_7b_tbh_all_adapters.json",
+                {
+                    "path": [
+                        {
+                            "path": "llama2_7b_toxic_backdoors_hard_rank256_qv/llama2_7b_toxic_backdoors_hard_rank256_qv_label0_",
+                            "indices": [0, 1],
+                        },
+                        {
+                            "path": "llama2_7b_toxic_backdoors_hard_rank256_qv/llama2_7b_toxic_backdoors_hard_rank256_qv_label1_",
+                            "indices": [0, 1],
+                        },
+                        {
+                            "path": "llama2_7b_dora_toxic_backdoors_hard_rank256_qv/llama2_7b_dora_toxic_backdoors_hard_rank256_qv_label0_",
+                            "indices": [0, 1],
+                        },
+                        {
+                            "path": "llama2_7b_dora_toxic_backdoors_hard_rank256_qv/llama2_7b_dora_toxic_backdoors_hard_rank256_qv_label1_",
+                            "indices": [0, 1],
+                        },
+                    ]
+                },
+            )
+            _write_json(
+                repo_root / "manifests" / "cnn_hyperparams" / "tiny_grid.json",
+                {
+                    "conv_channels": [16],
+                    "dropout": [0.0],
+                    "kernel_size": [3],
+                    "learning_rate": [0.001],
+                    "num_conv_layers": [1],
+                    "weight_decay": [0.0],
+                },
+            )
+            conda_sh = repo_root / "conda.sh"
+            conda_sh.write_text("# test\n", encoding="utf-8")
+            generated_root = repo_root / "custom_generated" / "adapter_loo"
+
+            with mock.patch.object(SUITE_MODULE, "_repo_root", return_value=repo_root):
+                rc = SUITE_MODULE.main(
+                    [
+                        "--suite",
+                        "adapter-leave-one-out",
+                        "--cnn-hyperparams",
+                        "tiny_grid",
+                        "--feature-file",
+                        "toy_features",
+                        "--features",
+                        "energy",
+                        "--conda-sh",
+                        str(conda_sh),
+                        "--generated-manifest-root",
+                        str(generated_root),
+                        "--dry-run",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                {path.name for path in generated_root.glob("*.json")},
+                {"holdout_adapter_dora.json", "holdout_adapter_lora.json"},
+            )
+
+    def test_supervised_cnn_suite_adapter_leave_one_out_submits_grid_array_per_holdout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            manifest_dir = repo_root / "manifests" / "adapter_exploration"
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            _write_json(
+                manifest_dir / "llama2_7b_tbh_all_adapters.json",
+                {
+                    "path": [
+                        {
+                            "path": "llama2_7b_toxic_backdoors_hard_rank256_qv/llama2_7b_toxic_backdoors_hard_rank256_qv_label0_",
+                            "indices": [0, 1],
+                        },
+                        {
+                            "path": "llama2_7b_toxic_backdoors_hard_rank256_qv/llama2_7b_toxic_backdoors_hard_rank256_qv_label1_",
+                            "indices": [0, 1],
+                        },
+                        {
+                            "path": "llama2_7b_dora_toxic_backdoors_hard_rank256_qv/llama2_7b_dora_toxic_backdoors_hard_rank256_qv_label0_",
+                            "indices": [0, 1],
+                        },
+                        {
+                            "path": "llama2_7b_dora_toxic_backdoors_hard_rank256_qv/llama2_7b_dora_toxic_backdoors_hard_rank256_qv_label1_",
+                            "indices": [0, 1],
+                        },
+                    ]
+                },
+            )
+            hyperparams_path = repo_root / "manifests" / "cnn_hyperparams" / "tiny_grid.json"
+            _write_json(
+                hyperparams_path,
+                {
+                    "conv_channels": [16, 32],
+                    "dropout": [0.0],
+                    "kernel_size": [3],
+                    "learning_rate": [0.001, 0.0003],
+                    "num_conv_layers": [1],
+                    "weight_decay": [0.0],
+                },
+            )
+            conda_sh = repo_root / "conda.sh"
+            conda_sh.write_text("# test\n", encoding="utf-8")
+            generated_root = repo_root / "custom_generated" / "adapter_loo"
+
+            def fake_prepare_run(**kwargs):
+                run_dir = kwargs["output_root"] / "supervised" / kwargs["run_id"]
+                _write_json(
+                    run_dir / "reports" / "tuning_manifest.json",
+                    {
+                        "runtime": {
+                            "slurm_cpus_per_task": 6,
+                            "slurm_max_concurrent": 2,
+                            "score_percentiles": [90.0],
+                        },
+                        "tuning": {
+                            "tasks": [{"task_index": idx} for idx in range(4)],
+                        },
+                    },
+                )
+
+            with (
+                mock.patch.object(SUITE_MODULE, "_repo_root", return_value=repo_root),
+                mock.patch.object(SUITE_MODULE, "run_supervised_pipeline", side_effect=fake_prepare_run) as pipeline_mock,
+                mock.patch.object(SUITE_MODULE, "_submit_sbatch", side_effect=["101", "102", "201", "202"]) as submit_mock,
+            ):
+                rc = SUITE_MODULE.main(
+                    [
+                        "--suite",
+                        "adapter-leave-one-out",
+                        "--cnn-hyperparams",
+                        "tiny_grid",
+                        "--feature-file",
+                        "toy_features",
+                        "--features",
+                        "energy",
+                        "--conda-sh",
+                        str(conda_sh),
+                        "--generated-manifest-root",
+                        str(generated_root),
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(pipeline_mock.call_count, 2)
+            for call in pipeline_mock.call_args_list:
+                self.assertEqual(call.kwargs["cnn_hyperparams"], hyperparams_path.resolve())
+
+            worker_commands = [
+                submit_mock.call_args_list[0].args[0],
+                submit_mock.call_args_list[2].args[0],
+            ]
+            for worker_command in worker_commands:
+                self.assertIn("--array", worker_command)
+                self.assertEqual(worker_command[worker_command.index("--array") + 1], "0-3%2")
+                self.assertEqual(worker_command[worker_command.index("--cpus-per-task") + 1], "6")
+                worker_wrap = worker_command[worker_command.index("--wrap") + 1]
+                self.assertIn("--task-index ${SLURM_ARRAY_TASK_ID}", worker_wrap)
 
 
 if __name__ == "__main__":

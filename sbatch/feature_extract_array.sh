@@ -48,9 +48,10 @@ DTYPE=${DTYPE:-float32}
 N_SHARDS=${N_SHARDS:-8}
 PIPELINE_START_EPOCH_SECONDS=${PIPELINE_START_EPOCH_SECONDS:-$(date -u +%s)}
 SLURM_PARTITION=${SLURM_PARTITION:-extra}
-SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-8}
-SLURM_MAX_CONCURRENT=${SLURM_MAX_CONCURRENT:-8}
+SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-auto}
+SLURM_MAX_CONCURRENT=${SLURM_MAX_CONCURRENT:-auto}
 SLURM_LOG_DIR=${SLURM_LOG_DIR:-${REPO_ROOT}/logs}
+SLURM_JOB_INDEX_PATH=${SLURM_JOB_INDEX_PATH:-}
 
 read -r -a FEATURE_VALUES <<< "${FEATURES}"
 if [[ "${#FEATURE_VALUES[@]}" -eq 0 ]]; then
@@ -59,6 +60,24 @@ if [[ "${#FEATURE_VALUES[@]}" -eq 0 ]]; then
 fi
 
 mkdir -p "${SLURM_LOG_DIR}"
+
+PARTITION_NODE_COUNT=""
+PARTITION_CPUS_PER_NODE=""
+if [[ "${SLURM_MAX_CONCURRENT}" == "auto" || "${SLURM_CPUS_PER_TASK}" == "auto" ]]; then
+  PARTITION_NODE_COUNT=$(sinfo -h -p "${SLURM_PARTITION}" -o "%D" 2>/dev/null | awk 'NF {sum += int($1)} END {if (sum > 0) print sum}')
+  PARTITION_CPUS_PER_NODE=$(sinfo -h -p "${SLURM_PARTITION}" -o "%c" 2>/dev/null | sort -nr | head -n 1)
+fi
+PARTITION_NODE_COUNT=${PARTITION_NODE_COUNT:-8}
+PARTITION_CPUS_PER_NODE=${PARTITION_CPUS_PER_NODE:-32}
+
+RESOLVED_SLURM_MAX_CONCURRENT=${SLURM_MAX_CONCURRENT}
+if [[ "${RESOLVED_SLURM_MAX_CONCURRENT}" == "auto" ]]; then
+  RESOLVED_SLURM_MAX_CONCURRENT="${PARTITION_NODE_COUNT}"
+fi
+RESOLVED_SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK}
+if [[ "${RESOLVED_SLURM_CPUS_PER_TASK}" == "auto" ]]; then
+  RESOLVED_SLURM_CPUS_PER_TASK="${PARTITION_CPUS_PER_NODE}"
+fi
 
 RUN_ROOT=$(python - <<PY
 from pathlib import Path
@@ -71,7 +90,7 @@ SCHEMA_REPORT_PATH="${RUN_ROOT}/schema_partition_report.json"
 
 mkdir -p "${SCHEMA_GROUP_ROOT}" "${MERGED_DIR}"
 
-python -m upeftguard.utilities.prepare_spectral_shards \
+python -m upeftguard.utilities.merge.prepare_spectral_shards \
   --manifest-json "${MANIFEST_JSON}" \
   --dataset-root "${DATASET_ROOT}" \
   --output-dir "${SCHEMA_GROUP_ROOT}" \
@@ -119,13 +138,13 @@ while IFS=$'\t' read -r GROUP_ID GROUP_MANIFEST_JSON GROUP_SHARD_MANIFEST_DIR GR
 
   WORKER_CMD="source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.cli feature extract --manifest-json ${GROUP_SHARD_MANIFEST_DIR}/shard_\${SLURM_ARRAY_TASK_ID}.json --dataset-root ${DATASET_ROOT} --extractor spectral --spectral-features ${FEATURES} --spectral-sv-top-k ${SV_TOP_K} --spectral-moment-source ${SPECTRAL_MOMENT_SOURCE} --spectral-qv-sum-mode ${GROUP_QV_MODE} --spectral-entrywise-delta-mode ${SPECTRAL_ENTRYWISE_DELTA_MODE} --stream-block-size ${STREAM_BLOCK_SIZE} --dtype ${DTYPE} --output-root ${GROUP_SHARD_OUTPUT_ROOT} --run-id shard_\${SLURM_ARRAY_TASK_ID}"
 
-  MERGE_CMD="source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.utilities.merge_spectral_shards --manifest-json ${GROUP_MANIFEST_JSON} --dataset-root ${DATASET_ROOT} --output-dir ${EFFECTIVE_MERGED_OUTPUT_DIR} --pipeline-start-epoch-seconds ${PIPELINE_START_EPOCH_SECONDS} --shard-run-dir-glob '${GROUP_SHARD_OUTPUT_ROOT}/feature_extract/shard_*'"
+  MERGE_CMD="source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.utilities.merge.merge_spectral_shards --manifest-json ${GROUP_MANIFEST_JSON} --dataset-root ${DATASET_ROOT} --output-dir ${EFFECTIVE_MERGED_OUTPUT_DIR} --pipeline-start-epoch-seconds ${PIPELINE_START_EPOCH_SECONDS} --shard-run-dir-glob '${GROUP_SHARD_OUTPUT_ROOT}/feature_extract/shard_*'"
 
   WORKER_JOB_ID=$(sbatch \
     --parsable \
     --partition "${SLURM_PARTITION}" \
-    --cpus-per-task "${SLURM_CPUS_PER_TASK}" \
-    --array "0-${ARRAY_MAX}%${SLURM_MAX_CONCURRENT}" \
+    --cpus-per-task "${RESOLVED_SLURM_CPUS_PER_TASK}" \
+    --array "0-${ARRAY_MAX}%${RESOLVED_SLURM_MAX_CONCURRENT}" \
     --job-name "upeftguard_feature_extract_worker_${RUN_ID}_${GROUP_ID}" \
     --output "${SLURM_LOG_DIR}/feature_extract_worker_${RUN_ID}_${GROUP_ID}_%A_%a.out" \
     --error "${SLURM_LOG_DIR}/feature_extract_worker_${RUN_ID}_${GROUP_ID}_%A_%a.err" \
@@ -176,7 +195,7 @@ fi
 
 if [[ "${GROUP_COUNT}" -gt 1 ]]; then
   DEPENDENCY=$(IFS=:; echo "${MERGE_DEPENDENCY_JOB_IDS[*]}")
-  FINALIZE_CMD="source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.utilities.finalize_schema_group_merge --schema-report-path ${SCHEMA_REPORT_PATH} --output-dir ${MERGED_DIR}"
+  FINALIZE_CMD="source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.utilities.merge.finalize_schema_group_merge --schema-report-path ${SCHEMA_REPORT_PATH} --output-dir ${MERGED_DIR}"
 
   FINALIZE_JOB_ID=$(sbatch \
     --parsable \
@@ -207,3 +226,33 @@ done
 if [[ -n "${FINALIZE_JOB_ID}" ]]; then
   echo "Finalize job id: ${FINALIZE_JOB_ID}"
 fi
+
+FINAL_DEPENDENCY_JOB_ID="${FINALIZE_JOB_ID}"
+if [[ -z "${FINAL_DEPENDENCY_JOB_ID}" ]]; then
+  FINAL_DEPENDENCY_JOB_ID=$(IFS=:; echo "${MERGE_DEPENDENCY_JOB_IDS[*]}")
+fi
+
+if [[ -z "${SLURM_JOB_INDEX_PATH}" ]]; then
+  SLURM_JOB_INDEX_PATH="${RUN_ROOT}/reports/slurm_job_index.json"
+fi
+mkdir -p "$(dirname "${SLURM_JOB_INDEX_PATH}")"
+python - <<PY
+import json
+from pathlib import Path
+
+payload = {
+    "run_root": "${RUN_ROOT}",
+    "schema_partition_report": "${SCHEMA_REPORT_PATH}",
+    "final_feature_output_dir": "${MERGED_DIR}",
+    "feature_path": "${MERGED_DIR}/spectral_features.npy",
+    "worker_job_ids": [x for x in "${WORKER_JOB_IDS[*]}".split() if x],
+    "merge_job_ids": [x for x in "${MERGE_JOB_IDS[*]}".split() if x],
+    "finalize_job_id": "${FINALIZE_JOB_ID}" or None,
+    "final_dependency_job_id": "${FINAL_DEPENDENCY_JOB_ID}",
+    "partition": "${SLURM_PARTITION}",
+    "resolved_cpus_per_task": int("${RESOLVED_SLURM_CPUS_PER_TASK}"),
+    "resolved_max_concurrent": int("${RESOLVED_SLURM_MAX_CONCURRENT}"),
+}
+Path("${SLURM_JOB_INDEX_PATH}").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+PY
+echo "Slurm job index: ${SLURM_JOB_INDEX_PATH}"

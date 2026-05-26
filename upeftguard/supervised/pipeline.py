@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -3773,7 +3774,9 @@ def _run_supervised_worker(
     )
     execution_mode = str(tuning_cfg.get("execution_mode", "cross_validation"))
     if execution_mode == "singleton_no_cv":
+        started_at = datetime.now(timezone.utc)
         start = perf_counter()
+        ended_at = datetime.now(timezone.utc)
         result = {
             "task_index": int(task["task_index"]),
             "model_name": str(task["model_name"]),
@@ -3788,6 +3791,8 @@ def _run_supervised_worker(
             "fold_results": [],
             "seed_results": [],
             "elapsed_seconds": float(perf_counter() - start),
+            "start_timestamp_utc": started_at.isoformat(),
+            "end_timestamp_utc": ended_at.isoformat(),
         }
         if task_spec.is_binary:
             result["roc_auc_mean"] = None
@@ -3832,6 +3837,7 @@ def _run_supervised_worker(
         ]
     resolved_n_jobs = int(n_jobs) if n_jobs is not None else int(manifest["tuning"]["n_jobs"])
 
+    started_at = datetime.now(timezone.utc)
     start = perf_counter()
     try:
         result = _evaluate_candidate(
@@ -3874,7 +3880,10 @@ def _run_supervised_worker(
             result["accuracy_mean"] = None
             result["accuracy_std"] = None
 
+    ended_at = datetime.now(timezone.utc)
     result["elapsed_seconds"] = float(perf_counter() - start)
+    result["start_timestamp_utc"] = started_at.isoformat()
+    result["end_timestamp_utc"] = ended_at.isoformat()
 
     task_dir = run_dir / "reports" / "tuning_tasks"
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -4720,6 +4729,8 @@ def _prepare_supervised_finalize_distributed(
     finalize_export_shards: int,
     skip_feature_importance: bool,
 ) -> dict[str, Any]:
+    started_at = datetime.now(timezone.utc)
+    started_perf = perf_counter()
     prepared = _prepare_supervised_finalize(
         run_dir=run_dir,
         score_percentiles=score_percentiles,
@@ -4729,6 +4740,12 @@ def _prepare_supervised_finalize_distributed(
         finalized = _complete_supervised_finalize(
             run_dir=run_dir,
             winner_exports=None,
+        )
+        _append_stage_timing(
+            run_dir=run_dir,
+            stage="supervised_finalize_prepare",
+            started_at=started_at,
+            started_perf=started_perf,
         )
         return {
             **finalized,
@@ -4746,6 +4763,12 @@ def _prepare_supervised_finalize_distributed(
         train_labels_path=Path(prepared["winner_export_train_labels"]),
         random_state=int(prepared["random_state"]),
         n_tasks=int(finalize_export_shards),
+    )
+    _append_stage_timing(
+        run_dir=run_dir,
+        stage="supervised_finalize_prepare",
+        started_at=started_at,
+        started_perf=started_perf,
     )
     return {
         "run_dir": str(run_dir),
@@ -4782,6 +4805,8 @@ def _merge_supervised_finalize(
     *,
     run_dir: Path,
 ) -> dict[str, Any]:
+    started_at = datetime.now(timezone.utc)
+    started_perf = perf_counter()
     finalized_mode = _already_finalized_winner_feature_weights_mode(run_dir)
     if finalized_mode is not None:
         return _completed_supervised_result(run_dir)
@@ -4789,10 +4814,17 @@ def _merge_supervised_finalize(
         run_dir=run_dir,
         artifact_index_path=run_dir / "artifact_index.json",
     )
-    return _complete_supervised_finalize(
+    finalized = _complete_supervised_finalize(
         run_dir=run_dir,
         winner_exports=winner_exports,
     )
+    _append_stage_timing(
+        run_dir=run_dir,
+        stage="supervised_finalize_merge",
+        started_at=started_at,
+        started_perf=started_perf,
+    )
+    return finalized
 
 
 def _finalize_supervised_run(
@@ -4802,6 +4834,8 @@ def _finalize_supervised_run(
     n_jobs: int,
     skip_feature_importance: bool,
 ) -> dict[str, Any]:
+    started_at = datetime.now(timezone.utc)
+    started_perf = perf_counter()
     prepared = _prepare_supervised_finalize(
         run_dir=run_dir,
         score_percentiles=score_percentiles,
@@ -4811,6 +4845,12 @@ def _finalize_supervised_run(
         finalized = _complete_supervised_finalize(
             run_dir=run_dir,
             winner_exports=None,
+        )
+        _append_stage_timing(
+            run_dir=run_dir,
+            stage="supervised_finalize",
+            started_at=started_at,
+            started_perf=started_perf,
         )
         return {
             **finalized,
@@ -4826,10 +4866,17 @@ def _finalize_supervised_run(
         random_state=int(prepared["random_state"]),
         n_jobs=int(n_jobs),
     )
-    return _complete_supervised_finalize(
+    finalized = _complete_supervised_finalize(
         run_dir=run_dir,
         winner_exports=winner_exports,
     )
+    _append_stage_timing(
+        run_dir=run_dir,
+        stage="supervised_finalize",
+        started_at=started_at,
+        started_perf=started_perf,
+    )
+    return finalized
 
 
 def run_supervised_pipeline(
@@ -5048,4 +5095,306 @@ def run_supervised_pipeline(
         **finalized,
         "tuning_manifest": prepared["tuning_manifest"],
         "n_tasks": prepared["n_tasks"],
+    }
+
+
+def _append_stage_timing(
+    *,
+    run_dir: Path,
+    stage: str,
+    started_at: datetime,
+    started_perf: float,
+) -> None:
+    timings_path = run_dir / "timings.json"
+    timings: dict[str, Any] = {}
+    if timings_path.exists():
+        with open(timings_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            timings.update(payload)
+    ended_at = datetime.now(timezone.utc)
+    timings[str(stage)] = {
+        "stage": str(stage),
+        "backend": "local_or_slurm_worker",
+        "start_timestamp_utc": started_at.isoformat(),
+        "end_timestamp_utc": ended_at.isoformat(),
+        "elapsed_seconds": float(perf_counter() - started_perf),
+    }
+    with open(timings_path, "w", encoding="utf-8") as f:
+        json.dump(json_ready(timings), f, indent=2)
+
+
+def _infer_reference_run_dir_from_checkpoint(checkpoint: Path) -> Path:
+    resolved = checkpoint.expanduser().resolve()
+    if resolved.parent.name == "models":
+        return resolved.parent.parent
+    raise ValueError(
+        "--run-dir is required when --checkpoint is not inside a supervised run's models/ directory"
+    )
+
+
+def _read_score_column(path: Path) -> np.ndarray | None:
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    values: list[float] = []
+    for row in rows:
+        raw = row.get("score")
+        if raw is None or str(raw).strip() == "":
+            continue
+        values.append(float(raw))
+    if not values:
+        return None
+    return np.asarray(values, dtype=np.float64)
+
+
+def run_supervised_checkpoint_inference(
+    *,
+    checkpoint: Path | None,
+    reference_run_dir: Path | None,
+    output_root: Path,
+    run_id: str | None,
+) -> dict[str, Any]:
+    from .cnn import load_cnn_checkpoint
+    from ..experiments.supervised_architecture_breakdown import (
+        build_supervised_results_summary,
+        write_supervised_results_summary_outputs,
+    )
+
+    started_at = datetime.now(timezone.utc)
+    started_perf = perf_counter()
+    if reference_run_dir is None:
+        if checkpoint is None:
+            raise ValueError("Either --run-dir or --checkpoint is required for cnn infer")
+        reference_run_dir = _infer_reference_run_dir_from_checkpoint(Path(checkpoint))
+    reference_run_dir = Path(reference_run_dir).expanduser().resolve()
+    if checkpoint is None:
+        checkpoint = reference_run_dir / "models" / "best_model.pt"
+    checkpoint = Path(checkpoint).expanduser().resolve()
+
+    tuning_manifest_path = reference_run_dir / "reports" / "tuning_manifest.json"
+    if not tuning_manifest_path.exists():
+        raise FileNotFoundError(f"Missing tuning manifest: {tuning_manifest_path}")
+    if not checkpoint.exists():
+        raise FileNotFoundError(f"Missing checkpoint: {checkpoint}")
+
+    with open(tuning_manifest_path, "r", encoding="utf-8") as f:
+        reference_manifest = json.load(f)
+    if not isinstance(reference_manifest, dict):
+        raise ValueError(f"Expected JSON object in {tuning_manifest_path}")
+
+    infer_indices = np.asarray(reference_manifest["data"].get("infer_indices", []), dtype=np.int64)
+    if infer_indices.size == 0:
+        raise ValueError(
+            "The reference tuning manifest has no inference split. Use a joint manifest with train/infer "
+            "when preparing the checkpoint run."
+        )
+
+    ctx = create_run_context(
+        pipeline="supervised_inference",
+        output_root=Path(output_root).expanduser().resolve(),
+        run_id=run_id,
+    )
+    copied_manifest = dict(reference_manifest)
+    copied_manifest["run_dir"] = str(ctx.run_dir)
+    copied_manifest["inference_source_run_dir"] = str(reference_run_dir)
+    copied_manifest["inference_checkpoint"] = str(checkpoint)
+    copied_manifest_path = ctx.reports_dir / "tuning_manifest.json"
+    with open(copied_manifest_path, "w", encoding="utf-8") as f:
+        json.dump(json_ready(copied_manifest), f, indent=2)
+
+    features = _load_features_for_tuning_manifest(reference_manifest)
+    labels_value = np.asarray(np.load(reference_manifest["data"]["labels_value_path"]), dtype=np.int32)
+    labels_known = np.asarray(np.load(reference_manifest["data"]["labels_known_path"]), dtype=bool)
+    with open(reference_manifest["data"]["model_names_path"], "r", encoding="utf-8") as f:
+        model_names = [str(x) for x in json.load(f)]
+    manifest_items = _load_manifest_items_for_tuning_manifest(reference_manifest)
+    sample_identities = infer_attack_sample_identities(manifest_items)
+
+    task_spec = _task_spec_from_manifest(reference_manifest)
+    model = load_cnn_checkpoint(checkpoint)
+    x_infer = _slice_supervised_features(features, infer_indices)
+    infer_outputs = _predict_task_outputs(model, x_infer, task_spec=task_spec)
+    infer_scores = np.asarray(infer_outputs.backdoor_scores, dtype=np.float64)
+    infer_model_names = [model_names[int(i)] for i in infer_indices.tolist()]
+    infer_sample_identities = [sample_identities[int(i)] for i in infer_indices.tolist()]
+
+    infer_task_labels_raw: list[int | None] = []
+    for idx in infer_indices.tolist():
+        raw = int(labels_value[int(idx)])
+        infer_task_labels_raw.append(raw if bool(labels_known[int(idx)]) and raw >= 0 else None)
+    infer_labels_raw = _project_optional_labels_to_binary(
+        infer_task_labels_raw,
+        task_spec=task_spec,
+    )
+    infer_known_task_labels = [label for label in infer_task_labels_raw if label is not None]
+    infer_labels_np = (
+        task_spec.project_known_labels_to_binary(np.asarray(infer_known_task_labels, dtype=np.int32))
+        if len(infer_known_task_labels) == len(infer_task_labels_raw) and infer_task_labels_raw
+        else None
+    )
+
+    infer_scores_csv = ctx.reports_dir / "inference_scores.csv"
+    save_score_csv(
+        output_path=infer_scores_csv,
+        model_names=infer_model_names,
+        labels=infer_labels_raw,
+        scores=infer_scores,
+        extra_rows=_multiclass_score_extra_rows(
+            task_labels=infer_task_labels_raw,
+            outputs=infer_outputs,
+            task_spec=task_spec,
+            open_set_result=None,
+        ),
+    )
+
+    score_percentiles = [
+        float(x)
+        for x in reference_manifest.get("runtime", {}).get("score_percentiles", [90.0, 95.0, 99.0])
+    ]
+    reference_train_scores = _read_score_column(reference_run_dir / "reports" / "train_scores.csv")
+    threshold_rows = (
+        compute_infer_threshold_rows(
+            train_scores=reference_train_scores,
+            infer_scores=infer_scores,
+            percentiles=score_percentiles,
+            infer_labels=infer_labels_np,
+        )
+        if reference_train_scores is not None
+        else []
+    )
+    threshold_rows_from_inference = compute_infer_threshold_rows_from_inference(
+        infer_scores=infer_scores,
+        percentiles=score_percentiles,
+        infer_labels=infer_labels_np,
+    )
+
+    report = {
+        "task": task_spec.to_dict(),
+        "data_info": {
+            "mode": reference_manifest.get("mode"),
+            "n_samples": int(_supervised_feature_row_count(features)),
+            "n_train": 0,
+            "n_training_pool": 0,
+            "n_calibration": 0,
+            "n_inference": int(infer_indices.size),
+            "split": reference_manifest.get("data", {}).get("split"),
+            "calibration_split": reference_manifest.get("data", {}).get("calibration_split"),
+            "n_train_clean": 0,
+            "n_train_backdoored": 0,
+            "n_calibration_clean": 0,
+            "n_calibration_backdoored": 0,
+            "n_inference_clean": int(sum(1 for label in infer_labels_raw if label == 0)),
+            "n_inference_backdoored": int(sum(1 for label in infer_labels_raw if label == 1)),
+            "n_inference_unknown_label": int(sum(1 for label in infer_labels_raw if label is None)),
+        },
+        "representation": {
+            "extractor": reference_manifest.get("extractor", {}).get("name", "spectral"),
+            "extractor_params": reference_manifest.get("extractor", {}).get("params", {}),
+            "extractor_metadata": _compact_extractor_metadata(
+                reference_manifest.get("extractor", {}).get("metadata", {})
+            ),
+            "feature_path": reference_manifest.get("data", {}).get("feature_path"),
+        },
+        "tuning": {
+            "metric": reference_manifest.get("tuning", {}).get("metric"),
+            "model_name": reference_manifest.get("tuning", {}).get("model_name", CNN_1D_MODEL_NAME),
+            "model_names": reference_manifest.get("tuning", {}).get("model_names", [CNN_1D_MODEL_NAME]),
+            "execution_mode": "checkpoint_inference",
+            "executor": "local",
+            "tasks_total": reference_manifest.get("tuning", {}).get("tasks_total"),
+            "candidates": [],
+            "winner": {
+                "model_name": reference_manifest.get("tuning", {}).get("model_name", CNN_1D_MODEL_NAME),
+                "status": "loaded_checkpoint",
+                "checkpoint": str(checkpoint),
+            },
+        },
+        "fit_assessment": {
+            "score_definition": (
+                "positive_class_score"
+                if task_spec.binary_projection == BINARY_PROJECTION_POSITIVE_CLASS_SCORE
+                else "backdoor_score"
+            ),
+            "binary_projection": str(task_spec.binary_projection),
+            "train_score_summary": None,
+            "train_offline_metrics": None,
+            "calibration_score_summary": None,
+            "calibration_offline_metrics": None,
+            "inference_score_summary": summarize_scores(infer_scores),
+            "threshold_evaluation": threshold_rows,
+            "threshold_evaluation_from_inference": threshold_rows_from_inference,
+            "offline_metrics": compute_offline_metrics(infer_labels_np, infer_scores),
+        },
+        "multiclass_assessment": None,
+        "open_set_assessment": None,
+        "threshold_selection": None,
+        "attack_analysis": {
+            "train": None,
+            "inference": _summarize_attack_groups(
+                sample_identities=infer_sample_identities,
+                labels=infer_labels_raw,
+                scores=infer_scores,
+                threshold_specs=threshold_rows,
+                selected_threshold_specs=[],
+            ),
+        },
+        "warnings": [],
+    }
+    report_path = ctx.reports_dir / "supervised_report.json"
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(json_ready(report), f, indent=2)
+
+    results_summary = build_supervised_results_summary(run_dir=ctx.run_dir)
+    summary_outputs = write_supervised_results_summary_outputs(
+        run_dir=ctx.run_dir,
+        summary=results_summary,
+        update_report=True,
+        update_artifact_index=False,
+        remove_legacy_outputs=True,
+    )
+    elapsed_seconds = float(perf_counter() - started_perf)
+    run_config = {
+        "pipeline": "supervised_inference",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "start_timestamp_utc": started_at.isoformat(),
+        "elapsed_seconds": elapsed_seconds,
+        "reference_run_dir": str(reference_run_dir),
+        "checkpoint": str(checkpoint),
+        "tuning_manifest": str(copied_manifest_path),
+    }
+    artifacts = {
+        "checkpoint": str(checkpoint),
+        "inference_scores_csv": str(infer_scores_csv),
+        "report": str(report_path),
+        "results_summary_md": str(summary_outputs["results_summary_md"]),
+        "tuning_manifest": str(copied_manifest_path),
+    }
+    with open(ctx.run_dir / "run_config.json", "w", encoding="utf-8") as f:
+        json.dump(json_ready(run_config), f, indent=2)
+    with open(ctx.run_dir / "artifact_index.json", "w", encoding="utf-8") as f:
+        json.dump(json_ready(artifacts), f, indent=2)
+    with open(ctx.run_dir / "timings.json", "w", encoding="utf-8") as f:
+        json.dump(
+            json_ready(
+                {
+                    "checkpoint_inference": {
+                        "stage": "checkpoint_inference",
+                        "backend": "local",
+                        "start_timestamp_utc": started_at.isoformat(),
+                        "end_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                        "elapsed_seconds": elapsed_seconds,
+                    }
+                }
+            ),
+            f,
+            indent=2,
+        )
+    return {
+        "run_dir": str(ctx.run_dir),
+        "report": str(report_path),
+        "inference_scores_csv": str(infer_scores_csv),
+        "results_summary_md": str(summary_outputs["results_summary_md"]),
+        "checkpoint": str(checkpoint),
     }

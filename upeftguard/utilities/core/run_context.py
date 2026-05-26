@@ -34,8 +34,16 @@ class RunContext:
             json.dump(json_ready(run_config), f, indent=2)
         with open(self.run_dir / "artifact_index.json", "w", encoding="utf-8") as f:
             json.dump(json_ready(self.artifacts), f, indent=2)
+        timings = {}
+        timings_path = self.run_dir / "timings.json"
+        if timings_path.exists():
+            with open(timings_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if isinstance(existing, dict):
+                timings.update(existing)
+        timings.update(self.timings)
         with open(self.run_dir / "timings.json", "w", encoding="utf-8") as f:
-            json.dump(json_ready(self.timings), f, indent=2)
+            json.dump(json_ready(timings), f, indent=2)
 
 
 

@@ -8,7 +8,6 @@ from typing import Any
 import numpy as np
 
 from .spectral import SPECTRAL_EXTRACTOR_VERSION, extract_spectral_features, spectral_extractor_params
-from .svd import SVD_EXTRACTOR_VERSION, extract_svd_embeddings
 from ..utilities.artifacts.spectral_metadata import (
     dataset_layouts_from_source,
     write_spectral_metadata,
@@ -26,7 +25,6 @@ class FeatureBundle:
 
 
 _EXTRACTOR_VERSIONS = {
-    "svd": SVD_EXTRACTOR_VERSION,
     "spectral": SPECTRAL_EXTRACTOR_VERSION,
 }
 
@@ -55,18 +53,9 @@ def _extractor_params_for_metadata(
     extractor_name: str,
     params: dict[str, Any],
 ) -> dict[str, Any]:
-    if extractor_name == "spectral":
-        return spectral_extractor_params(params)
-
-    return {
-        "component_grid": list(params.get("component_grid", [20, 25, 30])),
-        "n_components": params.get("n_components"),
-        "block_size": int(params.get("block_size", 131072)),
-        "dtype": str(params.get("dtype", "float32")),
-        "acceptance_spearman_threshold": float(params.get("acceptance_spearman_threshold", 0.99)),
-        "acceptance_variance_threshold": float(params.get("acceptance_variance_threshold", 0.95)),
-        "run_offline_label_diagnostics": bool(params.get("run_offline_label_diagnostics", False)),
-    }
+    if extractor_name != "spectral":
+        raise ValueError(f"Unsupported stable extractor: {extractor_name!r}")
+    return spectral_extractor_params(params)
 
 
 def _compute_bundle(
@@ -75,20 +64,6 @@ def _compute_bundle(
     items: list[ManifestItem],
     params: dict[str, Any],
 ) -> tuple[FeatureBundle, list[str]]:
-    if extractor_name == "svd":
-        dtype = np.float32 if params.get("dtype", "float32") == "float32" else np.float64
-        features, labels, model_names, metadata, warnings = extract_svd_embeddings(
-            items=items,
-            n_components=params.get("n_components"),
-            component_grid=list(params.get("component_grid", [20, 25, 30])),
-            block_size=int(params.get("block_size", 131072)),
-            dtype=dtype,
-            acceptance_spearman_threshold=float(params.get("acceptance_spearman_threshold", 0.99)),
-            acceptance_variance_threshold=float(params.get("acceptance_variance_threshold", 0.95)),
-            run_offline_label_diagnostics=bool(params.get("run_offline_label_diagnostics", False)),
-        )
-        return FeatureBundle(features=features, labels=labels, model_names=model_names, metadata=metadata), warnings
-
     if extractor_name == "spectral":
         dtype = np.float32 if params.get("dtype", "float32") == "float32" else np.float64
         features, labels, model_names, metadata = extract_spectral_features(

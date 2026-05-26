@@ -71,7 +71,7 @@ SCHEMA_REPORT_PATH="${RUN_ROOT}/schema_partition_report.json"
 
 mkdir -p "${SCHEMA_GROUP_ROOT}" "${MERGED_DIR}"
 
-python -m upeftguard.utilities.prepare_spectral_shards \
+python -m upeftguard.utilities.merge.prepare_spectral_shards \
   --manifest-json "${MANIFEST_JSON}" \
   --dataset-root "${DATASET_ROOT}" \
   --output-dir "${SCHEMA_GROUP_ROOT}" \
@@ -119,7 +119,7 @@ while IFS=$'\t' read -r GROUP_ID GROUP_MANIFEST_JSON GROUP_SHARD_MANIFEST_DIR GR
 
   WORKER_CMD="source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.cli feature extract --manifest-json ${GROUP_SHARD_MANIFEST_DIR}/shard_\${SLURM_ARRAY_TASK_ID}.json --dataset-root ${DATASET_ROOT} --extractor spectral --spectral-features ${FEATURES} --spectral-sv-top-k ${SV_TOP_K} --spectral-moment-source ${SPECTRAL_MOMENT_SOURCE} --spectral-qv-sum-mode ${GROUP_QV_MODE} --spectral-entrywise-delta-mode ${SPECTRAL_ENTRYWISE_DELTA_MODE} --stream-block-size ${STREAM_BLOCK_SIZE} --dtype ${DTYPE} --output-root ${GROUP_SHARD_OUTPUT_ROOT} --run-id shard_\${SLURM_ARRAY_TASK_ID}"
 
-  MERGE_CMD="source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.utilities.merge_spectral_shards --manifest-json ${GROUP_MANIFEST_JSON} --dataset-root ${DATASET_ROOT} --output-dir ${EFFECTIVE_MERGED_OUTPUT_DIR} --pipeline-start-epoch-seconds ${PIPELINE_START_EPOCH_SECONDS} --shard-run-dir-glob '${GROUP_SHARD_OUTPUT_ROOT}/feature_extract/shard_*'"
+  MERGE_CMD="source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.utilities.merge.merge_spectral_shards --manifest-json ${GROUP_MANIFEST_JSON} --dataset-root ${DATASET_ROOT} --output-dir ${EFFECTIVE_MERGED_OUTPUT_DIR} --pipeline-start-epoch-seconds ${PIPELINE_START_EPOCH_SECONDS} --shard-run-dir-glob '${GROUP_SHARD_OUTPUT_ROOT}/feature_extract/shard_*'"
 
   WORKER_JOB_ID=$(sbatch \
     --parsable \
@@ -176,7 +176,7 @@ fi
 
 if [[ "${GROUP_COUNT}" -gt 1 ]]; then
   DEPENDENCY=$(IFS=:; echo "${MERGE_DEPENDENCY_JOB_IDS[*]}")
-  FINALIZE_CMD="source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.utilities.finalize_schema_group_merge --schema-report-path ${SCHEMA_REPORT_PATH} --output-dir ${MERGED_DIR}"
+  FINALIZE_CMD="source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.utilities.merge.finalize_schema_group_merge --schema-report-path ${SCHEMA_REPORT_PATH} --output-dir ${MERGED_DIR}"
 
   FINALIZE_JOB_ID=$(sbatch \
     --parsable \

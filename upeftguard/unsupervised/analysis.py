@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import csv
+import hashlib
 from itertools import product
 import json
 import os
@@ -20,9 +21,18 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 import numpy as np
+from safetensors import safe_open
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
 
+from ..features.delta import (
+    check_consistency_reader,
+    iter_block_factors,
+    load_delta_block_schema,
+    schema_has_adalora_scaling,
+    shorten_block_name,
+)
+from ..features.spectral import build_qv_sum_specs
 from ..utilities.artifacts.dataset_references import (
     DATASET_REFERENCE_REPORT_NAME,
     load_dataset_reference_report,
@@ -76,6 +86,16 @@ class LoadedFeatureBundle:
     dataset_reference_payload: dict[str, Any] | None
     sample_dataset_names: list[str | None]
     sample_ranks: list[int | None]
+
+
+@dataclass(frozen=True)
+class RawDeltaBlockSpec:
+    kind: str
+    block_name: str
+    raw_block_name: str
+    pair_index: int | None = None
+    q_index: int | None = None
+    v_index: int | None = None
 
 
 def _candidate_companion_paths(feature_path: Path, suffix: str) -> list[Path]:
@@ -817,6 +837,558 @@ def _plot_per_layer_tsne_embeddings(
     fig.suptitle(title, fontsize=16)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout(rect=(0, 0, 1, 0.98))
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _normalize_block_filters(block_filters: list[str] | tuple[str, ...] | None) -> list[str]:
+    if not block_filters:
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_filter in block_filters:
+        text = str(raw_filter).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(text)
+    return normalized
+
+
+def _block_matches_filters(
+    *,
+    block_name: str,
+    raw_block_name: str | None,
+    block_filters: list[str],
+) -> bool:
+    if not block_filters:
+        return True
+    haystacks = [str(block_name).lower()]
+    if raw_block_name:
+        haystacks.append(str(raw_block_name).lower())
+    return any(
+        str(block_filter).lower() in haystack
+        for block_filter in block_filters
+        for haystack in haystacks
+    )
+
+
+def _normalize_dataset_folders(folders: Any) -> list[str]:
+    def iter_values(value: Any) -> list[Any]:
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, (list, tuple)):
+            flattened: list[Any] = []
+            for item in value:
+                flattened.extend(iter_values(item))
+            return flattened
+        return [value]
+
+    raw_values = iter_values(folders)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        text = str(raw_value).strip()
+        if not text:
+            continue
+        if text in seen:
+            continue
+        seen.add(text)
+        normalized.append(text)
+    if not normalized:
+        raise ValueError("--folder/--dataset-name must include at least one non-empty value")
+    return normalized
+
+
+def _entry_matching_dataset_folders(entry: Mapping[str, Any], folders: list[str]) -> list[str]:
+    candidates = [
+        entry.get("dataset_name"),
+        entry.get("subset_name"),
+    ]
+    dataset_path = entry.get("dataset_path")
+    if dataset_path:
+        candidates.append(Path(str(dataset_path)).name)
+    candidate_set = {str(candidate) for candidate in candidates if candidate}
+    return [folder for folder in folders if folder in candidate_set]
+
+
+def _folder_selection_slug(folders: list[str]) -> str:
+    if len(folders) == 1:
+        return _safe_slug(folders[0])
+    digest = hashlib.sha256("\n".join(folders).encode("utf-8")).hexdigest()[:10]
+    return f"multi_{len(folders)}_folders_{digest}"
+
+
+def _folder_selection_label(folders: list[str]) -> str:
+    if len(folders) == 1:
+        return folders[0]
+    if len(folders) <= 3:
+        return ", ".join(folders)
+    return ", ".join(folders[:3]) + f", +{len(folders) - 3} more"
+
+
+def _select_dataset_row_indices(
+    *,
+    bundle: LoadedFeatureBundle,
+    folders: list[str],
+) -> tuple[np.ndarray, dict[str, int]]:
+    payload = bundle.dataset_reference_payload
+    model_index = payload.get("model_index") if isinstance(payload, Mapping) else None
+    if not isinstance(model_index, Mapping) or not model_index:
+        raise ValueError("layer raw-feature t-SNE requires dataset-reference state with model_index")
+
+    selected: list[int] = []
+    matched_counts = {folder: 0 for folder in folders}
+    for row_idx, model_name in enumerate(bundle.model_names):
+        raw_entry = model_index.get(model_name)
+        if not isinstance(raw_entry, Mapping):
+            continue
+        matching_folders = _entry_matching_dataset_folders(raw_entry, folders)
+        if matching_folders:
+            selected.append(int(row_idx))
+            for folder in matching_folders:
+                matched_counts[folder] += 1
+
+    missing_folders = [folder for folder, count in matched_counts.items() if count <= 0]
+    if not selected:
+        available = sorted(
+            {
+                str(entry.get("dataset_name"))
+                for entry in model_index.values()
+                if isinstance(entry, Mapping) and entry.get("dataset_name")
+            }
+        )
+        preview = ", ".join(available[:8])
+        raise ValueError(
+            f"No rows matched --folder/--dataset-name values {folders}. "
+            + (f"Available datasets include: {preview}" if preview else "No dataset names were available.")
+        )
+    if missing_folders:
+        raise ValueError(
+            "No rows matched requested folder(s): "
+            + ", ".join(missing_folders)
+        )
+    if len(selected) < 2:
+        raise ValueError(
+            "layer raw-feature t-SNE requires at least two selected rows, "
+            f"found {len(selected)} for folders={folders}"
+        )
+    return np.asarray(selected, dtype=np.int64), matched_counts
+
+
+def _select_layer_feature_columns(
+    *,
+    bundle: LoadedFeatureBundle,
+    layer: int,
+    block_filters: list[str],
+    features: list[str] | tuple[str, ...] | None,
+) -> tuple[np.ndarray, list[str], list[str], list[str] | None]:
+    requested_features = _normalize_requested_features(features)
+    requested_feature_set = set(requested_features or [])
+    column_indices: list[int] = []
+    feature_names: list[str] = []
+    block_names: list[str] = []
+    seen_blocks: set[str] = set()
+
+    for column_idx, feature_name in enumerate(bundle.feature_names):
+        try:
+            block_name = _feature_block_name(feature_name)
+        except ValueError:
+            continue
+        resolved_layer = _extract_layer(block_name)
+        if resolved_layer != int(layer):
+            continue
+        if not _block_matches_filters(
+            block_name=block_name,
+            raw_block_name=None,
+            block_filters=block_filters,
+        ):
+            continue
+        if requested_features is not None:
+            feature_group = _feature_group_for_feature_name(feature_name)
+            if feature_group not in requested_feature_set:
+                continue
+        column_indices.append(int(column_idx))
+        feature_names.append(str(feature_name))
+        if block_name not in seen_blocks:
+            seen_blocks.add(block_name)
+            block_names.append(block_name)
+
+    if not column_indices:
+        feature_detail = (
+            "all feature groups"
+            if requested_features is None
+            else ", ".join(str(x) for x in requested_features)
+        )
+        filter_detail = ", ".join(block_filters) if block_filters else "no block filter"
+        raise ValueError(
+            "No extracted feature columns matched "
+            f"layer={layer}, {filter_detail}, features={feature_detail}"
+        )
+    return (
+        np.asarray(column_indices, dtype=np.int64),
+        block_names,
+        feature_names,
+        requested_features,
+    )
+
+
+def _adapter_path_candidates(model_dir: Path) -> tuple[Path, ...]:
+    return (
+        model_dir / "adapter_model.safetensors",
+        model_dir / "best_model" / "adapter_model.safetensors",
+    )
+
+
+def _resolve_adapter_path_for_selected_model(
+    *,
+    model_name: str,
+    entry: Mapping[str, Any],
+    folders: list[str],
+    dataset_root: Path | None,
+) -> Path:
+    candidate_model_dirs: list[Path] = []
+    dataset_path = entry.get("dataset_path")
+    if dataset_path:
+        candidate_model_dirs.append(Path(str(dataset_path)).expanduser() / model_name)
+
+    fallback_dataset_names = list(folders)
+    for key in ("dataset_name", "subset_name"):
+        raw_value = entry.get(key)
+        if raw_value and str(raw_value) not in fallback_dataset_names:
+            fallback_dataset_names.append(str(raw_value))
+    if dataset_path:
+        path_name = Path(str(dataset_path)).name
+        if path_name and path_name not in fallback_dataset_names:
+            fallback_dataset_names.append(path_name)
+
+    if dataset_root is not None:
+        resolved_dataset_root = _resolve_path(dataset_root)
+        for dataset_name in fallback_dataset_names:
+            candidate_model_dirs.append(resolved_dataset_root / dataset_name / model_name)
+
+    tried: list[Path] = []
+    seen: set[str] = set()
+    for model_dir in candidate_model_dirs:
+        resolved_model_dir = model_dir if model_dir.is_absolute() else (Path.cwd().resolve() / model_dir)
+        for candidate in _adapter_path_candidates(resolved_model_dir):
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            tried.append(candidate)
+            if candidate.exists():
+                return candidate.resolve()
+
+    preview = ", ".join(str(path) for path in tried[:6])
+    raise FileNotFoundError(
+        f"Adapter file not found for selected model '{model_name}'. "
+        + (f"Tried: {preview}" if preview else "No candidate paths could be built.")
+    )
+
+
+def _resolve_selected_adapter_paths(
+    *,
+    bundle: LoadedFeatureBundle,
+    row_indices: np.ndarray,
+    folders: list[str],
+    dataset_root: Path | None,
+) -> list[Path]:
+    payload = bundle.dataset_reference_payload
+    model_index = payload.get("model_index") if isinstance(payload, Mapping) else None
+    if not isinstance(model_index, Mapping):
+        raise ValueError("layer raw-feature t-SNE requires dataset-reference state with model_index")
+
+    adapter_paths: list[Path] = []
+    for row_idx in row_indices.tolist():
+        model_name = bundle.model_names[int(row_idx)]
+        entry = model_index.get(model_name)
+        if not isinstance(entry, Mapping):
+            raise ValueError(f"Dataset-reference entry missing for selected model '{model_name}'")
+        adapter_paths.append(
+            _resolve_adapter_path_for_selected_model(
+                model_name=model_name,
+                entry=entry,
+                folders=folders,
+                dataset_root=dataset_root,
+            )
+        )
+    return adapter_paths
+
+
+def _raw_delta_block_specs_for_feature_blocks(
+    *,
+    schema: Any,
+    feature_block_names: list[str],
+) -> tuple[list[RawDeltaBlockSpec], list[str]]:
+    base_specs = {
+        shorten_block_name(str(raw_block_name)): RawDeltaBlockSpec(
+            kind="base",
+            block_name=shorten_block_name(str(raw_block_name)),
+            raw_block_name=str(raw_block_name),
+            pair_index=int(pair_idx),
+        )
+        for pair_idx, raw_block_name in enumerate(schema.block_names)
+    }
+
+    needs_qv_sum = any(".qv_sum" in str(block_name) or str(block_name).endswith("qv_sum") for block_name in feature_block_names)
+    qv_specs_by_block: dict[str, RawDeltaBlockSpec] = {}
+    if needs_qv_sum:
+        for qv_spec in build_qv_sum_specs(schema):
+            block_name = shorten_block_name(qv_spec.qv_block_name_raw)
+            qv_specs_by_block[block_name] = RawDeltaBlockSpec(
+                kind="qv_sum",
+                block_name=block_name,
+                raw_block_name=str(qv_spec.qv_block_name_raw),
+                q_index=int(qv_spec.q_index),
+                v_index=int(qv_spec.v_index),
+            )
+
+    specs: list[RawDeltaBlockSpec] = []
+    missing: list[str] = []
+    for block_name in feature_block_names:
+        if block_name in base_specs:
+            specs.append(base_specs[block_name])
+        elif block_name in qv_specs_by_block:
+            specs.append(qv_specs_by_block[block_name])
+        else:
+            missing.append(block_name)
+
+    if not specs:
+        preview = ", ".join(feature_block_names[:8])
+        raise ValueError(f"No raw B@A blocks matched selected feature blocks. Examples: {preview}")
+    return specs, missing
+
+
+def _projection_seed(*, seed: int, block_name: str, shape: tuple[int, ...], side: str) -> int:
+    payload = f"{seed}|{block_name}|{side}|{'x'.join(str(x) for x in shape)}".encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest[:8], "little", signed=False)
+
+
+def _signed_projection_matrix(
+    *,
+    shape: tuple[int, int],
+    seed: int,
+    scale_denominator: int,
+) -> np.ndarray:
+    rng = np.random.default_rng(int(seed))
+    signs = rng.integers(0, 2, size=shape, dtype=np.int8)
+    projection = np.where(signs == 0, -1.0, 1.0).astype(np.float32)
+    projection /= float(np.sqrt(max(1, int(scale_denominator))))
+    return projection
+
+
+def _raw_delta_sketch_shape(raw_projection_dim: int) -> tuple[int, int]:
+    if raw_projection_dim <= 0:
+        raise ValueError(f"raw_projection_dim must be positive, got {raw_projection_dim}")
+    out_dim = max(1, int(np.floor(np.sqrt(int(raw_projection_dim)))))
+    in_dim = max(1, int(np.ceil(float(raw_projection_dim) / float(out_dim))))
+    return out_dim, in_dim
+
+
+def _raw_delta_projection_matrices(
+    *,
+    block_name: str,
+    out_features: int,
+    in_features: int,
+    raw_projection_dim: int,
+    projection_seed: int,
+    projection_cache: dict[tuple[str, int, int, int, int], tuple[np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray]:
+    out_sketch_dim, in_sketch_dim = _raw_delta_sketch_shape(raw_projection_dim)
+    key = (str(block_name), int(out_features), int(in_features), int(out_sketch_dim), int(in_sketch_dim))
+    cached = projection_cache.get(key)
+    if cached is not None:
+        return cached
+
+    output_projection = _signed_projection_matrix(
+        shape=(out_sketch_dim, int(out_features)),
+        seed=_projection_seed(
+            seed=projection_seed,
+            block_name=block_name,
+            shape=(out_sketch_dim, int(out_features)),
+            side="out",
+        ),
+        scale_denominator=out_sketch_dim,
+    )
+    input_projection = _signed_projection_matrix(
+        shape=(int(in_features), in_sketch_dim),
+        seed=_projection_seed(
+            seed=projection_seed,
+            block_name=block_name,
+            shape=(int(in_features), in_sketch_dim),
+            side="in",
+        ),
+        scale_denominator=in_sketch_dim,
+    )
+    projection_cache[key] = (output_projection, input_projection)
+    return output_projection, input_projection
+
+
+def _sketch_lora_delta(
+    *,
+    a: np.ndarray,
+    b: np.ndarray,
+    block_name: str,
+    raw_projection_dim: int,
+    projection_seed: int,
+    projection_cache: dict[tuple[str, int, int, int, int], tuple[np.ndarray, np.ndarray]],
+) -> np.ndarray:
+    a_array = np.asarray(a, dtype=np.float32)
+    b_array = np.asarray(b, dtype=np.float32)
+    if a_array.ndim != 2 or b_array.ndim != 2:
+        raise ValueError(f"Expected rank-2 LoRA factors for {block_name}, got A{a_array.shape}, B{b_array.shape}")
+    if int(a_array.shape[0]) != int(b_array.shape[1]):
+        raise ValueError(f"LoRA rank mismatch for {block_name}: A{a_array.shape}, B{b_array.shape}")
+
+    output_projection, input_projection = _raw_delta_projection_matrices(
+        block_name=block_name,
+        out_features=int(b_array.shape[0]),
+        in_features=int(a_array.shape[1]),
+        raw_projection_dim=raw_projection_dim,
+        projection_seed=projection_seed,
+        projection_cache=projection_cache,
+    )
+    sketch = (output_projection @ b_array) @ (a_array @ input_projection)
+    return np.asarray(sketch, dtype=np.float32).reshape(-1)[: int(raw_projection_dim)]
+
+
+def _build_raw_delta_sketch_matrix(
+    *,
+    adapter_paths: list[Path],
+    raw_block_specs: list[RawDeltaBlockSpec],
+    raw_projection_dim: int,
+    projection_seed: int,
+    dtype: np.dtype,
+) -> np.ndarray:
+    if not adapter_paths:
+        raise ValueError("adapter_paths must be non-empty")
+    if not raw_block_specs:
+        raise ValueError("raw_block_specs must be non-empty")
+
+    schema = load_delta_block_schema(adapter_paths[0])
+    expected_pairs = [tuple(x) for x in schema.pairs]
+    expected_a_shapes = [tuple(x) for x in schema.a_shapes]
+    expected_b_shapes = [tuple(x) for x in schema.b_shapes]
+    expected_e_keys = [str(x) if x is not None else None for x in schema.e_keys]
+    expected_e_shapes = [
+        tuple(int(y) for y in x) if x is not None else None
+        for x in schema.e_shapes
+    ]
+    allow_rank_variation = bool(schema_has_adalora_scaling(schema))
+    needed_pair_indices = {
+        int(index)
+        for spec in raw_block_specs
+        for index in (spec.pair_index, spec.q_index, spec.v_index)
+        if index is not None
+    }
+
+    rows: list[np.ndarray] = []
+    projection_cache: dict[tuple[str, int, int, int, int], tuple[np.ndarray, np.ndarray]] = {}
+    for adapter_path in adapter_paths:
+        factor_by_pair_index: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        with safe_open(adapter_path, framework="numpy") as reader:
+            check_consistency_reader(
+                reader=reader,
+                adapter_path=adapter_path,
+                expected_pairs=expected_pairs,
+                expected_a_shapes=expected_a_shapes,
+                expected_b_shapes=expected_b_shapes,
+                expected_e_keys=expected_e_keys,
+                expected_e_shapes=expected_e_shapes,
+                allow_rank_variation=allow_rank_variation,
+            )
+            for pair_idx, (_raw_block_name, a, b) in enumerate(
+                iter_block_factors(reader=reader, schema=schema, dtype=dtype)
+            ):
+                if pair_idx in needed_pair_indices:
+                    factor_by_pair_index[int(pair_idx)] = (a, b)
+
+        pieces: list[np.ndarray] = []
+        for spec in raw_block_specs:
+            if spec.kind == "base":
+                if spec.pair_index is None or spec.pair_index not in factor_by_pair_index:
+                    raise RuntimeError(f"Missing raw factors for block {spec.block_name} in {adapter_path}")
+                a, b = factor_by_pair_index[int(spec.pair_index)]
+            elif spec.kind == "qv_sum":
+                if spec.q_index is None or spec.v_index is None:
+                    raise RuntimeError(f"Invalid qv_sum raw block spec for {spec.block_name}")
+                if spec.q_index not in factor_by_pair_index or spec.v_index not in factor_by_pair_index:
+                    raise RuntimeError(f"Missing q/v factors for block {spec.block_name} in {adapter_path}")
+                a_q, b_q = factor_by_pair_index[int(spec.q_index)]
+                a_v, b_v = factor_by_pair_index[int(spec.v_index)]
+                a = np.concatenate([a_q, a_v], axis=0)
+                b = np.concatenate([b_q, b_v], axis=1)
+            else:
+                raise RuntimeError(f"Unsupported raw block spec kind '{spec.kind}'")
+
+            pieces.append(
+                _sketch_lora_delta(
+                    a=a,
+                    b=b,
+                    block_name=spec.block_name,
+                    raw_projection_dim=raw_projection_dim,
+                    projection_seed=projection_seed,
+                    projection_cache=projection_cache,
+                )
+            )
+        rows.append(np.concatenate(pieces).astype(np.float32, copy=False))
+
+    return np.vstack(rows).astype(np.float32, copy=False)
+
+
+def _plot_layer_raw_feature_tsne_comparison(
+    *,
+    output_path: Path,
+    raw_embedding: np.ndarray,
+    feature_embedding: np.ndarray,
+    labels: np.ndarray | None,
+    title: str,
+    point_size: float,
+    alpha: float,
+) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    panels = [
+        (axes[0], raw_embedding, "Raw B@A sketch"),
+        (axes[1], feature_embedding, "Extracted features"),
+    ]
+    for ax, embedding, panel_title in panels:
+        _scatter_tsne_points(
+            ax=ax,
+            embedding=embedding,
+            labels=labels,
+            point_size=point_size,
+            alpha=alpha,
+        )
+        ax.set_title(panel_title)
+        ax.set_xlabel("t-SNE 1")
+        ax.set_ylabel("t-SNE 2")
+        ax.grid(True, linestyle="--", alpha=0.3)
+
+    label_styles = _iter_label_styles(labels)
+    if label_styles:
+        handles = [
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                linestyle="",
+                markersize=8,
+                markerfacecolor=color,
+                markeredgecolor=color,
+                label=label_name,
+            )
+            for _label_value, label_name, color in label_styles
+        ]
+        fig.legend(handles=handles, loc="upper right")
+
+    fig.suptitle(title)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
@@ -1839,6 +2411,8 @@ def _run_cnn_embedding_tsne_view(
     partition_plot = plot_dir / f"{view_slug}_by_partition.png"
     label_plot = plot_dir / f"{view_slug}_by_label.png"
     attack_plot = plot_dir / f"{view_slug}_by_attack.png"
+    attack_and_clean_plot = plot_dir / f"{view_slug}_by_attack_and_clean.png"
+    attack_and_clean_categories = [row.get("effective_attack_name") for row in rows]
     _plot_categorical_tsne_embedding(
         output_path=partition_plot,
         embedding=embedding,
@@ -1852,6 +2426,14 @@ def _run_cnn_embedding_tsne_view(
         embedding=embedding,
         categories=[row.get("task_label_name") for row in rows],
         title=f"CNN feature t-SNE ({view_name}) by label",
+        point_size=point_size,
+        alpha=alpha,
+    )
+    _plot_categorical_tsne_embedding(
+        output_path=attack_and_clean_plot,
+        embedding=embedding,
+        categories=attack_and_clean_categories,
+        title=f"CNN feature t-SNE ({view_name}) by attack and clean",
         point_size=point_size,
         alpha=alpha,
     )
@@ -1876,10 +2458,17 @@ def _run_cnn_embedding_tsne_view(
                 "partition": str(partition_plot),
                 "label": str(label_plot),
                 "attack": str(attack_plot),
+                "attack_and_clean": str(attack_and_clean_plot),
             },
             "attack_plot_field": "attack_name",
             "attack_plot_scope": "backdoor_rows_only",
             "attack_plot_n_samples": int(len(attack_rows)),
+            "attack_and_clean_plot_field": "effective_attack_name",
+            "attack_and_clean_plot_scope": "all_rows",
+            "attack_and_clean_plot_n_samples": int(len(rows)),
+            "attack_and_clean_plot_categories": sorted(
+                {_category_label(value) for value in attack_and_clean_categories}
+            ),
         }
     )
     return view_report, warnings
@@ -3529,6 +4118,301 @@ def run_unsupervised_rank_feature_values_pipeline(
         "report": report_path,
         "plot_dir": plot_dir,
         "sample_table": sample_table_path,
+    }
+
+
+def run_layer_raw_feature_tsne_pipeline(
+    *,
+    feature_file: Path,
+    output_root: Path,
+    run_id: str | None,
+    folder: str | list[str] | tuple[str, ...],
+    layer: int,
+    feature_root: Path = DEFAULT_FEATURE_EXTRACT_ROOT,
+    model_names_file: Path | None = None,
+    labels_file: Path | None = None,
+    metadata_file: Path | None = None,
+    dataset_reference_report: Path | None = None,
+    dataset_root: Path | None = None,
+    block_filters: list[str] | tuple[str, ...] | None = None,
+    features: list[str] | tuple[str, ...] | None = None,
+    raw_projection_dim: int = 256,
+    projection_seed: int = 42,
+    perplexity: float = 30.0,
+    learning_rate: str | float = "auto",
+    max_iter: int = 1000,
+    metric: str = "euclidean",
+    init: str = "pca",
+    random_state: int = 42,
+    standardize: bool = True,
+    point_size: float = 28.0,
+    alpha: float = 0.85,
+) -> dict[str, Any]:
+    start = perf_counter()
+    folders = _normalize_dataset_folders(folder)
+    if int(layer) < 0:
+        raise ValueError(f"layer must be non-negative, got {layer}")
+    if raw_projection_dim <= 0:
+        raise ValueError(f"raw_projection_dim must be positive, got {raw_projection_dim}")
+
+    bundle = load_feature_bundle(
+        feature_file=feature_file,
+        feature_root=feature_root,
+        model_names_file=model_names_file,
+        labels_file=labels_file,
+        metadata_file=metadata_file,
+        dataset_reference_report=dataset_reference_report,
+    )
+    row_indices, matched_folder_counts = _select_dataset_row_indices(
+        bundle=bundle,
+        folders=folders,
+    )
+    if bundle.labels is None:
+        raise ValueError("layer raw-feature t-SNE requires sample labels for clean/backdoor coloring")
+    selected_labels = np.asarray(bundle.labels[row_indices], dtype=np.int32)
+    if np.any(selected_labels < 0):
+        raise ValueError("layer raw-feature t-SNE requires known sample labels for every selected row")
+
+    resolved_block_filters = _normalize_block_filters(block_filters)
+    feature_column_indices, feature_block_names, selected_feature_names, requested_features = (
+        _select_layer_feature_columns(
+            bundle=bundle,
+            layer=int(layer),
+            block_filters=resolved_block_filters,
+            features=features,
+        )
+    )
+    selected_model_names = [bundle.model_names[int(i)] for i in row_indices.tolist()]
+    selected_ranks = [bundle.sample_ranks[int(i)] for i in row_indices.tolist()]
+    selected_dataset_names = [bundle.sample_dataset_names[int(i)] for i in row_indices.tolist()]
+    adapter_paths = _resolve_selected_adapter_paths(
+        bundle=bundle,
+        row_indices=row_indices,
+        folders=folders,
+        dataset_root=dataset_root,
+    )
+
+    schema = load_delta_block_schema(adapter_paths[0])
+    raw_block_specs, missing_raw_blocks = _raw_delta_block_specs_for_feature_blocks(
+        schema=schema,
+        feature_block_names=feature_block_names,
+    )
+    raw_values = _build_raw_delta_sketch_matrix(
+        adapter_paths=adapter_paths,
+        raw_block_specs=raw_block_specs,
+        raw_projection_dim=int(raw_projection_dim),
+        projection_seed=int(projection_seed),
+        dtype=np.float32,
+    )
+    feature_values = np.asarray(
+        bundle.features[row_indices][:, feature_column_indices],
+        dtype=np.float32,
+    )
+
+    raw_embedding, raw_replaced, raw_perplexity, raw_init = _fit_tsne_embedding(
+        values=raw_values,
+        perplexity=perplexity,
+        learning_rate=learning_rate,
+        max_iter=max_iter,
+        metric=metric,
+        init=init,
+        random_state=random_state,
+        standardize=standardize,
+    )
+    feature_embedding, feature_replaced, feature_perplexity, feature_init = _fit_tsne_embedding(
+        values=feature_values,
+        perplexity=perplexity,
+        learning_rate=learning_rate,
+        max_iter=max_iter,
+        metric=metric,
+        init=init,
+        random_state=random_state,
+        standardize=standardize,
+    )
+
+    ctx = create_run_context(
+        pipeline="layer_raw_feature_tsne",
+        output_root=output_root,
+        run_id=run_id,
+    )
+    plot_dir = ctx.plots_dir / "layer_raw_feature_tsne"
+    embedding_dir = ctx.reports_dir / "layer_raw_feature_tsne"
+    folder_slug = _folder_selection_slug(folders)
+    folder_label = _folder_selection_label(folders)
+    slug = f"{folder_slug}__layer_{int(layer):03d}"
+    comparison_plot = plot_dir / f"{slug}__comparison.png"
+    raw_plot = plot_dir / f"{slug}__raw_ba_tsne.png"
+    feature_plot = plot_dir / f"{slug}__feature_tsne.png"
+    raw_csv = embedding_dir / f"{slug}__raw_ba_tsne.csv"
+    feature_csv = embedding_dir / f"{slug}__feature_tsne.csv"
+
+    title_suffix = f"{folder_label}, layer={int(layer)}"
+    if resolved_block_filters:
+        title_suffix += ", filters=" + ",".join(resolved_block_filters)
+    _plot_layer_raw_feature_tsne_comparison(
+        output_path=comparison_plot,
+        raw_embedding=raw_embedding,
+        feature_embedding=feature_embedding,
+        labels=selected_labels,
+        title=f"Raw B@A vs extracted-feature t-SNE ({title_suffix})",
+        point_size=point_size,
+        alpha=alpha,
+    )
+    _plot_tsne_embedding(
+        output_path=raw_plot,
+        embedding=raw_embedding,
+        labels=selected_labels,
+        title=f"Raw B@A sketch t-SNE ({title_suffix})",
+        point_size=point_size,
+        alpha=alpha,
+    )
+    _plot_tsne_embedding(
+        output_path=feature_plot,
+        embedding=feature_embedding,
+        labels=selected_labels,
+        title=f"Extracted-feature t-SNE ({title_suffix})",
+        point_size=point_size,
+        alpha=alpha,
+    )
+    _save_tsne_embedding_csv(
+        output_path=raw_csv,
+        group_label="raw_ba",
+        model_names=selected_model_names,
+        labels=selected_labels,
+        ranks=selected_ranks,
+        dataset_names=selected_dataset_names,
+        embedding=raw_embedding,
+    )
+    _save_tsne_embedding_csv(
+        output_path=feature_csv,
+        group_label="features",
+        model_names=selected_model_names,
+        labels=selected_labels,
+        ranks=selected_ranks,
+        dataset_names=selected_dataset_names,
+        embedding=feature_embedding,
+    )
+
+    warnings: list[str] = []
+    if raw_replaced > 0:
+        warnings.append(f"Replaced {raw_replaced} non-finite raw B@A sketch values before t-SNE")
+    if feature_replaced > 0:
+        warnings.append(f"Replaced {feature_replaced} non-finite extracted feature values before t-SNE")
+    if missing_raw_blocks:
+        warnings.append(
+            "No raw B@A block was available for selected feature block(s): "
+            + ", ".join(missing_raw_blocks[:8])
+        )
+
+    elapsed_seconds = float(perf_counter() - start)
+    report = {
+        "analysis": "layer_raw_feature_tsne",
+        "script_version": SCRIPT_VERSION,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "elapsed_seconds": elapsed_seconds,
+        "feature_file": str(bundle.feature_file),
+        "model_names_file": str(bundle.model_names_file),
+        "labels_file": str(bundle.labels_file) if bundle.labels_file is not None else None,
+        "metadata_file": str(bundle.metadata_file) if bundle.metadata_file is not None else None,
+        "dataset_reference_report": (
+            str(bundle.dataset_reference_report) if bundle.dataset_reference_report is not None else None
+        ),
+        "folder": folders[0] if len(folders) == 1 else list(folders),
+        "folders": list(folders),
+        "matched_folder_counts": matched_folder_counts,
+        "layer": int(layer),
+        "block_filters": resolved_block_filters,
+        "requested_features": "all" if requested_features is None else list(requested_features),
+        "n_samples": int(row_indices.size),
+        "label_counts": _label_count_summary(selected_labels),
+        "selected_feature_columns": int(feature_column_indices.size),
+        "selected_feature_blocks": feature_block_names,
+        "selected_feature_names": selected_feature_names,
+        "raw_blocks": [
+            {
+                "kind": spec.kind,
+                "block_name": spec.block_name,
+                "raw_block_name": spec.raw_block_name,
+            }
+            for spec in raw_block_specs
+        ],
+        "raw_projection_dim_per_block": int(raw_projection_dim),
+        "raw_projection_seed": int(projection_seed),
+        "raw_input_shape": [int(raw_values.shape[0]), int(raw_values.shape[1])],
+        "feature_input_shape": [int(feature_values.shape[0]), int(feature_values.shape[1])],
+        "perplexity": float(perplexity),
+        "raw_resolved_perplexity": float(raw_perplexity),
+        "feature_resolved_perplexity": float(feature_perplexity),
+        "learning_rate": learning_rate,
+        "max_iter": int(max_iter),
+        "metric": metric,
+        "init": init,
+        "raw_resolved_init": raw_init,
+        "feature_resolved_init": feature_init,
+        "random_state": int(random_state),
+        "standardize": bool(standardize),
+        "artifacts": {
+            "comparison_plot": str(comparison_plot),
+            "raw_plot": str(raw_plot),
+            "feature_plot": str(feature_plot),
+            "raw_embedding_csv": str(raw_csv),
+            "feature_embedding_csv": str(feature_csv),
+            "plot_dir": str(plot_dir),
+            "embedding_dir": str(embedding_dir),
+        },
+        "warnings": warnings,
+    }
+
+    report_path = ctx.reports_dir / "layer_raw_feature_tsne_report.json"
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(json_ready(report), f, indent=2)
+
+    ctx.add_artifact("report", report_path)
+    ctx.add_artifact("comparison_plot", comparison_plot)
+    ctx.add_artifact("raw_plot", raw_plot)
+    ctx.add_artifact("feature_plot", feature_plot)
+    ctx.add_artifact("raw_embedding_csv", raw_csv)
+    ctx.add_artifact("feature_embedding_csv", feature_csv)
+    ctx.add_artifact("plots", plot_dir)
+    ctx.add_artifact("embeddings", embedding_dir)
+    ctx.add_timing("elapsed_seconds", elapsed_seconds)
+    ctx.finalize(
+        {
+            "pipeline": "layer_raw_feature_tsne",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "feature_file": str(feature_file),
+            "feature_root": str(feature_root),
+            "model_names_file": str(model_names_file) if model_names_file is not None else None,
+            "labels_file": str(labels_file) if labels_file is not None else None,
+            "metadata_file": str(metadata_file) if metadata_file is not None else None,
+            "dataset_reference_report": (
+                str(dataset_reference_report) if dataset_reference_report is not None else None
+            ),
+            "dataset_root": str(dataset_root) if dataset_root is not None else None,
+            "folder": folders[0] if len(folders) == 1 else list(folders),
+            "folders": list(folders),
+            "layer": int(layer),
+            "block_filters": resolved_block_filters,
+            "features": None if features is None else [str(x) for x in features],
+            "raw_projection_dim": int(raw_projection_dim),
+            "projection_seed": int(projection_seed),
+            "perplexity": float(perplexity),
+            "learning_rate": learning_rate,
+            "max_iter": int(max_iter),
+            "metric": metric,
+            "init": init,
+            "random_state": int(random_state),
+            "standardize": bool(standardize),
+            "point_size": float(point_size),
+            "alpha": float(alpha),
+        }
+    )
+
+    return {
+        "run_dir": ctx.run_dir,
+        "report": report_path,
+        "plot_dir": plot_dir,
+        "embedding_dir": embedding_dir,
     }
 
 

@@ -48,6 +48,8 @@ PROJECT_STORAGE_ROOT=${UPEFTGUARD_STORAGE_ROOT:-/models/${CURRENT_USER}/unsuperv
 DATASET_ROOT=${DATASET_ROOT:-${UPEFTGUARD_DATA_ROOT:-${PROJECT_STORAGE_ROOT}/data}}
 OUTPUT_ROOT=${OUTPUT_ROOT:-runs}
 RUN_ID=${RUN_ID:-supervised_${SLURM_JOB_ID:-manual}}
+SLURM_SAFE_RUN_ID=${RUN_ID//\//__}
+SLURM_SAFE_RUN_ID=${SLURM_SAFE_RUN_ID// /_}
 PIPELINE_MODE=${PIPELINE_MODE:-full}
 MODEL=${MODEL:-all}
 TASK_MODE=${TASK_MODE:-binary}
@@ -324,9 +326,9 @@ WORKER_JOB_ID=$(sbatch \
   --partition "${SLURM_PARTITION}" \
   --cpus-per-task "${SLURM_CPUS_PER_TASK}" \
   --array "0-${ARRAY_MAX}%${SLURM_MAX_CONCURRENT}" \
-  --job-name "upeftguard_supervised_worker_${RUN_ID}" \
-  --output "${SLURM_LOG_DIR}/supervised_worker_${RUN_ID}_%A_%a.out" \
-  --error "${SLURM_LOG_DIR}/supervised_worker_${RUN_ID}_%A_%a.err" \
+  --job-name "upeftguard_supervised_worker_${SLURM_SAFE_RUN_ID}" \
+  --output "${SLURM_LOG_DIR}/supervised_worker_${SLURM_SAFE_RUN_ID}_%A_%a.out" \
+  --error "${SLURM_LOG_DIR}/supervised_worker_${SLURM_SAFE_RUN_ID}_%A_%a.err" \
   --wrap "source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.cli run supervised --stage worker --run-dir ${RUN_DIR} --task-index \${SLURM_ARRAY_TASK_ID} --n-jobs ${SLURM_CPUS_PER_TASK}")
 
 if [[ -n "${FINALIZE_SKIP_FLAG}" ]]; then
@@ -335,9 +337,9 @@ if [[ -n "${FINALIZE_SKIP_FLAG}" ]]; then
     --partition "${SLURM_PARTITION}" \
     --cpus-per-task 4 \
     --dependency "afterok:${WORKER_JOB_ID}" \
-    --job-name "upeftguard_supervised_finalize_${RUN_ID}" \
-    --output "${SLURM_LOG_DIR}/supervised_finalize_${RUN_ID}_%j.out" \
-    --error "${SLURM_LOG_DIR}/supervised_finalize_${RUN_ID}_%j.err" \
+    --job-name "upeftguard_supervised_finalize_${SLURM_SAFE_RUN_ID}" \
+    --output "${SLURM_LOG_DIR}/supervised_finalize_${SLURM_SAFE_RUN_ID}_%j.out" \
+    --error "${SLURM_LOG_DIR}/supervised_finalize_${SLURM_SAFE_RUN_ID}_%j.err" \
     --wrap "source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.cli run supervised --stage finalize --run-dir ${RUN_DIR}${FINALIZE_SCORE_PERCENTILES_ARGS}${FINALIZE_SKIP_FLAG}")
 else
   FINALIZE_PREPARE_JOB_ID=$(sbatch \
@@ -345,9 +347,9 @@ else
     --partition "${SLURM_PARTITION}" \
     --cpus-per-task 4 \
     --dependency "afterok:${WORKER_JOB_ID}" \
-    --job-name "upeftguard_supervised_finalize_prepare_${RUN_ID}" \
-    --output "${SLURM_LOG_DIR}/supervised_finalize_prepare_${RUN_ID}_%j.out" \
-    --error "${SLURM_LOG_DIR}/supervised_finalize_prepare_${RUN_ID}_%j.err" \
+    --job-name "upeftguard_supervised_finalize_prepare_${SLURM_SAFE_RUN_ID}" \
+    --output "${SLURM_LOG_DIR}/supervised_finalize_prepare_${SLURM_SAFE_RUN_ID}_%j.out" \
+    --error "${SLURM_LOG_DIR}/supervised_finalize_prepare_${SLURM_SAFE_RUN_ID}_%j.err" \
     --wrap "source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.cli run supervised --stage finalize_prepare --run-dir ${RUN_DIR}${FINALIZE_SCORE_PERCENTILES_ARGS} --finalize-export-shards ${FINALIZE_EXPORT_TASKS}")
 
   FINALIZE_WORKER_JOB_ID=$(sbatch \
@@ -358,9 +360,9 @@ else
     --cpus-per-task "${FINALIZE_EXPORT_CPUS_PER_TASK}" \
     --array "0-${FINALIZE_EXPORT_ARRAY_MAX}%${FINALIZE_EXPORT_MAX_CONCURRENT}" \
     --dependency "afterok:${FINALIZE_PREPARE_JOB_ID}" \
-    --job-name "upeftguard_supervised_finalize_worker_${RUN_ID}" \
-    --output "${SLURM_LOG_DIR}/supervised_finalize_worker_${RUN_ID}_%A_%a.out" \
-    --error "${SLURM_LOG_DIR}/supervised_finalize_worker_${RUN_ID}_%A_%a.err" \
+    --job-name "upeftguard_supervised_finalize_worker_${SLURM_SAFE_RUN_ID}" \
+    --output "${SLURM_LOG_DIR}/supervised_finalize_worker_${SLURM_SAFE_RUN_ID}_%A_%a.out" \
+    --error "${SLURM_LOG_DIR}/supervised_finalize_worker_${SLURM_SAFE_RUN_ID}_%A_%a.err" \
     --wrap "source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.cli run supervised --stage finalize_worker --run-dir ${RUN_DIR} --task-index \${SLURM_ARRAY_TASK_ID} --n-jobs ${FINALIZE_EXPORT_CPUS_PER_TASK}")
 
   FINALIZE_MERGE_JOB_ID=$(sbatch \
@@ -368,9 +370,9 @@ else
     --partition "${SLURM_PARTITION}" \
     --cpus-per-task 4 \
     --dependency "afterok:${FINALIZE_WORKER_JOB_ID}" \
-    --job-name "upeftguard_supervised_finalize_merge_${RUN_ID}" \
-    --output "${SLURM_LOG_DIR}/supervised_finalize_merge_${RUN_ID}_%j.out" \
-    --error "${SLURM_LOG_DIR}/supervised_finalize_merge_${RUN_ID}_%j.err" \
+    --job-name "upeftguard_supervised_finalize_merge_${SLURM_SAFE_RUN_ID}" \
+    --output "${SLURM_LOG_DIR}/supervised_finalize_merge_${SLURM_SAFE_RUN_ID}_%j.out" \
+    --error "${SLURM_LOG_DIR}/supervised_finalize_merge_${SLURM_SAFE_RUN_ID}_%j.err" \
     --wrap "source ${CONDA_SH} && conda activate ${CONDA_ENV} && python -m upeftguard.cli run supervised --stage finalize_merge --run-dir ${RUN_DIR}")
 fi
 

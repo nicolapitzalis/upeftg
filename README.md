@@ -238,6 +238,20 @@ Useful options:
 - `--perplexities`, `--learning-rates`, `--max-iters-grid`, `--metrics`, `--inits`, and `--random-states` to sweep multiple t-SNE settings in one run.
 - Bare `--feature-file` names resolve under `runs/feature_extract/<RUN_ID>/merged/` and automatically pick up sibling `spectral_model_names.json`, optional `spectral_labels.npy`, and optional `spectral_metadata.json`.
 
+### 5b. Layer raw B@A vs feature t-SNE
+
+```bash
+python -m upeftguard.cli run layer-raw-feature-tsne \
+  --feature-file <RUN_ID> \
+  --folder llama2_7b_toxic_backdoors_hard_rank256_qv llama2_7b_toxic_backdoors_alpaca_rank256_qv \
+  --layer 7 \
+  --block-filter q_proj \
+  --output-root runs \
+  --run-id layer7_raw_vs_features
+```
+
+This compares clean/backdoor t-SNE over the effective LoRA update `B @ A` for the selected layer against extracted spectral features for the same dataset rows and layer. Pass one or more folder/dataset names after `--folder` (or `--dataset-name`). The raw side uses a deterministic projected sketch of `B @ A`, so large 7B adapter layers can be compared without materializing dense deltas.
+
 ### 6. Layer scatter plots over features
 
 ```bash
@@ -406,6 +420,36 @@ python -m upeftguard.cli experiment supervised-cnn-suite \
 ```
 
 These launchers generate grouped joint manifests from `manifests/adapter_exploration/llama2_7b_tbh_all_adapters.json` and `manifests/architecture_exploration/tbh_all_architectures.json`, train on all groups except the held-out adapter or architecture, run a fresh CNN grid for each held-out group, and write outputs under `runs/supervised/leave_one_out_adapter_cnn/<RUN_ID>/` or `runs/supervised/leave_one_out_architecture_cnn/<RUN_ID>/`. Passing `--hyperparam-config <REFERENCE_RUN_ID_OR_RUN_DIR>` without `--cnn-hyperparams` keeps the old fixed-reference-winner behavior; passing both uses the reference only for defaults such as feature/extractor settings while still running the per-holdout grid.
+
+For the paper q+v reference baselines over the same CNN holdout manifests:
+
+```bash
+python -m upeftguard.cli experiment paper-qv-reference \
+  --suite rank-leave-one-out \
+  --feature-file list2_features-merged
+
+python -m upeftguard.cli experiment paper-qv-reference \
+  --suite adapter-leave-one-out \
+  --feature-file list2_features-merged
+
+python -m upeftguard.cli experiment paper-qv-reference \
+  --suite architecture-leave-one-out \
+  --feature-file list2_features-merged
+```
+
+These suites reuse existing manifests instead of generating new splits: rank uses `manifests/leave_one_out/holdout_llama2_7b_toxic_backdoors_hard_rank*_qv.json`, adapter uses `runs/generated_manifests/leave_one_out_adapter/*.json`, and architecture uses `runs/generated_manifests/leave_one_out_architecture/*.json`. Summaries are written to `runs/paper_qv_reference/summaries/` and use the method's calibration-selected threshold from `selected_threshold.json`.
+
+To run the clean-reference unsupervised variant, skip the logistic-regression weights and calibrate the threshold from clean training scores only:
+
+```bash
+python -m upeftguard.cli experiment paper-qv-reference \
+  --suite all-leave-one-out \
+  --feature-file list2_features-merged \
+  --scoring-mode clean-uniform \
+  --clean-threshold-percentile 95
+```
+
+This writes separate clean-uniform suite runs with a `_clean_uniform_p95` suffix and clean-uniform summaries under `runs/paper_qv_reference/summaries/`.
 
 The same contract applies to direct CLI runs and Slurm-array runs: supervised always consumes a precomputed feature bundle.
 

@@ -5,6 +5,7 @@ from typing import Any
 
 
 __all__ = [
+    "run_layer_raw_feature_tsne_pipeline",
     "run_grouped_tsne_analysis",
     "run_grouped_tsne_sweep_analysis",
     "run_layer_value_scatter_analysis",
@@ -18,6 +19,7 @@ __all__ = [
 
 def __getattr__(name: str) -> Any:
     if name in {
+        "run_layer_raw_feature_tsne_pipeline",
         "run_grouped_tsne_analysis",
         "run_grouped_tsne_sweep_analysis",
         "run_layer_value_scatter_analysis",

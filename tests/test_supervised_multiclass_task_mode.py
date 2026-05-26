@@ -41,7 +41,10 @@ from upeftguard.supervised.pipeline import (
     _resolve_supervised_task_spec,
     run_supervised_pipeline,
 )
-from upeftguard.unsupervised.analysis import run_supervised_cnn_feature_tsne_pipeline
+from upeftguard.unsupervised.analysis import (
+    _run_cnn_embedding_tsne_view,
+    run_supervised_cnn_feature_tsne_pipeline,
+)
 from upeftguard.utilities.artifacts.spectral_metadata import write_spectral_metadata
 from upeftguard.utilities.core.manifest import ManifestItem, infer_attack_sample_identities
 
@@ -629,6 +632,132 @@ class TestSupervisedMulticlassTaskMode(unittest.TestCase):
         task_spec = _resolve_supervised_task_spec(task_mode=None, multiclass_attack_names=None)
         self.assertTrue(task_spec.is_binary)
         self.assertEqual(task_spec.selection_metric_name, "roc_auc")
+
+    def test_cnn_tsne_binary_view_writes_attack_and_clean_coloring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            rows = [
+                {
+                    "embedding_index": 0,
+                    "source_row_index": 0,
+                    "partition": "train",
+                    "model_name": "clean_from_insertsent",
+                    "label": 0,
+                    "binary_label": 0,
+                    "task_label_name": "clean",
+                    "predicted_label_name": "clean",
+                    "attack_name": "insertsent",
+                    "effective_attack_name": "clean",
+                    "backdoor_score": 0.01,
+                    "head_projection": -4.0,
+                    "head_margin": -4.0,
+                    "prediction_entropy": 0.1,
+                },
+                {
+                    "embedding_index": 1,
+                    "source_row_index": 1,
+                    "partition": "train",
+                    "model_name": "clean_from_stybkd",
+                    "label": 0,
+                    "binary_label": 0,
+                    "task_label_name": "clean",
+                    "predicted_label_name": "clean",
+                    "attack_name": "stybkd",
+                    "effective_attack_name": "clean",
+                    "backdoor_score": 0.02,
+                    "head_projection": -3.5,
+                    "head_margin": -3.5,
+                    "prediction_entropy": 0.2,
+                },
+                {
+                    "embedding_index": 2,
+                    "source_row_index": 2,
+                    "partition": "train",
+                    "model_name": "insertsent_backdoor",
+                    "label": 1,
+                    "binary_label": 1,
+                    "task_label_name": "backdoored",
+                    "predicted_label_name": "backdoored",
+                    "attack_name": "insertsent",
+                    "effective_attack_name": "insertsent",
+                    "backdoor_score": 0.97,
+                    "head_projection": 5.0,
+                    "head_margin": 5.0,
+                    "prediction_entropy": 0.3,
+                },
+                {
+                    "embedding_index": 3,
+                    "source_row_index": 3,
+                    "partition": "inference",
+                    "model_name": "stybkd_backdoor",
+                    "label": 1,
+                    "binary_label": 1,
+                    "task_label_name": "backdoored",
+                    "predicted_label_name": "backdoored",
+                    "attack_name": "stybkd",
+                    "effective_attack_name": "stybkd",
+                    "backdoor_score": 0.94,
+                    "head_projection": 4.5,
+                    "head_margin": 4.5,
+                    "prediction_entropy": 0.4,
+                },
+                {
+                    "embedding_index": 4,
+                    "source_row_index": 4,
+                    "partition": "inference",
+                    "model_name": "clean_from_inference",
+                    "label": 0,
+                    "binary_label": 0,
+                    "task_label_name": "clean",
+                    "predicted_label_name": "clean",
+                    "attack_name": "insertsent",
+                    "effective_attack_name": "clean",
+                    "backdoor_score": 0.03,
+                    "head_projection": -3.0,
+                    "head_margin": -3.0,
+                    "prediction_entropy": 0.2,
+                },
+            ]
+            embeddings = np.asarray(
+                [
+                    [-2.0, -1.5, 0.0],
+                    [-1.6, -1.1, 0.2],
+                    [1.9, 1.4, 0.1],
+                    [1.5, 1.8, 0.3],
+                    [-1.8, -1.7, -0.1],
+                ],
+                dtype=np.float32,
+            )
+
+            view_report, warnings = _run_cnn_embedding_tsne_view(
+                view_name="combined",
+                rows=rows,
+                embeddings=embeddings,
+                plot_dir=tmp_path / "plots",
+                embedding_dir=tmp_path / "reports",
+                perplexity=2.0,
+                learning_rate="auto",
+                max_iter=250,
+                metric="euclidean",
+                init="pca",
+                random_state=7,
+                standardize=True,
+                point_size=20.0,
+                alpha=0.8,
+            )
+
+            self.assertEqual(warnings, [])
+            self.assertEqual(view_report["attack_plot_scope"], "backdoor_rows_only")
+            self.assertEqual(view_report["attack_plot_n_samples"], 2)
+            self.assertEqual(view_report["attack_and_clean_plot_field"], "effective_attack_name")
+            self.assertEqual(view_report["attack_and_clean_plot_scope"], "all_rows")
+            self.assertEqual(view_report["attack_and_clean_plot_n_samples"], len(rows))
+            self.assertEqual(
+                view_report["attack_and_clean_plot_categories"],
+                ["clean", "insertsent", "stybkd"],
+            )
+            self.assertTrue(Path(view_report["plots"]["attack"]).exists())
+            self.assertTrue(Path(view_report["plots"]["attack_and_clean"]).exists())
 
     def test_multiclass_can_select_by_binary_auroc(self):
         task_spec = _resolve_supervised_task_spec(
@@ -1432,6 +1561,9 @@ class TestSupervisedMulticlassTaskMode(unittest.TestCase):
                 self.assertEqual(view["attack_plot_field"], "attack_name")
                 self.assertEqual(view["attack_plot_scope"], "backdoor_rows_only")
                 self.assertEqual(view["attack_plot_n_samples"], expected_attack_plot_counts[view["view"]])
+                self.assertEqual(view["attack_and_clean_plot_field"], "effective_attack_name")
+                self.assertEqual(view["attack_and_clean_plot_scope"], "all_rows")
+                self.assertTrue(Path(view["plots"]["attack_and_clean"]).exists())
                 coordinate_rows = load_csv_rows(Path(view["embedding_csv"]))
                 self.assertIn("effective_attack_name", coordinate_rows[0])
                 self.assertTrue(Path(view["plots"]["partition"]).exists())

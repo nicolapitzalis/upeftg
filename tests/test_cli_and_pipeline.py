@@ -40,7 +40,10 @@ from upeftguard.supervised.interfaces import (
 )
 from upeftguard.supervised.pipeline import _load_features_for_tuning_manifest, run_supervised_pipeline
 from upeftguard.supervised.registry import candidate_params, create, normalization_policy, registered_models
-from upeftguard.unsupervised.analysis import run_rank_feature_value_analysis
+from upeftguard.unsupervised.analysis import (
+    run_layer_raw_feature_tsne_pipeline,
+    run_rank_feature_value_analysis,
+)
 from upeftguard.utilities.artifacts.dataset_references import (
     build_dataset_reference_payload_from_items,
     default_dataset_reference_report_path,
@@ -89,6 +92,7 @@ class ExperimentCliTests(unittest.TestCase):
             "prepare-attack-family-leave-one-out",
             "prepare-group-leave-one-out",
             "supervised-cnn-suite",
+            "runtime-comparison",
         ]
 
         for command in commands:
@@ -103,15 +107,17 @@ def make_tiny_adapter_dataset(
     *,
     q_out_dim: int = 4,
     v_out_dim: int = 3,
+    dataset_name: str = "tiny_data",
+    model_prefix: str = "tiny",
 ) -> Path:
-    data_dir = root / "tiny_data"
+    data_dir = root / dataset_name
     data_dir.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(123)
 
     for label in [0, 1]:
         for idx in [0, 1, 2, 3]:
-            model_dir = data_dir / f"tiny_label{label}_{idx}"
+            model_dir = data_dir / f"{model_prefix}_label{label}_{idx}"
             model_dir.mkdir(parents=True, exist_ok=True)
 
             tensors = {}
@@ -467,6 +473,11 @@ def write_tiny_adapter(model_dir: Path) -> None:
 def load_json_file(path: Path) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_csv_rows(path: Path) -> list[dict[str, str]]:
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
 
 
 def load_public_and_internal_spectral_metadata(metadata_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2630,6 +2641,209 @@ class TestCliAndPipeline(unittest.TestCase):
                     dataset_reference_report=ranked_report_path,
                 )
 
+    def test_raw_delta_sketch_matches_projected_ba(self):
+        from upeftguard.unsupervised.analysis import (
+            _raw_delta_projection_matrices,
+            _sketch_lora_delta,
+        )
+
+        a = np.arange(1, 9, dtype=np.float32).reshape(2, 4)
+        b = np.arange(1, 7, dtype=np.float32).reshape(3, 2)
+        projection_cache = {}
+
+        actual = _sketch_lora_delta(
+            a=a,
+            b=b,
+            block_name="layer0.self_attn.q_proj",
+            raw_projection_dim=5,
+            projection_seed=17,
+            projection_cache=projection_cache,
+        )
+        output_projection, input_projection = _raw_delta_projection_matrices(
+            block_name="layer0.self_attn.q_proj",
+            out_features=3,
+            in_features=4,
+            raw_projection_dim=5,
+            projection_seed=17,
+            projection_cache=projection_cache,
+        )
+        expected = (output_projection @ (b @ a) @ input_projection).reshape(-1)[:5]
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+        self.assertFalse(np.allclose(actual, np.concatenate([a.reshape(-1), b.reshape(-1)])[:5]))
+
+    def test_cli_run_layer_raw_feature_tsne_writes_report_plots_and_csvs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = make_tiny_adapter_dataset(tmp_path)
+            extra_data_dir = make_tiny_adapter_dataset(
+                tmp_path,
+                dataset_name="tiny_extra_data",
+                model_prefix="tiny_extra",
+            )
+            manifest = tmp_path / "prepare_manifest.json"
+            adapter_paths = [
+                *sorted(data_dir.glob("*/adapter_model.safetensors")),
+                *sorted(extra_data_dir.glob("*/adapter_model.safetensors")),
+            ]
+            write_path_manifest(
+                manifest,
+                [str(path.resolve()) for path in adapter_paths],
+            )
+            items = parse_single_manifest_json(
+                manifest_path=manifest,
+                dataset_root=tmp_path,
+                section_key="path",
+            )
+            features, labels, model_names, metadata = extract_spectral_features(
+                items=items,
+                spectral_features=["energy", "stable_rank"],
+                sv_top_k=2,
+                block_size=64,
+                dtype=np.float32,
+            )
+            feature_dir = tmp_path / "feature_runs" / "tiny" / "merged"
+            write_merged_feature_artifacts(
+                feature_dir,
+                features=features,
+                labels=labels,
+                model_names=model_names,
+                metadata=metadata,
+            )
+            reference_payload = build_dataset_reference_payload_from_items(
+                items=items,
+                artifact_kind="feature_extract",
+                manifest_json=manifest,
+                dataset_root=tmp_path,
+                artifact_model_count=len(model_names),
+            )
+            reference_path = write_dataset_reference_report(
+                default_dataset_reference_report_path(feature_dir),
+                reference_payload,
+            )
+
+            runs_root = tmp_path / "runs"
+            run_id = "layer_raw_feature_tsne_cli"
+            proc = run_cli(
+                [
+                    "run",
+                    "layer-raw-feature-tsne",
+                    "--feature-file",
+                    str(feature_dir / "spectral_features.npy"),
+                    "--dataset-reference-report",
+                    str(reference_path),
+                    "--dataset-root",
+                    str(tmp_path),
+                    "--folder",
+                    "tiny_data",
+                    "tiny_extra_data",
+                    "--layer",
+                    "0",
+                    "--block-filter",
+                    "q_proj",
+                    "--features",
+                    "energy",
+                    "stable_rank",
+                    "--raw-projection-dim",
+                    "4",
+                    "--perplexity",
+                    "2",
+                    "--max-iter",
+                    "250",
+                    "--output-root",
+                    str(runs_root),
+                    "--run-id",
+                    run_id,
+                ],
+                cwd=REPO_ROOT,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr + proc.stdout)
+
+            run_dir = runs_root / "layer_raw_feature_tsne" / run_id
+            report_path = run_dir / "reports" / "layer_raw_feature_tsne_report.json"
+            artifact_index = load_json_file(run_dir / "artifact_index.json")
+            report = load_json_file(report_path)
+
+            self.assertEqual(report["analysis"], "layer_raw_feature_tsne")
+            self.assertEqual(report["folder"], ["tiny_data", "tiny_extra_data"])
+            self.assertEqual(report["folders"], ["tiny_data", "tiny_extra_data"])
+            self.assertEqual(report["matched_folder_counts"], {"tiny_data": 8, "tiny_extra_data": 8})
+            self.assertEqual(report["layer"], 0)
+            self.assertEqual(report["block_filters"], ["q_proj"])
+            self.assertEqual(report["raw_input_shape"], [16, 4])
+            self.assertEqual(report["feature_input_shape"], [16, 2])
+            self.assertEqual(report["label_counts"], {"0": 8, "1": 8})
+            self.assertEqual([block["block_name"] for block in report["raw_blocks"]], ["layer0.self_attn.q_proj"])
+
+            for key in [
+                "comparison_plot",
+                "raw_plot",
+                "feature_plot",
+                "raw_embedding_csv",
+                "feature_embedding_csv",
+            ]:
+                self.assertIn(key, artifact_index)
+                self.assertTrue(Path(artifact_index[key]).exists())
+
+            raw_rows = load_csv_rows(Path(report["artifacts"]["raw_embedding_csv"]))
+            feature_rows = load_csv_rows(Path(report["artifacts"]["feature_embedding_csv"]))
+            self.assertEqual(len(raw_rows), 16)
+            self.assertEqual(len(feature_rows), 16)
+
+    def test_layer_raw_feature_tsne_errors_for_missing_layer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = make_tiny_adapter_dataset(tmp_path)
+            manifest = tmp_path / "prepare_manifest.json"
+            write_path_manifest(
+                manifest,
+                [str(path.resolve()) for path in sorted(data_dir.glob("*/adapter_model.safetensors"))],
+            )
+            items = parse_single_manifest_json(
+                manifest_path=manifest,
+                dataset_root=tmp_path,
+                section_key="path",
+            )
+            features, labels, model_names, metadata = extract_spectral_features(
+                items=items,
+                spectral_features=["energy"],
+                sv_top_k=2,
+                block_size=64,
+                dtype=np.float32,
+            )
+            feature_dir = tmp_path / "feature_runs" / "tiny" / "merged"
+            write_merged_feature_artifacts(
+                feature_dir,
+                features=features,
+                labels=labels,
+                model_names=model_names,
+                metadata=metadata,
+            )
+            reference_payload = build_dataset_reference_payload_from_items(
+                items=items,
+                artifact_kind="feature_extract",
+                manifest_json=manifest,
+                dataset_root=tmp_path,
+                artifact_model_count=len(model_names),
+            )
+            reference_path = write_dataset_reference_report(
+                default_dataset_reference_report_path(feature_dir),
+                reference_payload,
+            )
+
+            with self.assertRaisesRegex(ValueError, "No extracted feature columns matched"):
+                run_layer_raw_feature_tsne_pipeline(
+                    feature_file=feature_dir / "spectral_features.npy",
+                    output_root=tmp_path / "runs",
+                    run_id="missing_layer",
+                    folder="tiny_data",
+                    layer=99,
+                    dataset_reference_report=reference_path,
+                    dataset_root=tmp_path,
+                    max_iter=250,
+                )
+
     def test_spectral_per_block_identities(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -3286,6 +3500,97 @@ class TestCliAndPipeline(unittest.TestCase):
                 self.assertEqual(aggregation_report["aggregation_operator"], operator)
                 self.assertEqual(dataset_report["artifact_kind"], "aggregate_features")
                 self.assertEqual(int(dataset_report["artifact_model_count"]), len(model_names))
+
+    def test_util_aggregate_features_filters_moment_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            data_dir = make_tiny_adapter_dataset(tmp_path, v_out_dim=4)
+            manifest = tmp_path / "single_schema_manifest.json"
+            entries = [
+                str((data_dir / "tiny_label0_0").resolve()),
+                str((data_dir / "tiny_label1_0").resolve()),
+            ]
+            write_path_manifest(manifest, entries)
+
+            items = parse_single_manifest_json(
+                manifest_path=manifest,
+                dataset_root=tmp_path,
+                section_key="path",
+            )
+            features, labels, model_names, metadata = extract_spectral_features(
+                items=items,
+                spectral_features=["energy", "kurtosis", "l1_norm", "sv_topk"],
+                spectral_moment_source="both",
+                spectral_qv_sum_mode="append",
+                sv_top_k=2,
+                block_size=64,
+                dtype=np.float32,
+            )
+
+            feature_root = tmp_path / "runs" / "feature_extract"
+            source_dir = feature_root / "both_source" / "merged"
+            write_merged_feature_artifacts(
+                source_dir,
+                features=features,
+                labels=labels,
+                model_names=model_names,
+                metadata=metadata,
+            )
+            write_dataset_reference_report(
+                default_dataset_reference_report_path(source_dir),
+                build_dataset_reference_payload_from_items(
+                    items=items,
+                    artifact_kind="merge_spectral_shards",
+                    manifest_json=manifest,
+                    dataset_root=tmp_path,
+                    artifact_model_count=len(model_names),
+                    source_artifacts=[str(manifest)],
+                ),
+            )
+
+            output_dir = feature_root / "sv_only_aggregated" / "merged"
+            proc = run_cli(
+                [
+                    "util",
+                    "aggregate-features",
+                    "--feature-file",
+                    "both_source",
+                    "--output-filename",
+                    "sv_only_aggregated",
+                    "--feature-root",
+                    str(feature_root),
+                    "--layout",
+                    "layer_sequence",
+                    "--features",
+                    "energy",
+                    "kurtosis",
+                    "l1_norm",
+                    "sv_topk",
+                    "--spectral-qv-sum-mode",
+                    "append",
+                    "--spectral-moment-source",
+                    "sv",
+                ],
+                cwd=REPO_ROOT,
+            )
+            if proc.returncode != 0:
+                self.fail(proc.stderr + proc.stdout)
+
+            _, internal_metadata = load_public_and_internal_spectral_metadata(
+                output_dir / "spectral_metadata.json"
+            )
+            feature_names = [str(name) for name in internal_metadata["feature_names"]]
+            emitted = [str(name) for name in internal_metadata["emitted_feature_names"]]
+            self.assertEqual(internal_metadata["spectral_moment_source"], "sv")
+            self.assertIn("sv_kurtosis", emitted)
+            self.assertIn("sv_l1_norm", emitted)
+            self.assertIn("sv_1", emitted)
+            self.assertIn("sv_2", emitted)
+            self.assertNotIn("kurtosis", emitted)
+            self.assertNotIn("l1_norm", emitted)
+            self.assertTrue(any(name.endswith(".sv_kurtosis") for name in feature_names))
+            self.assertTrue(any(name.endswith(".sv_1") for name in feature_names))
+            self.assertFalse(any(name.endswith(".kurtosis") for name in feature_names))
 
     def test_util_aggregate_features_avg_equal_weights_structural_groups(self):
         with tempfile.TemporaryDirectory() as tmp:

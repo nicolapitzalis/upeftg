@@ -13,6 +13,7 @@ from ...features.spectral import (
     DEFAULT_SPECTRAL_MOMENT_SOURCE,
     _layer_identifier_for_block_name,
     build_spectral_feature_names,
+    expand_spectral_feature_names,
     resolve_spectral_moment_source,
     resolve_spectral_qv_sum_mode,
     sanitize_spectral_metadata,
@@ -88,6 +89,13 @@ def _emitted_feature_name(feature_name: str) -> str:
     return str(feature_name).rpartition(".")[2]
 
 
+def _emitted_feature_matches_allowed(emitted_feature: str, allowed_features: set[str]) -> bool:
+    emitted = str(emitted_feature)
+    if emitted in allowed_features:
+        return True
+    return "sv_topk" in allowed_features and emitted.startswith("sv_") and emitted[3:].isdigit()
+
+
 def _role_bucket_for_block_name(block_name: str) -> str:
     text = str(block_name).strip()
     if text.endswith(".qv_sum"):
@@ -157,6 +165,7 @@ def _filter_selected_input_feature_names(
     root_feature_names: list[str],
     requested_features: list[str] | None,
     spectral_qv_sum_mode: str,
+    spectral_moment_source: str | None = None,
 ) -> list[str]:
     resolved_qv_mode = resolve_spectral_qv_sum_mode(spectral_qv_sum_mode)
     available_feature_names = list(root_feature_names)
@@ -183,6 +192,19 @@ def _filter_selected_input_feature_names(
         available_feature_names=available_feature_names,
         requested_features=requested_features,
     )
+    if spectral_moment_source is not None:
+        selected_feature_groups = _ordered_feature_groups(selected_feature_names)
+        allowed_emitted_features = set(
+            expand_spectral_feature_names(
+                selected_features=selected_feature_groups,
+                spectral_moment_source=spectral_moment_source,
+            )
+        )
+        selected_feature_names = [
+            name
+            for name in selected_feature_names
+            if _emitted_feature_matches_allowed(_emitted_feature_name(name), allowed_emitted_features)
+        ]
     if not selected_feature_names:
         raise ValueError("Requested aggregation resolved to zero input columns")
     return selected_feature_names
@@ -701,6 +723,7 @@ def aggregate_features(
     feature_root: Path = DEFAULT_FEATURE_EXTRACT_ROOT,
     features: list[str] | tuple[str, ...] | None = None,
     spectral_qv_sum_mode: str = "append",
+    spectral_moment_source: str | None = None,
     layout: str = "flat",
 ) -> dict[str, Path | None]:
     started_at = datetime.now(timezone.utc)
@@ -723,21 +746,24 @@ def aggregate_features(
         )
 
     root_feature_names = [str(name) for name in table.feature_names]
-    selected_input_feature_names = _filter_selected_input_feature_names(
-        root_feature_names=root_feature_names,
-        requested_features=requested_features,
-        spectral_qv_sum_mode=resolved_requested_qv_mode,
-    )
-    selected_input_feature_name_set = set(selected_input_feature_names)
-    selected_feature_groups = _ordered_feature_groups(selected_input_feature_names)
     source_metadata = dict(table.metadata)
     raw_moment_source = source_metadata.get("spectral_moment_source")
     extractor_params = source_metadata.get("extractor_params")
     if raw_moment_source is None and isinstance(extractor_params, dict):
         raw_moment_source = extractor_params.get("spectral_moment_source")
     resolved_moment_source = resolve_spectral_moment_source(
-        None if raw_moment_source is None else str(raw_moment_source)
+        str(spectral_moment_source)
+        if spectral_moment_source is not None
+        else (None if raw_moment_source is None else str(raw_moment_source))
     )
+    selected_input_feature_names = _filter_selected_input_feature_names(
+        root_feature_names=root_feature_names,
+        requested_features=requested_features,
+        spectral_qv_sum_mode=resolved_requested_qv_mode,
+        spectral_moment_source=resolved_moment_source,
+    )
+    selected_input_feature_name_set = set(selected_input_feature_names)
+    selected_feature_groups = _ordered_feature_groups(selected_input_feature_names)
     raw_sv_top_k = source_metadata.get("sv_top_k")
     if raw_sv_top_k is None and isinstance(extractor_params, dict):
         raw_sv_top_k = extractor_params.get("spectral_sv_top_k")
@@ -1027,6 +1053,7 @@ def aggregate_features(
         "selection": {
             "requested_features": list(requested_features) if requested_features is not None else "all",
             "requested_qv_sum_mode": resolved_requested_qv_mode,
+            "requested_spectral_moment_source": resolved_moment_source,
             "emitted_feature_names": list(emitted_feature_names),
             "selected_source_feature_files": [str(path) for path in selected_leaf_paths],
         },
@@ -1165,6 +1192,15 @@ def build_parser() -> argparse.ArgumentParser:
         default="append",
         help="Which q+v-sum columns to keep before aggregation",
     )
+    parser.add_argument(
+        "--spectral-moment-source",
+        choices=["entrywise", "sv", "both"],
+        default=None,
+        help=(
+            "Which moment columns to keep when the source bundle contains both entrywise and singular-value "
+            "moment features. Defaults to the source bundle metadata."
+        ),
+    )
     return parser
 
 
@@ -1178,6 +1214,7 @@ def main(argv: list[str] | None = None) -> int:
         feature_root=args.feature_root,
         features=args.features,
         spectral_qv_sum_mode=args.spectral_qv_sum_mode,
+        spectral_moment_source=args.spectral_moment_source,
         layout=args.layout,
     )
     print("Feature aggregation complete")

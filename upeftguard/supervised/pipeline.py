@@ -3154,6 +3154,7 @@ def _prepare_supervised_run(
     rank_label_weight_loss: bool = False,
     selection_metric: str | None = None,
 ) -> dict[str, Any]:
+    prepare_started_perf = perf_counter()
     manifest_json = resolve_manifest_path(manifest_json)
     if not manifest_json.exists():
         raise FileNotFoundError(f"Manifest JSON not found: {manifest_json}")
@@ -3733,6 +3734,8 @@ def _prepare_supervised_run(
     tuning_manifest_path = ctx.reports_dir / "tuning_manifest.json"
     with open(tuning_manifest_path, "w", encoding="utf-8") as f:
         json.dump(json_ready(tuning_manifest), f, indent=2)
+    prepare_elapsed_seconds = float(perf_counter() - prepare_started_perf)
+    _update_supervised_timings(ctx.run_dir, {"prepare_elapsed_seconds": prepare_elapsed_seconds})
 
     return {
         "run_dir": str(ctx.run_dir),
@@ -3952,6 +3955,69 @@ def _finalize_state_path(run_dir: Path) -> Path:
     return run_dir / "reports" / FINALIZE_STATE_FILENAME
 
 
+def _supervised_timings_path(run_dir: Path) -> Path:
+    return run_dir / "timings.json"
+
+
+def _load_supervised_timings(run_dir: Path) -> dict[str, float]:
+    path = _supervised_timings_path(run_dir)
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        return {}
+    timings: dict[str, float] = {}
+    for key, value in payload.items():
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(parsed) and parsed >= 0.0:
+            timings[str(key)] = parsed
+    return timings
+
+
+def _update_supervised_timings(run_dir: Path, updates: dict[str, float | int | None]) -> dict[str, float]:
+    timings = _load_supervised_timings(run_dir)
+    for key, value in updates.items():
+        if value is None:
+            continue
+        parsed = float(value)
+        if np.isfinite(parsed) and parsed >= 0.0:
+            timings[str(key)] = parsed
+    with open(_supervised_timings_path(run_dir), "w", encoding="utf-8") as f:
+        json.dump(json_ready(timings), f, indent=2)
+    return timings
+
+
+def _parse_supervised_timestamp(raw: Any) -> datetime | None:
+    if raw is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _supervised_observed_elapsed_seconds(run_dir: Path, *, completed_at: datetime) -> float | None:
+    manifest_path = run_dir / "reports" / "tuning_manifest.json"
+    if not manifest_path.exists():
+        return None
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+    if not isinstance(manifest, dict):
+        return None
+    started_at = _parse_supervised_timestamp(manifest.get("timestamp_utc"))
+    if started_at is None:
+        return None
+    elapsed = float((completed_at.astimezone(timezone.utc) - started_at).total_seconds())
+    return elapsed if elapsed >= 0.0 else None
+
+
 def _write_finalize_state(
     *,
     run_dir: Path,
@@ -3961,11 +4027,13 @@ def _write_finalize_state(
     winner_export_train_labels: Path | None,
     random_state: int,
     skip_feature_importance: bool,
+    timings: dict[str, float] | None = None,
 ) -> Path:
     state_path = _finalize_state_path(run_dir)
     payload = {
         "run_config": run_config,
         "artifacts": artifacts,
+        "timings": timings or {},
         "winner_export": {
             "train_feature_matrix_path": (
                 str(winner_export_train_features) if winner_export_train_features is not None else None
@@ -4054,6 +4122,7 @@ def _prepare_supervised_finalize(
     score_percentiles: list[float] | None,
     skip_feature_importance: bool,
 ) -> dict[str, Any]:
+    finalize_started_perf = perf_counter()
     ctx = _context_from_run_dir(run_dir)
     tuning_manifest_path = run_dir / "reports" / "tuning_manifest.json"
     if not tuning_manifest_path.exists():
@@ -4081,6 +4150,11 @@ def _prepare_supervised_finalize(
         raise RuntimeError(f"Missing tuning task outputs for indices: {missing[:10]}")
 
     winner = _select_winner(task_results)
+    task_elapsed_values = [
+        float(row["elapsed_seconds"])
+        for row in task_results
+        if row.get("elapsed_seconds") is not None
+    ]
     task_spec = _task_spec_from_manifest(manifest)
     features = _load_features_for_tuning_manifest(manifest)
     labels_value = np.load(manifest["data"]["labels_value_path"]).astype(np.int32)
@@ -4120,6 +4194,7 @@ def _prepare_supervised_finalize(
         task_spec=task_spec,
     )
     winner_backend = model_backend(str(winner["model_name"]))
+    final_model_fit_started_perf = perf_counter()
     if winner_backend == "cnn":
         fit_kwargs: dict[str, Any] = {}
         fit_indices = np.asarray(train_indices, dtype=np.int64)
@@ -4144,6 +4219,7 @@ def _prepare_supervised_finalize(
         )
     else:
         model.fit(x_train, y_train)
+    final_model_fit_seconds = float(perf_counter() - final_model_fit_started_perf)
     train_outputs = _predict_task_outputs(model, x_train, task_spec=task_spec)
     train_scores = np.asarray(train_outputs.backdoor_scores, dtype=np.float64)
     open_set_unknown_config = _build_open_set_unknown_attack_config(
@@ -4644,6 +4720,16 @@ def _prepare_supervised_finalize(
         "tuning_manifest": str(tuning_manifest_path),
         "tuning_tasks_dir": str(task_dir),
     }
+    worker_elapsed_wall_proxy = float(max(task_elapsed_values)) if task_elapsed_values else 0.0
+    worker_elapsed_sum = float(sum(task_elapsed_values)) if task_elapsed_values else 0.0
+    finalize_elapsed_seconds = float(perf_counter() - finalize_started_perf)
+    timing_updates = {
+        "worker_elapsed_seconds_wall_proxy": worker_elapsed_wall_proxy,
+        "worker_elapsed_seconds_sum": worker_elapsed_sum,
+        "final_model_fit_seconds": final_model_fit_seconds,
+        "finalize_elapsed_seconds": finalize_elapsed_seconds,
+        "supervised_training_method_seconds": worker_elapsed_wall_proxy + finalize_elapsed_seconds,
+    }
     state_path = _write_finalize_state(
         run_dir=run_dir,
         run_config=run_config,
@@ -4652,6 +4738,7 @@ def _prepare_supervised_finalize(
         winner_export_train_labels=export_train_labels_path,
         random_state=int(manifest["tuning"]["random_state"]),
         skip_feature_importance=bool(skip_feature_importance),
+        timings=timing_updates,
     )
 
     return {
@@ -4670,6 +4757,7 @@ def _prepare_supervised_finalize(
         "winner_export_train_features": export_train_features_path,
         "winner_export_train_labels": export_train_labels_path,
         "winner_feature_weights_mode": winner_feature_weights_mode,
+        "timings": timing_updates,
     }
 
 
@@ -4697,6 +4785,22 @@ def _complete_supervised_finalize(
     run_config = state.get("run_config")
     if not isinstance(run_config, dict):
         raise ValueError("Finalize state is missing run_config")
+    completed_at = datetime.now(timezone.utc)
+    timing_updates = _load_supervised_timings(run_dir)
+    raw_state_timings = state.get("timings", {})
+    if isinstance(raw_state_timings, dict):
+        for key, value in raw_state_timings.items():
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(parsed) and parsed >= 0.0:
+                timing_updates[str(key)] = parsed
+    observed_elapsed = _supervised_observed_elapsed_seconds(run_dir, completed_at=completed_at)
+    if observed_elapsed is not None:
+        timing_updates["supervised_total_observed_seconds"] = observed_elapsed
+    for key, value in timing_updates.items():
+        ctx.add_timing(key, value)
     ctx.finalize(run_config)
     _cleanup_finalize_intermediates(run_dir, state)
 

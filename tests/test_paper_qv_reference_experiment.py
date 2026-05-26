@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import tempfile
 import unittest
@@ -11,10 +12,19 @@ import numpy as np
 
 from upeftguard.experiments.paper_qv_reference import (
     PAPER_QV_SELECTED_SUFFIXES,
+    SCORE_AGGREGATION_METRIC_EQUAL_UNIFORM,
+    SCORING_MODE_CLEAN_UNIFORM,
+    PaperQvSuiteManifestSpec,
+    _materialize_available_suite_manifest,
     coefficients_to_normalized_weights,
+    discover_paper_qv_reference_suite_manifests,
+    generate_paper_qv_reference_summary,
+    metric_equal_uniform_weights,
     normalize_paper_features,
     run_paper_qv_reference_experiment,
+    run_paper_qv_reference_suite,
     select_calibration_threshold,
+    select_clean_percentile_threshold,
     select_paper_qv_feature_indices,
 )
 from upeftguard.utilities.artifacts.dataset_references import (
@@ -28,6 +38,17 @@ from upeftguard.utilities.artifacts.spectral_metadata import load_spectral_metad
 def load_json_file(path: Path) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_csv_rows(path: Path) -> list[dict[str, str]]:
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def write_json_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
 
 
 def load_public_and_internal_spectral_metadata(metadata_path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -307,6 +328,39 @@ class TestPaperQvReferenceExperiment(unittest.TestCase):
         weights = coefficients_to_normalized_weights(np.asarray([-2.0, 1.0, 3.0], dtype=np.float64))
         np.testing.assert_allclose(weights, np.asarray([0.0, 0.25, 0.75], dtype=np.float64))
 
+    def test_metric_equal_uniform_weights_give_each_metric_equal_mass(self):
+        feature_names = [
+            "layer0.self_attn.qv_sum.kurtosis",
+            "layer1.self_attn.qv_sum.kurtosis",
+            "layer0.self_attn.qv_sum.l2_norm",
+            "layer0.self_attn.qv_sum.concentration_of_energy",
+            "layer0.self_attn.qv_sum.sv_1",
+            "layer0.self_attn.qv_sum.spectral_entropy",
+            "layer1.self_attn.qv_sum.spectral_entropy",
+        ]
+        weights = metric_equal_uniform_weights(feature_names)
+        self.assertAlmostEqual(float(np.sum(weights)), 1.0, places=8)
+        totals: dict[str, float] = {}
+        for name, weight in zip(feature_names, weights.tolist()):
+            suffix = name.rpartition(".")[2]
+            totals[suffix] = totals.get(suffix, 0.0) + float(weight)
+        for suffix in PAPER_QV_SELECTED_SUFFIXES:
+            self.assertAlmostEqual(totals[suffix], 0.2, places=8)
+        np.testing.assert_allclose(
+            weights,
+            np.asarray([0.1, 0.1, 0.2, 0.2, 0.2, 0.1, 0.1], dtype=np.float64),
+        )
+
+    def test_metric_equal_uniform_weights_require_all_metric_groups(self):
+        feature_names = [
+            "layer0.self_attn.qv_sum.kurtosis",
+            "layer0.self_attn.qv_sum.l2_norm",
+            "layer0.self_attn.qv_sum.concentration_of_energy",
+            "layer0.self_attn.qv_sum.sv_1",
+        ]
+        with self.assertRaisesRegex(ValueError, "missing: spectral_entropy"):
+            metric_equal_uniform_weights(feature_names)
+
     def test_select_calibration_threshold_uses_perfect_separation_formula(self):
         labels = np.asarray([0, 0, 1, 1], dtype=np.int32)
         scores = np.asarray([0.10, 0.20, 0.50, 0.70], dtype=np.float64)
@@ -320,6 +374,301 @@ class TestPaperQvReferenceExperiment(unittest.TestCase):
         selected = select_calibration_threshold(labels_true=labels, scores=scores)
         self.assertEqual(selected["selection_method"], "youden_j")
         self.assertAlmostEqual(float(selected["threshold"]), 0.40, places=6)
+
+    def test_select_clean_percentile_threshold_uses_only_clean_scores(self):
+        labels = np.asarray([0, 0, 0, 1, 1], dtype=np.int32)
+        scores = np.asarray([0.10, 0.20, 0.30, 0.95, 0.99], dtype=np.float64)
+        selected = select_clean_percentile_threshold(
+            labels_true=labels,
+            scores=scores,
+            percentile=95.0,
+            source_partition="train_clean",
+        )
+        self.assertEqual(selected["selection_method"], "clean_train_percentile")
+        self.assertEqual(selected["source_partition"], "train_clean")
+        self.assertEqual(selected["n_clean_samples"], 3)
+        self.assertAlmostEqual(float(selected["target_fpr"]), 0.05, places=8)
+        self.assertAlmostEqual(float(selected["threshold"]), float(np.percentile(scores[:3], 95.0)), places=8)
+
+    def test_discover_rank_suite_uses_existing_cnn_rank_holdout_manifests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            manifest_root = repo_root / "manifests" / "leave_one_out"
+            write_json_file(
+                manifest_root / "holdout_llama2_7b_toxic_backdoors_hard_rank256_qv.json",
+                {"train": [], "infer": []},
+            )
+            write_json_file(
+                manifest_root / "holdout_llama2_7b_toxic_backdoors_hard_rank8_qv.json",
+                {"train": [], "infer": []},
+            )
+            write_json_file(
+                manifest_root / "holdout_llama2_7b_ag_news_RIPPLE_rank256_qv.json",
+                {"train": [], "infer": []},
+            )
+
+            specs = discover_paper_qv_reference_suite_manifests(
+                "rank-leave-one-out",
+                repo_root=repo_root,
+            )
+
+            self.assertEqual([spec.heldout_group for spec in specs], ["rank8", "rank256"])
+            self.assertEqual(
+                [spec.run_id for spec in specs],
+                [
+                    "rank_loo_paper_qv_holdout_rank8",
+                    "rank_loo_paper_qv_holdout_rank256",
+                ],
+            )
+            self.assertTrue(all(spec.manifest_path.parent == manifest_root.resolve() for spec in specs))
+
+    def test_discover_tbh_tba_rank_zero_shot_suite_uses_rank_transfer_manifests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            manifest_root = repo_root / "manifests" / "zero_shots" / "tbh+tba_rank_wise"
+            write_json_file(
+                manifest_root / "llama2_7b_tbh+tba_zero_shot_r256_to_rank128.json",
+                {"train": [], "infer": []},
+            )
+            write_json_file(
+                manifest_root / "llama2_7b_tbh+tba_zero_shot_r256_to_rank8.json",
+                {"train": [], "infer": []},
+            )
+            write_json_file(
+                manifest_root / "llama2_7b_tbh_zero_shot_r256_to_rank16.json",
+                {"train": [], "infer": []},
+            )
+
+            specs = discover_paper_qv_reference_suite_manifests(
+                "tbh-tba-rank-zero-shot",
+                repo_root=repo_root,
+            )
+
+            self.assertEqual([spec.heldout_group for spec in specs], ["rank8", "rank128"])
+            self.assertEqual(
+                [spec.run_id for spec in specs],
+                [
+                    "tbh_tba_rank_zero_shot_paper_qv_r256_to_rank8",
+                    "tbh_tba_rank_zero_shot_paper_qv_r256_to_rank128",
+                ],
+            )
+            self.assertTrue(all(spec.manifest_path.parent == manifest_root.resolve() for spec in specs))
+
+    def test_discover_adapter_and_architecture_suites_reuse_generated_cnn_roots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            adapter_root = repo_root / "runs" / "generated_manifests" / "leave_one_out_adapter"
+            architecture_root = repo_root / "runs" / "generated_manifests" / "leave_one_out_architecture"
+            write_json_file(adapter_root / "holdout_adapter_lora.json", {"train": [], "infer": []})
+            write_json_file(adapter_root / "holdout_adapter_lora_plus.json", {"train": [], "infer": []})
+            write_json_file(
+                architecture_root / "holdout_architecture_llama2_7b.json",
+                {"train": [], "infer": []},
+            )
+
+            adapter_specs = discover_paper_qv_reference_suite_manifests(
+                "adapter-leave-one-out",
+                repo_root=repo_root,
+            )
+            architecture_specs = discover_paper_qv_reference_suite_manifests(
+                "architecture-leave-one-out",
+                repo_root=repo_root,
+            )
+
+            self.assertEqual([spec.heldout_group for spec in adapter_specs], ["lora", "lora_plus"])
+            self.assertEqual(
+                [spec.run_id for spec in adapter_specs],
+                [
+                    "adapter_loo_paper_qv_holdout_adapter_lora",
+                    "adapter_loo_paper_qv_holdout_adapter_lora_plus",
+                ],
+            )
+            self.assertEqual([spec.heldout_group for spec in architecture_specs], ["llama2_7b"])
+            self.assertEqual(
+                architecture_specs[0].run_id,
+                "architecture_loo_paper_qv_holdout_architecture_llama2_7b",
+            )
+            self.assertTrue(all(spec.manifest_path.parent == adapter_root.resolve() for spec in adapter_specs))
+            self.assertTrue(
+                all(spec.manifest_path.parent == architecture_root.resolve() for spec in architecture_specs)
+            )
+
+    def test_generate_paper_qv_reference_summary_from_completed_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            output_root = tmp_path / "runs"
+            manifest_path = tmp_path / "holdout_rank8.json"
+            write_json_file(manifest_path, {"train": [], "infer": []})
+            spec = PaperQvSuiteManifestSpec(
+                suite="rank-leave-one-out",
+                heldout_group="rank8",
+                run_id="rank_loo_paper_qv_holdout_rank8",
+                manifest_path=manifest_path,
+            )
+            reports_dir = output_root / "paper_qv_reference" / spec.run_id / "reports"
+            write_json_file(
+                reports_dir / "metrics.json",
+                {
+                    "feature_dim": 15,
+                    "reference_bank": {"n_clean_samples": 7},
+                    "test": {
+                        "n_samples": 10,
+                        "roc_auc": 0.91,
+                        "average_precision": 0.87,
+                        "threshold_metrics": {
+                            "recall": 0.8,
+                            "specificity": 0.9,
+                            "balanced_accuracy": 0.85,
+                        },
+                    },
+                },
+            )
+            write_json_file(
+                reports_dir / "selected_threshold.json",
+                {
+                    "threshold": 0.42,
+                    "selection_method": "youden_j",
+                    "source_partition": "calibration",
+                },
+            )
+
+            summary_path = generate_paper_qv_reference_summary(
+                [spec],
+                output_root=output_root,
+            )
+
+            rows = load_csv_rows(summary_path)
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row["suite"], "rank-leave-one-out")
+            self.assertEqual(row["heldout_group"], "rank8")
+            self.assertEqual(row["run_id"], "rank_loo_paper_qv_holdout_rank8")
+            self.assertEqual(row["manifest_path"], str(manifest_path))
+            self.assertEqual(row["test_roc_auc"], "0.91")
+            self.assertEqual(row["test_average_precision"], "0.87")
+            self.assertEqual(row["test_recall"], "0.8")
+            self.assertEqual(row["test_specificity"], "0.9")
+            self.assertEqual(row["test_balanced_accuracy"], "0.85")
+            self.assertEqual(row["threshold"], "0.42")
+            self.assertEqual(row["threshold_selection_method"], "youden_j")
+            self.assertEqual(row["threshold_source_partition"], "calibration")
+            self.assertEqual(row["test_n_samples"], "10")
+            self.assertEqual(row["reference_clean_count"], "7")
+            self.assertEqual(row["feature_dim"], "15")
+
+    def test_clean_uniform_suite_summary_uses_variant_run_ids_and_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            output_root = tmp_path / "runs"
+            manifest_root = tmp_path / "manifests"
+            manifest_path = manifest_root / "holdout_llama2_7b_toxic_backdoors_hard_rank8_qv.json"
+            write_json_file(manifest_path, {"train": [], "infer": []})
+
+            run_id = "rank_loo_paper_qv_holdout_rank8_clean_uniform_p95"
+            reports_dir = output_root / "paper_qv_reference" / run_id / "reports"
+            write_json_file(
+                reports_dir / "metrics.json",
+                {
+                    "feature_dim": 15,
+                    "reference_bank": {"n_clean_samples": 7},
+                    "test": {
+                        "n_samples": 10,
+                        "roc_auc": 0.61,
+                        "average_precision": 0.57,
+                        "threshold_metrics": {
+                            "recall": 0.4,
+                            "specificity": 0.95,
+                            "balanced_accuracy": 0.675,
+                        },
+                    },
+                },
+            )
+            write_json_file(
+                reports_dir / "selected_threshold.json",
+                {
+                    "threshold": 0.55,
+                    "selection_method": "clean_train_percentile",
+                    "source_partition": "train_clean",
+                    "percentile": 95.0,
+                    "target_fpr": 0.05,
+                    "n_clean_samples": 7,
+                },
+            )
+
+            outputs = run_paper_qv_reference_suite(
+                suite="rank-leave-one-out",
+                feature_file=Path("unused"),
+                output_root=output_root,
+                manifest_root=manifest_root,
+                scoring_mode=SCORING_MODE_CLEAN_UNIFORM,
+                clean_threshold_percentile=95.0,
+                summary_only=True,
+            )
+
+            self.assertEqual(
+                outputs.summary_path.name,
+                "paper_qv_reference_rank_leave_one_out_clean_uniform_p95_summary.csv",
+            )
+            rows = load_csv_rows(outputs.summary_path)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["run_id"], run_id)
+            self.assertEqual(rows[0]["threshold_selection_method"], "clean_train_percentile")
+            self.assertEqual(rows[0]["threshold_source_partition"], "train_clean")
+            self.assertEqual(rows[0]["threshold_clean_count"], "7")
+
+    def test_materialize_available_suite_manifest_drops_missing_feature_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            manifest_path = tmp_path / "holdout_rank512.json"
+            write_json_file(
+                manifest_path,
+                {
+                    "train": [
+                        {
+                            "path": "rank512/rank512_label0_",
+                            "indices": [0, 2],
+                        },
+                        "rank512/rank512_label1_0",
+                    ],
+                    "infer": [
+                        "rank8/rank8_label0_0",
+                        "rank8/rank8_label1_0",
+                    ],
+                },
+            )
+            spec = PaperQvSuiteManifestSpec(
+                suite="rank-leave-one-out",
+                heldout_group="rank512",
+                run_id="rank_loo_paper_qv_holdout_rank512",
+                manifest_path=manifest_path,
+            )
+
+            filtered_spec, missing = _materialize_available_suite_manifest(
+                spec,
+                available_model_names={
+                    "rank512_label0_0",
+                    "rank512_label0_1",
+                    "rank512_label1_0",
+                    "rank8_label0_0",
+                    "rank8_label1_0",
+                },
+                output_root=tmp_path / "runs",
+            )
+
+            self.assertEqual(missing, ["rank512_label0_2"])
+            self.assertNotEqual(filtered_spec.manifest_path, manifest_path)
+            payload = load_json_file(filtered_spec.manifest_path)
+            self.assertEqual(payload["source_manifest"], str(manifest_path))
+            self.assertEqual(payload["missing_model_names"], ["rank512_label0_2"])
+            self.assertEqual(
+                payload["train"],
+                [
+                    "rank512/rank512_label0_0",
+                    "rank512/rank512_label0_1",
+                    "rank512/rank512_label1_0",
+                ],
+            )
+            self.assertEqual(payload["infer"], ["rank8/rank8_label0_0", "rank8/rank8_label1_0"])
 
     def test_run_paper_qv_reference_experiment_end_to_end(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -423,6 +772,48 @@ class TestPaperQvReferenceExperiment(unittest.TestCase):
             artifact_index = load_json_file(outputs["run_dir"] / "artifact_index.json")
             self.assertEqual(artifact_index["derived_feature_file"], str(derived_feature_path))
             self.assertEqual(artifact_index["detector_model"], str(outputs["detector_model_path"]))
+
+    def test_run_paper_qv_reference_experiment_clean_uniform_end_to_end(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            source = write_synthetic_source_bundle(tmp_path)
+            runs_root = tmp_path / "runs"
+
+            outputs = run_paper_qv_reference_experiment(
+                feature_file=Path("synthetic_source"),
+                feature_root=source["feature_root"],
+                feature_output_run="synthetic_paper_qv_clean_uniform",
+                output_root=runs_root,
+                run_id="paper_qv_clean_uniform_run",
+                random_state=7,
+                test_split_percent=20,
+                calibration_split_percent=20,
+                scoring_mode=SCORING_MODE_CLEAN_UNIFORM,
+                clean_threshold_percentile=95.0,
+            )
+
+            detector_payload = joblib.load(outputs["detector_model_path"])
+            self.assertEqual(detector_payload["scoring_mode"], SCORING_MODE_CLEAN_UNIFORM)
+            self.assertEqual(detector_payload["score_aggregation"], SCORE_AGGREGATION_METRIC_EQUAL_UNIFORM)
+            self.assertNotIn("raw_logistic_coefficients", detector_payload)
+            self.assertNotIn("logistic_regression_params", detector_payload)
+            self.assertAlmostEqual(float(np.sum(detector_payload["normalized_weights"])), 1.0, places=8)
+
+            selected_threshold = load_json_file(outputs["selected_threshold_path"])
+            metrics = load_json_file(outputs["metrics_path"])
+            split_manifest = load_json_file(outputs["split_manifest_path"])
+            self.assertEqual(selected_threshold["selection_method"], "clean_train_percentile")
+            self.assertEqual(selected_threshold["source_partition"], "train_clean")
+            self.assertEqual(selected_threshold["n_clean_samples"], metrics["reference_bank"]["n_clean_samples"])
+            self.assertEqual(metrics["scoring_mode"], SCORING_MODE_CLEAN_UNIFORM)
+            self.assertEqual(metrics["score_aggregation"], SCORE_AGGREGATION_METRIC_EQUAL_UNIFORM)
+            self.assertEqual(metrics["reference_bank"]["source_partition"], "train")
+            self.assertEqual(metrics["selected_threshold"]["selection_method"], "clean_train_percentile")
+            self.assertIn("test", metrics)
+            self.assertIn("fit_indices", split_manifest)
+
+            for csv_path in [outputs["calibration_scores_csv"], outputs["test_scores_csv"]]:
+                self.assertTrue(Path(csv_path).exists())
 
     def test_run_paper_qv_reference_experiment_uses_joint_manifest_holdout(self):
         with tempfile.TemporaryDirectory() as tmp:

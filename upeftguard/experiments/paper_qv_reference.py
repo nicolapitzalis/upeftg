@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 from math import ceil
 from pathlib import Path
+import re
 from time import perf_counter
 from typing import Any, Iterable, Sequence
 
@@ -47,6 +48,28 @@ SPLIT_MANIFEST_FILENAME = "split_manifest.json"
 REFERENCE_BANK_SUMMARY_FILENAME = "reference_bank_summary.json"
 CALIBRATION_SCORES_FILENAME = "calibration_scores.csv"
 TEST_SCORES_FILENAME = "test_scores.csv"
+PAPER_QV_SUMMARY_FILENAME_TEMPLATE = "paper_qv_reference_{suite_slug}_summary.csv"
+PAPER_QV_COMBINED_SUMMARY_FILENAME = "paper_qv_reference_leave_one_out_summary.csv"
+RANK_LEAVE_ONE_OUT_GLOB = "holdout_llama2_7b_toxic_backdoors_hard_rank*_qv.json"
+_RANK_LEAVE_ONE_OUT_RE = re.compile(r"^holdout_llama2_7b_toxic_backdoors_hard_(rank\d+)_qv$")
+TBH_TBA_RANK_ZERO_SHOT_GLOB = "llama2_7b_tbh+tba_zero_shot_r256_to_rank*.json"
+_TBH_TBA_RANK_ZERO_SHOT_RE = re.compile(r"^llama2_7b_tbh\+tba_zero_shot_r256_to_(rank\d+)$")
+PAPER_QV_SUITE_CHOICES = (
+    "rank-leave-one-out",
+    "adapter-leave-one-out",
+    "architecture-leave-one-out",
+    "tbh-tba-rank-zero-shot",
+    "all-leave-one-out",
+)
+SCORING_MODE_SUPERVISED_LOGREG = "supervised-logreg"
+SCORING_MODE_CLEAN_UNIFORM = "clean-uniform"
+PAPER_QV_SCORING_MODE_CHOICES = (
+    SCORING_MODE_SUPERVISED_LOGREG,
+    SCORING_MODE_CLEAN_UNIFORM,
+)
+DEFAULT_CLEAN_THRESHOLD_PERCENTILE = 95.0
+SCORE_AGGREGATION_SUPERVISED_LOGREG = "supervised_logistic_positive_coefficients"
+SCORE_AGGREGATION_METRIC_EQUAL_UNIFORM = "metric_equal_uniform"
 PAPER_QV_SELECTED_FEATURES = (
     "kurtosis",
     "l2_norm",
@@ -95,6 +118,22 @@ class SplitAssignments:
     calibration_stratify_kind: str
     warnings: list[str]
     manifest_json: Path | None = None
+
+
+@dataclass(frozen=True)
+class PaperQvSuiteManifestSpec:
+    suite: str
+    heldout_group: str
+    run_id: str
+    manifest_path: Path
+
+
+@dataclass(frozen=True)
+class PaperQvSuiteRunOutputs:
+    suite: str
+    run_outputs: dict[str, dict[str, Path]]
+    summary_path: Path
+    combined_summary_path: Path | None = None
 
 
 def _feature_block_name(feature_name: str) -> str:
@@ -199,6 +238,18 @@ def _write_json(path: Path, payload: Any) -> Path:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(json_ready(payload), f, indent=2)
     return path
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object in {path}")
+    return payload
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
 
 
 def _safe_slug(text: str) -> str:
@@ -829,6 +880,32 @@ def coefficients_to_normalized_weights(coefficients: np.ndarray) -> np.ndarray:
     return np.asarray(clipped / total, dtype=np.float64)
 
 
+def metric_equal_uniform_weights(feature_names: Sequence[str]) -> np.ndarray:
+    grouped_indices: dict[str, list[int]] = {suffix: [] for suffix in PAPER_QV_SELECTED_SUFFIXES}
+    unknown_suffixes: set[str] = set()
+    for idx, raw_name in enumerate(feature_names):
+        suffix = _metric_name_from_feature_name(str(raw_name))
+        if suffix not in grouped_indices:
+            unknown_suffixes.add(suffix)
+            continue
+        grouped_indices[suffix].append(int(idx))
+
+    if unknown_suffixes:
+        preview = ", ".join(sorted(unknown_suffixes)[:5])
+        raise ValueError(f"Unexpected paper q+v metric suffix(es) for clean-uniform scoring: {preview}")
+
+    missing = [suffix for suffix, indices in grouped_indices.items() if not indices]
+    if missing:
+        preview = ", ".join(missing)
+        raise ValueError(f"Clean-uniform scoring requires all paper q+v metric groups; missing: {preview}")
+
+    weights = np.zeros(len(feature_names), dtype=np.float64)
+    metric_mass = 1.0 / float(len(PAPER_QV_SELECTED_SUFFIXES))
+    for indices in grouped_indices.values():
+        weights[np.asarray(indices, dtype=np.int64)] = metric_mass / float(len(indices))
+    return weights
+
+
 def fit_paper_weighted_sum_detector(
     normalized_fit_features: np.ndarray,
     fit_labels: np.ndarray,
@@ -871,6 +948,7 @@ def evaluate_binary_threshold(
     precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 1.0
     specificity = float(tn / negatives) if negatives > 0 else 0.0
     accuracy = float((tp + tn) / max(1, labels.shape[0]))
+    balanced_accuracy = float((recall + specificity) / 2.0)
     youden_j = float(recall - false_positive_rate)
     return {
         "threshold": float(threshold),
@@ -885,6 +963,7 @@ def evaluate_binary_threshold(
         "false_positive_rate": false_positive_rate,
         "specificity": specificity,
         "accuracy": accuracy,
+        "balanced_accuracy": balanced_accuracy,
         "fraction_flagged": float(np.mean(flagged)) if flagged.size > 0 else 0.0,
         "youden_j": youden_j,
     }
@@ -928,6 +1007,42 @@ def select_calibration_threshold(
     )
     selected = dict(best)
     selected["selection_method"] = "youden_j"
+    return selected
+
+
+def select_clean_percentile_threshold(
+    *,
+    labels_true: np.ndarray,
+    scores: np.ndarray,
+    percentile: float,
+    source_partition: str = "train_clean",
+) -> dict[str, Any]:
+    pct = float(percentile)
+    if not 0.0 <= pct <= 100.0:
+        raise ValueError(f"clean_threshold_percentile must be between 0 and 100, got {percentile}")
+
+    labels = np.asarray(labels_true, dtype=np.int32).reshape(-1)
+    values = np.asarray(scores, dtype=np.float64).reshape(-1)
+    clean_scores = np.asarray(values[labels == 0], dtype=np.float64)
+    if clean_scores.size == 0:
+        raise ValueError("Clean-percentile threshold selection requires at least one clean source sample")
+
+    threshold = float(np.percentile(clean_scores, pct))
+    selected = evaluate_binary_threshold(labels_true=labels, scores=values, threshold=threshold)
+    resolved_source = str(source_partition)
+    if resolved_source == "train_clean":
+        selection_method = "clean_train_percentile"
+    elif resolved_source == "calibration_clean":
+        selection_method = "clean_calibration_percentile"
+    else:
+        selection_method = "clean_percentile"
+    selected["selection_method"] = selection_method
+    selected["percentile"] = pct
+    selected["target_fpr"] = float(max(0.0, min(1.0, (100.0 - pct) / 100.0)))
+    selected["source_partition"] = resolved_source
+    selected["n_clean_samples"] = int(clean_scores.size)
+    selected["clean_score_min"] = float(np.min(clean_scores))
+    selected["clean_score_max"] = float(np.max(clean_scores))
     return selected
 
 
@@ -1048,7 +1163,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--run-id",
         type=str,
         default=None,
-        help="Optional experiment run id. Defaults to the shared run-context timestamp format.",
+        help=(
+            "Optional experiment run id. Defaults to the shared run-context timestamp format for single runs; "
+            "for suites this is used as a prefix before each stable suite run id."
+        ),
+    )
+    parser.add_argument(
+        "--suite",
+        choices=list(PAPER_QV_SUITE_CHOICES),
+        default=None,
+        help="Run a predefined paper q+v baseline suite over existing CNN holdout manifests.",
+    )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="For --suite, skip fitting and regenerate the suite summary from completed runs.",
+    )
+    parser.add_argument(
+        "--summary-output-dir",
+        type=Path,
+        default=None,
+        help="Optional output directory for paper q+v suite summaries.",
     )
     parser.add_argument(
         "--manifest-json",
@@ -1089,6 +1224,21 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CALIBRATION_SPLIT_PERCENT,
         help="Calibration split percentage applied to the post-test remaining pool.",
     )
+    parser.add_argument(
+        "--scoring-mode",
+        choices=list(PAPER_QV_SCORING_MODE_CHOICES),
+        default=SCORING_MODE_SUPERVISED_LOGREG,
+        help=(
+            "Score aggregation mode. supervised-logreg fits labeled logistic weights; "
+            "clean-uniform uses metric-equal fixed weights and clean-only percentile thresholding."
+        ),
+    )
+    parser.add_argument(
+        "--clean-threshold-percentile",
+        type=float,
+        default=DEFAULT_CLEAN_THRESHOLD_PERCENTILE,
+        help="Clean training score percentile used as the threshold for --scoring-mode clean-uniform.",
+    )
     return parser
 
 
@@ -1103,17 +1253,28 @@ def run_paper_qv_reference_experiment(
     random_state: int = DEFAULT_RANDOM_STATE,
     test_split_percent: int = DEFAULT_TEST_SPLIT_PERCENT,
     calibration_split_percent: int = DEFAULT_CALIBRATION_SPLIT_PERCENT,
+    scoring_mode: str = SCORING_MODE_SUPERVISED_LOGREG,
+    clean_threshold_percentile: float = DEFAULT_CLEAN_THRESHOLD_PERCENTILE,
 ) -> dict[str, Path]:
     started_at = perf_counter()
+    resolved_scoring_mode = str(scoring_mode)
+    if resolved_scoring_mode not in PAPER_QV_SCORING_MODE_CHOICES:
+        raise ValueError(
+            f"Unsupported paper q+v scoring mode {scoring_mode!r}; "
+            f"supported modes: {list(PAPER_QV_SCORING_MODE_CHOICES)}"
+        )
+
     bundle = load_feature_bundle(feature_file=feature_file, feature_root=feature_root)
     if bundle.labels is None:
         raise ValueError("The selected feature bundle does not expose labels required for fitting")
 
+    feature_derivation_started_at = perf_counter()
     derived = export_paper_qv_feature_bundle(
         bundle=bundle,
         feature_root=feature_root,
         feature_output_run=feature_output_run,
     )
+    feature_derivation_seconds = float(perf_counter() - feature_derivation_started_at)
     ctx = create_run_context(
         pipeline=PIPELINE_NAME,
         output_root=output_root,
@@ -1128,11 +1289,17 @@ def run_paper_qv_reference_experiment(
         calibration_split_percent=int(calibration_split_percent),
     )
     labels = np.asarray(bundle.labels, dtype=np.int32)
-    reference_indices = clean_reference_indices(labels, splits.fit_indices)
+    reference_source_partition = (
+        "train" if resolved_scoring_mode == SCORING_MODE_CLEAN_UNIFORM else "fit"
+    )
+    reference_source_indices = (
+        splits.train_indices if resolved_scoring_mode == SCORING_MODE_CLEAN_UNIFORM else splits.fit_indices
+    )
+    reference_indices = clean_reference_indices(labels, reference_source_indices)
     benign_mean, benign_std = compute_reference_bank_stats(
         derived.features,
         labels,
-        reference_indices=splits.fit_indices,
+        reference_indices=reference_source_indices,
     )
     entropy_mask = entropy_feature_mask(derived.feature_names)
     normalized_features = normalize_paper_features(
@@ -1145,25 +1312,51 @@ def run_paper_qv_reference_experiment(
     fit_labels = np.asarray(labels[splits.fit_indices], dtype=np.int32)
     calibration_labels = np.asarray(labels[splits.calibration_indices], dtype=np.int32)
     test_labels = np.asarray(labels[splits.test_indices], dtype=np.int32)
-    model, normalized_weights = fit_paper_weighted_sum_detector(
-        normalized_features[splits.fit_indices],
-        fit_labels,
-    )
+    raw_logistic_coefficients: np.ndarray | None = None
+    logistic_regression_params: dict[str, Any] | None = None
+    if resolved_scoring_mode == SCORING_MODE_SUPERVISED_LOGREG:
+        model, normalized_weights = fit_paper_weighted_sum_detector(
+            normalized_features[splits.fit_indices],
+            fit_labels,
+        )
+        raw_logistic_coefficients = np.asarray(model.coef_[0], dtype=np.float64)
+        logistic_regression_params = {
+            "fit_intercept": False,
+            "solver": "lbfgs",
+            "max_iter": 5000,
+            "C": 1.0,
+            "class_weight": None,
+        }
+        score_aggregation = SCORE_AGGREGATION_SUPERVISED_LOGREG
+    else:
+        normalized_weights = metric_equal_uniform_weights(derived.feature_names)
+        score_aggregation = SCORE_AGGREGATION_METRIC_EQUAL_UNIFORM
 
+    train_scores = score_with_weights(normalized_features[splits.train_indices], normalized_weights)
     fit_scores = score_with_weights(normalized_features[splits.fit_indices], normalized_weights)
     calibration_scores = score_with_weights(
         normalized_features[splits.calibration_indices],
         normalized_weights,
     )
     test_scores = score_with_weights(normalized_features[splits.test_indices], normalized_weights)
-    selected_threshold = select_calibration_threshold(
-        labels_true=calibration_labels,
-        scores=calibration_scores,
-    )
+    if resolved_scoring_mode == SCORING_MODE_SUPERVISED_LOGREG:
+        selected_threshold = select_calibration_threshold(
+            labels_true=calibration_labels,
+            scores=calibration_scores,
+        )
+    else:
+        selected_threshold = select_clean_percentile_threshold(
+            labels_true=np.asarray(labels[splits.train_indices], dtype=np.int32),
+            scores=train_scores,
+            percentile=float(clean_threshold_percentile),
+            source_partition="train_clean",
+        )
     threshold = float(selected_threshold["threshold"])
 
     detector_payload = {
         "script_version": SCRIPT_VERSION,
+        "scoring_mode": resolved_scoring_mode,
+        "score_aggregation": score_aggregation,
         "feature_names": list(derived.feature_names),
         "block_names": list(derived.block_names),
         "feature_mapping": dict(PAPER_QV_FEATURE_MAPPING),
@@ -1177,22 +1370,20 @@ def run_paper_qv_reference_experiment(
         "derived_feature_file": str(derived.feature_path.resolve()),
         "split_strategy": splits.split_strategy,
         "manifest_json": str(splits.manifest_json) if splits.manifest_json is not None else None,
+        "reference_bank_source_partition": reference_source_partition,
         "reference_bank_indices": [int(x) for x in reference_indices.tolist()],
         "random_state": int(random_state),
         "test_split_percent": int(test_split_percent),
         "calibration_split_percent": int(calibration_split_percent),
+        "clean_threshold_percentile": float(clean_threshold_percentile),
         "test_stratify_kind": splits.test_stratify_kind,
         "calibration_stratify_kind": splits.calibration_stratify_kind,
         "fit_warnings": list(splits.warnings),
-        "logistic_regression_params": {
-            "fit_intercept": False,
-            "solver": "lbfgs",
-            "max_iter": 5000,
-            "C": 1.0,
-            "class_weight": None,
-        },
-        "raw_logistic_coefficients": np.asarray(model.coef_[0], dtype=np.float64),
     }
+    if logistic_regression_params is not None:
+        detector_payload["logistic_regression_params"] = logistic_regression_params
+    if raw_logistic_coefficients is not None:
+        detector_payload["raw_logistic_coefficients"] = raw_logistic_coefficients
     detector_path = ctx.models_dir / DETECTOR_FILENAME
     joblib.dump(detector_payload, detector_path)
 
@@ -1202,18 +1393,27 @@ def run_paper_qv_reference_experiment(
     )
     metrics_payload = {
         "script_version": SCRIPT_VERSION,
+        "scoring_mode": resolved_scoring_mode,
+        "score_aggregation": score_aggregation,
+        "clean_threshold_percentile": float(clean_threshold_percentile),
         "source_feature_file": str(bundle.feature_file.resolve()),
         "derived_feature_file": str(derived.feature_path.resolve()),
         "feature_dim": int(len(derived.feature_names)),
         "selected_metric_suffixes": list(PAPER_QV_SELECTED_SUFFIXES),
         "feature_mapping": dict(PAPER_QV_FEATURE_MAPPING),
         "weights_by_metric": _weights_by_metric(derived.feature_names, normalized_weights),
+        "selected_threshold": dict(selected_threshold),
         "split_strategy": splits.split_strategy,
         "manifest_json": str(splits.manifest_json) if splits.manifest_json is not None else None,
         "reference_bank": {
-            "source_partition": "fit",
+            "source_partition": reference_source_partition,
             "n_clean_samples": int(reference_indices.size),
             "indices": [int(x) for x in reference_indices.tolist()],
+        },
+        "train": {
+            "n_samples": int(splits.train_indices.size),
+            "label_counts": _label_counts(labels[splits.train_indices].tolist()),
+            **_score_metrics(labels[splits.train_indices], train_scores),
         },
         "fit": {
             "n_samples": int(splits.fit_indices.size),
@@ -1224,7 +1424,6 @@ def run_paper_qv_reference_experiment(
             "n_samples": int(splits.calibration_indices.size),
             "label_counts": _label_counts(calibration_labels.tolist()),
             **_score_metrics(calibration_labels, calibration_scores),
-            "selected_threshold": dict(selected_threshold),
         },
         "test": {
             "n_samples": int(splits.test_indices.size),
@@ -1267,7 +1466,7 @@ def run_paper_qv_reference_experiment(
         {
             "script_version": SCRIPT_VERSION,
             "source_feature_file": str(bundle.feature_file.resolve()),
-            "source_partition": "fit",
+            "source_partition": reference_source_partition,
             "split_strategy": splits.split_strategy,
             "manifest_json": str(splits.manifest_json) if splits.manifest_json is not None else None,
             "n_reference_clean_samples": int(reference_indices.size),
@@ -1275,6 +1474,7 @@ def run_paper_qv_reference_experiment(
             "source_label_counts": _label_counts(labels.tolist()),
             "train_label_counts": _label_counts(labels[splits.train_indices].tolist()),
             "fit_label_counts": _label_counts(fit_labels.tolist()),
+            "score_summary_train": _score_summary(train_scores),
             "mean_zero_count": int(np.sum(np.isclose(benign_mean, 0.0))),
             "safe_std_unit_count": int(np.sum(np.isclose(benign_std, 1.0))),
             "score_summary_fit": _score_summary(fit_scores),
@@ -1311,7 +1511,10 @@ def run_paper_qv_reference_experiment(
     ctx.add_artifact("reference_bank_summary", reference_bank_summary_path)
     ctx.add_artifact("calibration_scores_csv", calibration_scores_path)
     ctx.add_artifact("test_scores_csv", test_scores_path)
-    ctx.add_timing("total_seconds", perf_counter() - started_at)
+    total_seconds = float(perf_counter() - started_at)
+    ctx.add_timing("feature_derivation_seconds", feature_derivation_seconds)
+    ctx.add_timing("paper_qv_method_seconds", max(0.0, total_seconds - feature_derivation_seconds))
+    ctx.add_timing("total_seconds", total_seconds)
     ctx.finalize(
         {
             "script_version": SCRIPT_VERSION,
@@ -1320,6 +1523,9 @@ def run_paper_qv_reference_experiment(
             "feature_root": str(Path(feature_root).expanduser().resolve()),
             "feature_output_run": str(derived.output_dir.parent.name),
             "output_root": str(Path(output_root).expanduser().resolve()),
+            "scoring_mode": resolved_scoring_mode,
+            "score_aggregation": score_aggregation,
+            "clean_threshold_percentile": float(clean_threshold_percentile),
             "split_strategy": splits.split_strategy,
             "manifest_json": str(splits.manifest_json) if splits.manifest_json is not None else None,
             "random_state": int(random_state),
@@ -1352,9 +1558,522 @@ def _manifest_paths_from_root(manifest_root: Path, manifest_glob: str) -> list[P
     return paths
 
 
+def _rank_manifest_sort_key(path: Path) -> tuple[int, str]:
+    match = _RANK_LEAVE_ONE_OUT_RE.fullmatch(path.stem)
+    if match is None:
+        return (10**12, path.name)
+    rank = int(match.group(1).removeprefix("rank"))
+    return (rank, path.name)
+
+
+def _tbh_tba_rank_zero_shot_sort_key(path: Path) -> tuple[int, str]:
+    match = _TBH_TBA_RANK_ZERO_SHOT_RE.fullmatch(path.stem)
+    if match is None:
+        return (10**12, path.name)
+    rank = int(match.group(1).removeprefix("rank"))
+    return (rank, path.name)
+
+
+def _default_suite_manifest_root(suite: str, repo_root: Path) -> Path:
+    if suite == "rank-leave-one-out":
+        return repo_root / "manifests" / "leave_one_out"
+    if suite == "adapter-leave-one-out":
+        return repo_root / "runs" / "generated_manifests" / "leave_one_out_adapter"
+    if suite == "architecture-leave-one-out":
+        return repo_root / "runs" / "generated_manifests" / "leave_one_out_architecture"
+    if suite == "tbh-tba-rank-zero-shot":
+        return repo_root / "manifests" / "zero_shots" / "tbh+tba_rank_wise"
+    raise ValueError(f"Unsupported paper q+v reference suite: {suite}")
+
+
+def _suite_slug(suite: str) -> str:
+    return str(suite).replace("-", "_")
+
+
+def _percentile_slug(percentile: float) -> str:
+    value = float(percentile)
+    if value.is_integer():
+        return f"p{int(value)}"
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return "p" + text.replace(".", "_")
+
+
+def _scoring_variant_suffix(*, scoring_mode: str, clean_threshold_percentile: float) -> str:
+    if str(scoring_mode) == SCORING_MODE_SUPERVISED_LOGREG:
+        return ""
+    if str(scoring_mode) == SCORING_MODE_CLEAN_UNIFORM:
+        return f"clean_uniform_{_percentile_slug(clean_threshold_percentile)}"
+    raise ValueError(f"Unsupported paper q+v scoring mode: {scoring_mode}")
+
+
+def _variant_run_id(
+    run_id: str,
+    *,
+    scoring_mode: str,
+    clean_threshold_percentile: float,
+) -> str:
+    suffix = _scoring_variant_suffix(
+        scoring_mode=scoring_mode,
+        clean_threshold_percentile=clean_threshold_percentile,
+    )
+    if not suffix or str(run_id).endswith(f"_{suffix}"):
+        return str(run_id)
+    return f"{run_id}_{suffix}"
+
+
+def _summary_output_dir(output_root: Path, summary_output_dir: Path | None) -> Path:
+    if summary_output_dir is not None:
+        return summary_output_dir.expanduser().resolve()
+    return (Path(output_root).expanduser() / PIPELINE_NAME / "summaries").resolve()
+
+
+def _suite_summary_filename(
+    suite: str,
+    *,
+    scoring_mode: str = SCORING_MODE_SUPERVISED_LOGREG,
+    clean_threshold_percentile: float = DEFAULT_CLEAN_THRESHOLD_PERCENTILE,
+) -> str:
+    suffix = _scoring_variant_suffix(
+        scoring_mode=scoring_mode,
+        clean_threshold_percentile=clean_threshold_percentile,
+    )
+    if suite == "all-leave-one-out":
+        if not suffix:
+            return PAPER_QV_COMBINED_SUMMARY_FILENAME
+        return f"paper_qv_reference_leave_one_out_{suffix}_summary.csv"
+    suite_slug = _suite_slug(suite)
+    if suffix:
+        suite_slug = f"{suite_slug}_{suffix}"
+    return PAPER_QV_SUMMARY_FILENAME_TEMPLATE.format(suite_slug=suite_slug)
+
+
+def discover_paper_qv_reference_suite_manifests(
+    suite: str,
+    *,
+    repo_root: Path | None = None,
+    manifest_root: Path | None = None,
+) -> tuple[PaperQvSuiteManifestSpec, ...]:
+    """Discover existing CNN holdout manifests used by paper_qv_reference suites."""
+    resolved_repo_root = (repo_root or _repo_root()).expanduser().resolve()
+    suite_name = str(suite)
+    if suite_name == "all-leave-one-out":
+        if manifest_root is not None:
+            raise ValueError("--manifest-root cannot be used with suite=all-leave-one-out")
+        specs: list[PaperQvSuiteManifestSpec] = []
+        for child_suite in ("rank-leave-one-out", "adapter-leave-one-out", "architecture-leave-one-out"):
+            specs.extend(
+                discover_paper_qv_reference_suite_manifests(
+                    child_suite,
+                    repo_root=resolved_repo_root,
+                )
+            )
+        return tuple(specs)
+
+    resolved_manifest_root = (
+        manifest_root.expanduser().resolve()
+        if manifest_root is not None
+        else _default_suite_manifest_root(suite_name, resolved_repo_root)
+    )
+
+    if suite_name == "rank-leave-one-out":
+        manifest_paths = _manifest_paths_from_root(resolved_manifest_root, RANK_LEAVE_ONE_OUT_GLOB)
+        rank_paths = [
+            path
+            for path in manifest_paths
+            if _RANK_LEAVE_ONE_OUT_RE.fullmatch(path.stem) is not None
+        ]
+        if not rank_paths:
+            raise FileNotFoundError(
+                f"No CNN rank holdout manifests matched {RANK_LEAVE_ONE_OUT_GLOB!r} under {resolved_manifest_root}"
+            )
+        specs = []
+        for manifest_path in sorted(rank_paths, key=_rank_manifest_sort_key):
+            match = _RANK_LEAVE_ONE_OUT_RE.fullmatch(manifest_path.stem)
+            assert match is not None
+            heldout_group = match.group(1)
+            specs.append(
+                PaperQvSuiteManifestSpec(
+                    suite=suite_name,
+                    heldout_group=heldout_group,
+                    run_id=f"rank_loo_paper_qv_holdout_{heldout_group}",
+                    manifest_path=manifest_path,
+                )
+            )
+        return tuple(specs)
+
+    if suite_name == "adapter-leave-one-out":
+        manifest_paths = _manifest_paths_from_root(resolved_manifest_root, "holdout_adapter_*.json")
+        return tuple(
+            PaperQvSuiteManifestSpec(
+                suite=suite_name,
+                heldout_group=path.stem.removeprefix("holdout_adapter_"),
+                run_id=f"adapter_loo_paper_qv_{path.stem}",
+                manifest_path=path,
+            )
+            for path in manifest_paths
+        )
+
+    if suite_name == "architecture-leave-one-out":
+        manifest_paths = _manifest_paths_from_root(resolved_manifest_root, "holdout_architecture_*.json")
+        return tuple(
+            PaperQvSuiteManifestSpec(
+                suite=suite_name,
+                heldout_group=path.stem.removeprefix("holdout_architecture_"),
+                run_id=f"architecture_loo_paper_qv_{path.stem}",
+                manifest_path=path,
+            )
+            for path in manifest_paths
+        )
+
+    if suite_name == "tbh-tba-rank-zero-shot":
+        manifest_paths = _manifest_paths_from_root(resolved_manifest_root, TBH_TBA_RANK_ZERO_SHOT_GLOB)
+        rank_paths = [
+            path
+            for path in manifest_paths
+            if _TBH_TBA_RANK_ZERO_SHOT_RE.fullmatch(path.stem) is not None
+        ]
+        if not rank_paths:
+            raise FileNotFoundError(
+                f"No TBH+TBA rank zero-shot manifests matched {TBH_TBA_RANK_ZERO_SHOT_GLOB!r} "
+                f"under {resolved_manifest_root}"
+            )
+        specs = []
+        for manifest_path in sorted(rank_paths, key=_tbh_tba_rank_zero_shot_sort_key):
+            match = _TBH_TBA_RANK_ZERO_SHOT_RE.fullmatch(manifest_path.stem)
+            assert match is not None
+            heldout_group = match.group(1)
+            specs.append(
+                PaperQvSuiteManifestSpec(
+                    suite=suite_name,
+                    heldout_group=heldout_group,
+                    run_id=f"tbh_tba_rank_zero_shot_paper_qv_r256_to_{heldout_group}",
+                    manifest_path=manifest_path,
+                )
+            )
+        return tuple(specs)
+
+    raise ValueError(f"Unsupported paper q+v reference suite: {suite_name}")
+
+
+PAPER_QV_SUMMARY_FIELDNAMES = [
+    "suite",
+    "heldout_group",
+    "manifest_path",
+    "run_id",
+    "test_roc_auc",
+    "test_average_precision",
+    "test_recall",
+    "test_specificity",
+    "test_balanced_accuracy",
+    "threshold",
+    "threshold_selection_method",
+    "threshold_source_partition",
+    "threshold_percentile",
+    "threshold_target_fpr",
+    "threshold_clean_count",
+    "test_n_samples",
+    "reference_clean_count",
+    "feature_dim",
+]
+
+
+def _paper_qv_summary_row(
+    spec: PaperQvSuiteManifestSpec,
+    *,
+    output_root: Path,
+) -> dict[str, Any]:
+    run_dir = Path(output_root).expanduser().resolve() / PIPELINE_NAME / spec.run_id
+    metrics_path = run_dir / "reports" / METRICS_FILENAME
+    threshold_path = run_dir / "reports" / SELECTED_THRESHOLD_FILENAME
+    metrics = _read_json(metrics_path)
+    selected_threshold = _read_json(threshold_path)
+
+    test_metrics = metrics.get("test", {})
+    if not isinstance(test_metrics, dict):
+        test_metrics = {}
+    threshold_metrics = test_metrics.get("threshold_metrics", {})
+    if not isinstance(threshold_metrics, dict):
+        threshold_metrics = {}
+    reference_bank = metrics.get("reference_bank", {})
+    if not isinstance(reference_bank, dict):
+        reference_bank = {}
+    balanced_accuracy = threshold_metrics.get("balanced_accuracy")
+    if balanced_accuracy is None and threshold_metrics.get("recall") is not None and threshold_metrics.get("specificity") is not None:
+        balanced_accuracy = (float(threshold_metrics["recall"]) + float(threshold_metrics["specificity"])) / 2.0
+
+    return {
+        "suite": spec.suite,
+        "heldout_group": spec.heldout_group,
+        "manifest_path": str(spec.manifest_path),
+        "run_id": spec.run_id,
+        "test_roc_auc": test_metrics.get("roc_auc"),
+        "test_average_precision": test_metrics.get("average_precision"),
+        "test_recall": threshold_metrics.get("recall"),
+        "test_specificity": threshold_metrics.get("specificity"),
+        "test_balanced_accuracy": balanced_accuracy,
+        "threshold": selected_threshold.get("threshold", threshold_metrics.get("threshold")),
+        "threshold_selection_method": selected_threshold.get("selection_method"),
+        "threshold_source_partition": selected_threshold.get("source_partition"),
+        "threshold_percentile": selected_threshold.get("percentile"),
+        "threshold_target_fpr": selected_threshold.get("target_fpr"),
+        "threshold_clean_count": selected_threshold.get("n_clean_samples"),
+        "test_n_samples": test_metrics.get("n_samples"),
+        "reference_clean_count": reference_bank.get("n_clean_samples"),
+        "feature_dim": metrics.get("feature_dim"),
+    }
+
+
+def _filter_manifest_items_to_available_rows(
+    items: Sequence[ManifestItem],
+    *,
+    available_model_names: set[str],
+) -> tuple[list[str], list[str]]:
+    kept: list[str] = []
+    missing: list[str] = []
+    for item in items:
+        model_name = str(item.model_name)
+        if model_name in available_model_names:
+            kept.append(str(item.raw_entry))
+        else:
+            missing.append(model_name)
+    return kept, missing
+
+
+def _materialize_available_suite_manifest(
+    spec: PaperQvSuiteManifestSpec,
+    *,
+    available_model_names: set[str],
+    output_root: Path,
+) -> tuple[PaperQvSuiteManifestSpec, list[str]]:
+    train_items, infer_items = parse_joint_manifest_json_by_model_name(manifest_path=spec.manifest_path)
+    train_entries, missing_train = _filter_manifest_items_to_available_rows(
+        train_items,
+        available_model_names=available_model_names,
+    )
+    infer_entries, missing_infer = _filter_manifest_items_to_available_rows(
+        infer_items,
+        available_model_names=available_model_names,
+    )
+    missing = [*missing_train, *missing_infer]
+    if not missing:
+        return spec, []
+    if not train_entries:
+        raise ValueError(
+            f"Filtering unavailable feature rows would empty the train partition for {spec.manifest_path}"
+        )
+    if not infer_entries:
+        raise ValueError(
+            f"Filtering unavailable feature rows would empty the infer partition for {spec.manifest_path}"
+        )
+
+    filtered_root = (
+        Path(output_root).expanduser().resolve()
+        / PIPELINE_NAME
+        / "generated_manifests"
+        / _suite_slug(spec.suite)
+    )
+    filtered_path = filtered_root / spec.manifest_path.name
+    filtered_payload = {
+        "source_manifest": str(spec.manifest_path),
+        "filtered_for_feature_bundle": True,
+        "missing_model_names": sorted(set(missing)),
+        "train": train_entries,
+        "infer": infer_entries,
+    }
+    _write_json(filtered_path, filtered_payload)
+    return (
+        PaperQvSuiteManifestSpec(
+            suite=spec.suite,
+            heldout_group=spec.heldout_group,
+            run_id=spec.run_id,
+            manifest_path=filtered_path,
+        ),
+        missing,
+    )
+
+
+def _materialize_available_suite_manifests(
+    specs: Sequence[PaperQvSuiteManifestSpec],
+    *,
+    feature_file: Path,
+    feature_root: Path,
+    output_root: Path,
+) -> tuple[PaperQvSuiteManifestSpec, ...]:
+    bundle = load_feature_bundle(feature_file=feature_file, feature_root=feature_root)
+    available_model_names = {str(name) for name in bundle.model_names}
+    filtered_specs: list[PaperQvSuiteManifestSpec] = []
+    for spec in specs:
+        filtered_spec, missing = _materialize_available_suite_manifest(
+            spec,
+            available_model_names=available_model_names,
+            output_root=output_root,
+        )
+        filtered_specs.append(filtered_spec)
+        if missing:
+            preview = ", ".join(sorted(set(missing))[:5])
+            print(
+                f"Filtered {len(set(missing))} unavailable model(s) from {spec.manifest_path}: {preview}"
+            )
+    return tuple(filtered_specs)
+
+
+def generate_paper_qv_reference_summary(
+    specs: Sequence[PaperQvSuiteManifestSpec],
+    *,
+    output_root: Path = DEFAULT_OUTPUT_ROOT,
+    summary_output_dir: Path | None = None,
+    filename: str | None = None,
+    scoring_mode: str = SCORING_MODE_SUPERVISED_LOGREG,
+    clean_threshold_percentile: float = DEFAULT_CLEAN_THRESHOLD_PERCENTILE,
+) -> Path:
+    if not specs:
+        raise ValueError("No paper q+v suite specs were provided for summary generation")
+
+    suite_names = sorted({spec.suite for spec in specs})
+    suite = suite_names[0] if len(suite_names) == 1 else "all-leave-one-out"
+    output_dir = _summary_output_dir(output_root, summary_output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = output_dir / (
+        filename
+        or _suite_summary_filename(
+            suite,
+            scoring_mode=scoring_mode,
+            clean_threshold_percentile=clean_threshold_percentile,
+        )
+    )
+
+    rows = [_paper_qv_summary_row(spec, output_root=output_root) for spec in specs]
+    with open(summary_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=PAPER_QV_SUMMARY_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+    return summary_path
+
+
+def run_paper_qv_reference_suite(
+    *,
+    suite: str,
+    feature_file: Path,
+    feature_root: Path = DEFAULT_FEATURE_ROOT,
+    feature_output_run: str | None = None,
+    output_root: Path = DEFAULT_OUTPUT_ROOT,
+    manifest_root: Path | None = None,
+    summary_output_dir: Path | None = None,
+    run_id_prefix: str | None = None,
+    random_state: int = DEFAULT_RANDOM_STATE,
+    test_split_percent: int = DEFAULT_TEST_SPLIT_PERCENT,
+    calibration_split_percent: int = DEFAULT_CALIBRATION_SPLIT_PERCENT,
+    scoring_mode: str = SCORING_MODE_SUPERVISED_LOGREG,
+    clean_threshold_percentile: float = DEFAULT_CLEAN_THRESHOLD_PERCENTILE,
+    summary_only: bool = False,
+) -> PaperQvSuiteRunOutputs:
+    specs = discover_paper_qv_reference_suite_manifests(
+        suite,
+        manifest_root=manifest_root,
+    )
+    resolved_specs = tuple(
+        PaperQvSuiteManifestSpec(
+            suite=spec.suite,
+            heldout_group=spec.heldout_group,
+            run_id=_variant_run_id(
+                f"{run_id_prefix}_{spec.run_id}" if run_id_prefix else spec.run_id,
+                scoring_mode=scoring_mode,
+                clean_threshold_percentile=clean_threshold_percentile,
+            ),
+            manifest_path=spec.manifest_path,
+        )
+        for spec in specs
+    )
+
+    outputs_by_run_id: dict[str, dict[str, Path]] = {}
+    run_specs = resolved_specs
+    if not summary_only:
+        run_specs = _materialize_available_suite_manifests(
+            resolved_specs,
+            feature_file=feature_file,
+            feature_root=feature_root,
+            output_root=output_root,
+        )
+        for spec in run_specs:
+            outputs_by_run_id[spec.run_id] = run_paper_qv_reference_experiment(
+                feature_file=feature_file,
+                feature_root=feature_root,
+                feature_output_run=feature_output_run,
+                output_root=output_root,
+                run_id=spec.run_id,
+                manifest_json=spec.manifest_path,
+                random_state=random_state,
+                test_split_percent=test_split_percent,
+                calibration_split_percent=calibration_split_percent,
+                scoring_mode=scoring_mode,
+                clean_threshold_percentile=clean_threshold_percentile,
+            )
+
+    summary_path = generate_paper_qv_reference_summary(
+        run_specs,
+        output_root=output_root,
+        summary_output_dir=summary_output_dir,
+        scoring_mode=scoring_mode,
+        clean_threshold_percentile=clean_threshold_percentile,
+    )
+    combined_summary_path: Path | None = None
+    if str(suite) == "all-leave-one-out":
+        combined_summary_path = summary_path
+        for child_suite in ("rank-leave-one-out", "adapter-leave-one-out", "architecture-leave-one-out"):
+            child_specs = [spec for spec in run_specs if spec.suite == child_suite]
+            if child_specs:
+                generate_paper_qv_reference_summary(
+                    child_specs,
+                    output_root=output_root,
+                    summary_output_dir=summary_output_dir,
+                    scoring_mode=scoring_mode,
+                    clean_threshold_percentile=clean_threshold_percentile,
+                )
+
+    return PaperQvSuiteRunOutputs(
+        suite=str(suite),
+        run_outputs=outputs_by_run_id,
+        summary_path=summary_path,
+        combined_summary_path=combined_summary_path,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.suite is not None:
+        if args.manifest_json is not None:
+            parser.error("--manifest-json cannot be used with --suite")
+        outputs = run_paper_qv_reference_suite(
+            suite=args.suite,
+            feature_file=args.feature_file,
+            feature_root=args.feature_root,
+            feature_output_run=args.feature_output_run,
+            output_root=args.output_root,
+            manifest_root=args.manifest_root,
+            summary_output_dir=args.summary_output_dir,
+            run_id_prefix=args.run_id,
+            random_state=args.random_state,
+            test_split_percent=args.test_split_percent,
+            calibration_split_percent=args.calibration_split_percent,
+            scoring_mode=args.scoring_mode,
+            clean_threshold_percentile=args.clean_threshold_percentile,
+            summary_only=bool(args.summary_only),
+        )
+        mode = "summary regenerated" if args.summary_only else "complete"
+        print(f"Paper-style q+v reference suite {mode}: {args.suite}")
+        print(f"summary_path: {outputs.summary_path}")
+        if outputs.combined_summary_path is not None:
+            print(f"combined_summary_path: {outputs.combined_summary_path}")
+        for run_id, run_outputs in outputs.run_outputs.items():
+            print(f"run_id: {run_id}")
+            for key, path in run_outputs.items():
+                print(f"{key}: {path}")
+        return 0
+
+    if args.summary_only:
+        parser.error("--summary-only requires --suite")
+
     if args.manifest_root is not None:
         if args.manifest_json is not None:
             parser.error("--manifest-json and --manifest-root are mutually exclusive")
@@ -1362,6 +2081,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Running paper-style q+v reference detector for {len(manifest_paths)} manifest(s)")
         for manifest_path in manifest_paths:
             child_run_id = f"{args.run_id}_{manifest_path.stem}" if args.run_id else manifest_path.stem
+            child_run_id = _variant_run_id(
+                child_run_id,
+                scoring_mode=args.scoring_mode,
+                clean_threshold_percentile=args.clean_threshold_percentile,
+            )
             outputs = run_paper_qv_reference_experiment(
                 feature_file=args.feature_file,
                 feature_root=args.feature_root,
@@ -1372,6 +2096,8 @@ def main(argv: list[str] | None = None) -> int:
                 random_state=args.random_state,
                 test_split_percent=args.test_split_percent,
                 calibration_split_percent=args.calibration_split_percent,
+                scoring_mode=args.scoring_mode,
+                clean_threshold_percentile=args.clean_threshold_percentile,
             )
             print(f"manifest: {manifest_path}")
             for key, path in outputs.items():
@@ -1388,6 +2114,8 @@ def main(argv: list[str] | None = None) -> int:
         random_state=args.random_state,
         test_split_percent=args.test_split_percent,
         calibration_split_percent=args.calibration_split_percent,
+        scoring_mode=args.scoring_mode,
+        clean_threshold_percentile=args.clean_threshold_percentile,
     )
     print("Paper-style q+v reference detector complete")
     for key, path in outputs.items():

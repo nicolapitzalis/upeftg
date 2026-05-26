@@ -30,6 +30,7 @@ from .supervised.pipeline import (
 )
 from .supervised.registry import default_cnn_hyperparams_path, registered_models
 from .unsupervised.analysis import (
+    run_layer_raw_feature_tsne_pipeline,
     run_supervised_cnn_feature_tsne_pipeline,
     run_unsupervised_layer_scatter_pipeline,
     run_unsupervised_rank_feature_values_pipeline,
@@ -86,6 +87,10 @@ EXPERIMENT_COMMANDS: dict[str, tuple[str, str]] = {
     "supervised-cnn-suite": (
         "upeftguard.experiments.supervised_cnn_suite",
         "Run a supervised CNN transfer suite",
+    ),
+    "runtime-comparison": (
+        "upeftguard.experiments.runtime_comparison",
+        "Collect and plot method runtime comparisons",
     ),
 }
 
@@ -352,6 +357,43 @@ def _cmd_run_unsupervised_rank_feature_values(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_run_layer_raw_feature_tsne(args: argparse.Namespace) -> int:
+    output_root = _resolve_output_root(args.output_root, "run_layer_raw_feature_tsne")
+    result = run_layer_raw_feature_tsne_pipeline(
+        feature_file=args.feature_file,
+        output_root=output_root,
+        run_id=args.run_id,
+        folder=args.folder,
+        layer=args.layer,
+        feature_root=args.feature_root,
+        model_names_file=args.feature_model_names_file,
+        labels_file=args.feature_labels_file,
+        metadata_file=args.feature_metadata_file,
+        dataset_reference_report=args.dataset_reference_report,
+        dataset_root=args.dataset_root,
+        block_filters=args.block_filters,
+        features=args.features,
+        raw_projection_dim=args.raw_projection_dim,
+        projection_seed=args.projection_seed,
+        perplexity=args.perplexity,
+        learning_rate=args.learning_rate,
+        max_iter=args.max_iter,
+        metric=args.metric,
+        init=args.init,
+        random_state=args.random_state,
+        standardize=args.standardize,
+        point_size=args.point_size,
+        alpha=args.alpha,
+    )
+
+    print("Run complete")
+    print(f"Run dir: {result['run_dir']}")
+    print(f"Report: {result['report']}")
+    print(f"Plots: {result['plot_dir']}")
+    print(f"Embeddings: {result['embedding_dir']}")
+    return 0
+
+
 def _cmd_run_supervised(args: argparse.Namespace) -> int:
     output_root = _resolve_output_root(args.output_root, "run_supervised")
     result = run_supervised_pipeline(
@@ -430,6 +472,7 @@ def _cmd_util_aggregate_features(args: argparse.Namespace) -> int:
         operator=args.operator,
         features=args.features,
         spectral_qv_sum_mode=args.spectral_qv_sum_mode,
+        spectral_moment_source=args.spectral_moment_source,
         layout=args.layout,
     )
 
@@ -921,6 +964,98 @@ def build_parser() -> argparse.ArgumentParser:
     unsupervised_rank_feature_values.add_argument("--jitter", type=float, default=0.08)
     unsupervised_rank_feature_values.set_defaults(func=_cmd_run_unsupervised_rank_feature_values)
 
+    layer_raw_feature_tsne = run_sub.add_parser(
+        "layer-raw-feature-tsne",
+        help="Compare t-SNE over raw B@A layer deltas and extracted spectral features",
+    )
+    layer_raw_feature_tsne.add_argument(
+        "--feature-file",
+        type=Path,
+        required=True,
+        help="Input feature run name or explicit spectral feature .npy file",
+    )
+    layer_raw_feature_tsne.add_argument(
+        "--folder",
+        "--dataset-name",
+        dest="folder",
+        nargs="+",
+        action="append",
+        required=True,
+        help="One or more dataset folder/name values to select from dataset-reference provenance",
+    )
+    layer_raw_feature_tsne.add_argument("--layer", type=int, required=True)
+    layer_raw_feature_tsne.add_argument("--output-root", type=Path, default=Path("runs"))
+    layer_raw_feature_tsne.add_argument("--run-id", type=str, default=None)
+    layer_raw_feature_tsne.add_argument(
+        "--feature-root",
+        type=Path,
+        default=Path("runs") / "feature_extract",
+        help="Base directory used to resolve bare feature run names (default: runs/feature_extract)",
+    )
+    layer_raw_feature_tsne.add_argument(
+        "--feature-model-names-file",
+        type=Path,
+        default=None,
+        help="Optional model-names JSON for --feature-file (defaults to the sibling companion file)",
+    )
+    layer_raw_feature_tsne.add_argument(
+        "--feature-labels-file",
+        type=Path,
+        default=None,
+        help="Optional labels .npy for --feature-file (defaults to the sibling companion file)",
+    )
+    layer_raw_feature_tsne.add_argument(
+        "--feature-metadata-file",
+        type=Path,
+        default=None,
+        help="Optional metadata JSON for --feature-file (defaults to the sibling companion file)",
+    )
+    layer_raw_feature_tsne.add_argument(
+        "--dataset-reference-report",
+        type=Path,
+        default=None,
+        help="Optional dataset_reference_report.json path for row provenance",
+    )
+    layer_raw_feature_tsne.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=default_dataset_root(),
+        help=dataset_root_help("Fallback root for resolving selected adapter files"),
+    )
+    layer_raw_feature_tsne.add_argument(
+        "--block-filter",
+        action="append",
+        dest="block_filters",
+        default=None,
+        help="Optional substring filter over layer block names; repeat to include multiple filters",
+    )
+    layer_raw_feature_tsne.add_argument(
+        "--features",
+        nargs="+",
+        default=None,
+        help=(
+            "Optional spectral feature groups to include on the extracted-feature side; "
+            "omit or pass 'all' to include every emitted feature family"
+        ),
+    )
+    layer_raw_feature_tsne.add_argument("--raw-projection-dim", type=int, default=256)
+    layer_raw_feature_tsne.add_argument("--projection-seed", type=int, default=42)
+    layer_raw_feature_tsne.add_argument("--perplexity", type=float, default=30.0)
+    layer_raw_feature_tsne.add_argument("--learning-rate", type=_parse_learning_rate, default="auto")
+    layer_raw_feature_tsne.add_argument("--max-iter", type=int, default=1000)
+    layer_raw_feature_tsne.add_argument("--metric", type=str, default="euclidean")
+    layer_raw_feature_tsne.add_argument("--init", choices=["pca", "random"], default="pca")
+    layer_raw_feature_tsne.add_argument("--random-state", type=int, default=42)
+    layer_raw_feature_tsne.add_argument("--point-size", type=float, default=28.0)
+    layer_raw_feature_tsne.add_argument("--alpha", type=float, default=0.85)
+    layer_raw_feature_tsne.add_argument(
+        "--no-standardize",
+        action="store_false",
+        dest="standardize",
+        help="Disable input standardization before t-SNE",
+    )
+    layer_raw_feature_tsne.set_defaults(func=_cmd_run_layer_raw_feature_tsne, standardize=True)
+
     supervised = run_sub.add_parser("supervised", help="Run supervised spectral feature pipeline")
     supervised.add_argument("--manifest-json", type=Path, default=None)
     supervised.add_argument(
@@ -1309,6 +1444,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["none", "append", "only"],
         default="append",
         help="Which q+v-sum columns to keep before aggregation",
+    )
+    aggregate_feature_bundle.add_argument(
+        "--spectral-moment-source",
+        choices=["entrywise", "sv", "both"],
+        default=None,
+        help=(
+            "Which moment columns to keep when the source bundle contains both entrywise and singular-value "
+            "moment features. Defaults to the source bundle metadata."
+        ),
     )
     aggregate_feature_bundle.set_defaults(func=_cmd_util_aggregate_features)
 

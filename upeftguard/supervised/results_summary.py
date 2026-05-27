@@ -10,7 +10,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from ..unsupervised.reporting import compute_offline_metrics, summarize_scores
+from .score_reporting import compute_offline_metrics, summarize_scores
 from ..utilities.core.manifest import (
     AttackSampleIdentity,
     parse_joint_manifest_json_by_model_name,
@@ -1761,19 +1761,6 @@ def run_supervised_results_summary(
         run_dir=run_dir,
         summary=summary,
         update_report=bool(update_report),
-    )
-
-
-def run_supervised_architecture_breakdown(
-    *,
-    run_spec: str | Path,
-    runs_root: Path = DEFAULT_SUPERVISED_RUNS_ROOT,
-    update_report: bool = False,
-) -> dict[str, Path]:
-    return run_supervised_results_summary(
-        run_spec=run_spec,
-        runs_root=runs_root,
-        update_report=update_report,
     )
 
 

@@ -30,12 +30,11 @@ conda activate upeftg
 ## Active Layout
 
 - `upeftguard/features`: stable spectral feature extraction
-- `upeftguard/pipelines`: CNN pipeline orchestration and Slurm submission
-- `upeftguard/supervised`: CNN training/finalization and checkpoint inference helpers
+- `upeftguard/cnn_pipeline.py`: CNN orchestration and Slurm submission
+- `upeftguard/supervised`: CNN training/finalization, scoring, and results summaries
 - `upeftguard/utilities/artifacts`: aggregation, spectral metadata, and dataset-reference helpers
 - `upeftguard/utilities/merge`: spectral sharding and merge/finalize utilities
 - `upeftguard/utilities/data`: dataset download helpers
-- `upeftguard/utilities/maintenance`: backfill utilities for older artifacts
 - `sbatch/`: generic Slurm scripts used by the CLI
 - `archive/`: inactive research and trial code
 

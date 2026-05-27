@@ -8,25 +8,25 @@ import subprocess
 from time import perf_counter
 from typing import Any
 
-from ..features.registry import extract_features
-from ..features.spectral import (
+from .features.registry import extract_features
+from .features.spectral import (
     DEFAULT_SPECTRAL_ENTRYWISE_DELTA_MODE,
     DEFAULT_SPECTRAL_FEATURES,
     DEFAULT_SPECTRAL_MOMENT_SOURCE,
     DEFAULT_SPECTRAL_QV_SUM_MODE,
 )
-from ..supervised.pipeline import run_supervised_pipeline
-from ..utilities.artifacts.aggregate_features import aggregate_features
-from ..utilities.artifacts.dataset_references import (
+from .supervised.pipeline import run_supervised_pipeline
+from .utilities.artifacts.aggregate_features import aggregate_features
+from .utilities.artifacts.dataset_references import (
     build_dataset_reference_payload_from_items,
     default_dataset_reference_report_path,
     write_dataset_reference_report,
 )
-from ..utilities.core.manifest import parse_single_manifest_json, resolve_manifest_path
-from ..utilities.core.paths import default_dataset_root
-from ..utilities.core.run_context import create_run_context
-from ..utilities.core.serialization import json_ready
-from ..utilities.merge.merge_feature_files import _resolve_output_feature_path
+from .utilities.core.manifest import parse_single_manifest_json, resolve_manifest_path
+from .utilities.core.paths import default_dataset_root
+from .utilities.core.run_context import create_run_context
+from .utilities.core.serialization import json_ready
+from .utilities.merge.merge_feature_files import _resolve_output_feature_path
 
 
 DEFAULT_CNN_FEATURES = list(DEFAULT_SPECTRAL_FEATURES)
@@ -35,7 +35,7 @@ DEFAULT_CNN_MODEL = "cnn_1d"
 
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[1]
 
 
 def _utc_now() -> datetime:
@@ -785,7 +785,7 @@ def run_cnn_infer(
             "timings": {"submit": timing},
         }
 
-    from ..supervised.pipeline import run_supervised_checkpoint_inference
+    from .supervised.pipeline import run_supervised_checkpoint_inference
 
     timing, started_perf = _timing_start("cnn_infer", backend="local")
     result = run_supervised_checkpoint_inference(

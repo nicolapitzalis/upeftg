@@ -30,7 +30,7 @@ from ..features.spectral import (
     spectral_block_lora_dims_by_block,
     spectral_extractor_params,
 )
-from ..unsupervised.reporting import (
+from .score_reporting import (
     compute_infer_threshold_rows,
     compute_infer_threshold_rows_from_inference,
     compute_offline_metrics,
@@ -4588,7 +4588,7 @@ def _prepare_supervised_finalize(
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(json_ready(report), f, indent=2)
 
-    from ..experiments.supervised_architecture_breakdown import (
+    from .results_summary import (
         build_supervised_results_summary,
         write_supervised_results_summary_outputs,
     )
@@ -5157,7 +5157,7 @@ def run_supervised_checkpoint_inference(
     run_id: str | None,
 ) -> dict[str, Any]:
     from .cnn import load_cnn_checkpoint
-    from ..experiments.supervised_architecture_breakdown import (
+    from .results_summary import (
         build_supervised_results_summary,
         write_supervised_results_summary_outputs,
     )

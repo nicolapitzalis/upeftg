@@ -12,7 +12,7 @@ from .features.spectral import (
     DEFAULT_SPECTRAL_QV_SUM_MODE,
     SUPPORTED_SPECTRAL_ENTRYWISE_DELTA_MODES,
 )
-from .pipelines.cnn_main import (
+from .cnn_pipeline import (
     run_cnn_aggregate,
     run_cnn_extract,
     run_cnn_full,

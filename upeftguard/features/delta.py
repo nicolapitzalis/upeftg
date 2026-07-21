@@ -7,6 +7,8 @@ from typing import Any, Iterator
 import numpy as np
 from safetensors import safe_open
 
+from ..contracts.spectral import tensor_shape
+
 DELTA_SCHEMA_VERSION = "2.1.0"
 
 
@@ -51,7 +53,9 @@ def _normalize_optional_shape(shape: tuple[int, ...] | None) -> tuple[int, ...] 
     return tuple(int(x) for x in shape)
 
 
-def discover_delta_pairs(adapter_path: Path) -> tuple[list[tuple[str, str]], list[str], list[tuple[int, ...]], list[tuple[int, ...]]]:
+def discover_delta_pairs(
+    adapter_path: Path,
+) -> tuple[list[tuple[str, str]], list[str], list[tuple[int, ...]], list[tuple[int, ...]]]:
     schema = load_delta_block_schema(adapter_path)
     return (
         [tuple(pair) for pair in schema.pairs],
@@ -59,12 +63,6 @@ def discover_delta_pairs(adapter_path: Path) -> tuple[list[tuple[str, str]], lis
         [tuple(int(x) for x in shape) for shape in schema.a_shapes],
         [tuple(int(x) for x in shape) for shape in schema.b_shapes],
     )
-
-
-def _tensor_shape(reader: Any, key: str) -> tuple[int, ...]:
-    if hasattr(reader, "get_slice"):
-        return tuple(int(x) for x in reader.get_slice(key).get_shape())
-    return tuple(int(x) for x in reader.get_tensor(key).shape)
 
 
 def _load_schema_fields(
@@ -98,16 +96,18 @@ def _load_schema_fields(
                 raise ValueError(f"Missing matching B tensor for {a_key}")
             pairs.append((a_key, b_key))
             block_names.append(block_name)
-            a_shapes.append(_tensor_shape(reader, a_key))
-            b_shapes.append(_tensor_shape(reader, b_key))
+            a_shapes.append(tensor_shape(reader, a_key))
+            b_shapes.append(tensor_shape(reader, b_key))
             e_keys.append(e_key)
-            e_shapes.append(_tensor_shape(reader, e_key) if e_key is not None else None)
+            e_shapes.append(tensor_shape(reader, e_key) if e_key is not None else None)
 
     return pairs, block_names, a_shapes, b_shapes, e_keys, e_shapes
 
 
 def load_delta_block_schema(adapter_path: Path) -> DeltaBlockSchema:
     pairs, block_names, a_shapes, b_shapes, e_keys, e_shapes = _load_schema_fields(adapter_path)
+    if not pairs:
+        raise ValueError(f"Adapter contains no supported LoRA factor pairs: {adapter_path}")
     return DeltaBlockSchema(
         pairs=tuple((str(a_key), str(b_key)) for a_key, b_key in pairs),
         block_names=tuple(str(name) for name in block_names),
@@ -184,9 +184,7 @@ def _reshape_vector_tensor(
         return tensor.reshape(-1)
     if tensor.ndim == 1:
         return tensor
-    raise ValueError(
-        f"Expected {tensor_kind} {key} to be rank-1 or singleton rank-2, got shape {tensor.shape}"
-    )
+    raise ValueError(f"Expected {tensor_kind} {key} to be rank-1 or singleton rank-2, got shape {tensor.shape}")
 
 
 def load_effective_block_factors(
@@ -231,19 +229,15 @@ def check_consistency_reader(
             f"pairs={len(expected_pairs)}, A={len(expected_a_shapes)}, B={len(expected_b_shapes)}"
         )
     if expected_e_keys is not None and len(expected_e_keys) != len(expected_pairs):
-        raise ValueError(
-            f"Expected E-key count must match pairs: {len(expected_e_keys)} vs {len(expected_pairs)}"
-        )
+        raise ValueError(f"Expected E-key count must match pairs: {len(expected_e_keys)} vs {len(expected_pairs)}")
     if expected_e_shapes is not None and len(expected_e_shapes) != len(expected_pairs):
-        raise ValueError(
-            f"Expected E-shape count must match pairs: {len(expected_e_shapes)} vs {len(expected_pairs)}"
-        )
+        raise ValueError(f"Expected E-shape count must match pairs: {len(expected_e_shapes)} vs {len(expected_pairs)}")
     keys = set(reader.keys())
     for i, (a_key, b_key) in enumerate(expected_pairs):
         if a_key not in keys or b_key not in keys:
             raise ValueError(f"Key mismatch in {adapter_path}: expected {a_key} and {b_key}")
-        a_shape = _tensor_shape(reader, a_key)
-        b_shape = _tensor_shape(reader, b_key)
+        a_shape = tensor_shape(reader, a_key)
+        b_shape = tensor_shape(reader, b_key)
         if allow_rank_variation:
             if len(a_shape) != 2 or len(b_shape) != 2:
                 raise ValueError(
@@ -256,9 +250,7 @@ def check_consistency_reader(
                     f"but got {(a_shape[1], b_shape[0])}"
                 )
             if int(a_shape[0]) != int(b_shape[1]):
-                raise ValueError(
-                    f"LoRA rank mismatch in {adapter_path} for block index {i}: A{a_shape}, B{b_shape}"
-                )
+                raise ValueError(f"LoRA rank mismatch in {adapter_path} for block index {i}: A{a_shape}, B{b_shape}")
         elif a_shape != expected_a_shapes[i] or b_shape != expected_b_shapes[i]:
             raise ValueError(
                 f"Shape mismatch in {adapter_path} for block index {i}: "
@@ -275,7 +267,7 @@ def check_consistency_reader(
                 if expected_e_shapes is not None:
                     expected_e_shape = expected_e_shapes[i]
                     if expected_e_shape is not None:
-                        e_shape = _tensor_shape(reader, e_key)
+                        e_shape = tensor_shape(reader, e_key)
                         if allow_rank_variation:
                             if len(e_shape) == 2 and 1 in e_shape:
                                 e_len = int(np.prod(e_shape, dtype=np.int64))
@@ -297,12 +289,17 @@ def check_consistency_reader(
                                 f"E expected {expected_e_shape} got {e_shape}"
                             )
 
+
 def block_delta_singular_values(
     a: np.ndarray,
     b: np.ndarray,
+    a_qr_r: np.ndarray | None = None,
 ) -> np.ndarray:
     _, rb = np.linalg.qr(b, mode="reduced")
-    _, ra = np.linalg.qr(a.T, mode="reduced")
+    if a_qr_r is None:
+        _, ra = np.linalg.qr(a.T, mode="reduced")
+    else:
+        ra = a_qr_r
     s_small = rb @ ra.T
     return np.asarray(np.linalg.svd(s_small, compute_uv=False), dtype=np.float64)
 
@@ -382,10 +379,7 @@ def build_schema_metadata(schema: DeltaBlockSchema) -> dict[str, Any]:
                     )
                     for a_shape, b_shape in zip(schema.a_shapes, schema.b_shapes)
                 ],
-                "e_shapes": [
-                    list(shape) if shape is not None else None
-                    for shape in schema.e_shapes
-                ],
+                "e_shapes": [list(shape) if shape is not None else None for shape in schema.e_shapes],
             }
         ),
     }

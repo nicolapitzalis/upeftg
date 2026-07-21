@@ -29,9 +29,7 @@ def default_dataset_root() -> Path:
 
 def dataset_root_help(prefix: str | None = None) -> str:
     base = (
-        "Dataset root "
-        f"(default: {default_dataset_root()}; override with {DATASET_ROOT_ENV} "
-        f"or {PROJECT_STORAGE_ENV})."
+        f"Dataset root (default: {default_dataset_root()}; override with {DATASET_ROOT_ENV} or {PROJECT_STORAGE_ENV})."
     )
     if not prefix:
         return base

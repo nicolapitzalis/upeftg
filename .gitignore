@@ -2,6 +2,17 @@
 __pycache__/
 *.py[cod]
 
+# Local verification assets
+/tests/
+/archive/legacy_tests/
+/scripts/slurm_pipeline_smoke.py
+/manifests/smoke/
+/manifests/transformer_hyperparams/transformer_smoke_*.json
+experiments.sh
+/archive
+*.ipynb
+*.gz
+
 # Local environments
 .venv/
 venv/

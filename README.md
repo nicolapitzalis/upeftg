@@ -1,220 +1,102 @@
 # upeftguard
 
-Stable CNN-only pipeline for spectral PEFT adapter features.
+Spectral PEFT-adapter feature extraction and supervised backdoor detection.
 
-The active codebase exposes one public workflow:
+The public workflow is model-neutral. It supports classical scikit-learn
+estimators, CNN, DANN, and Transformer models through one CLI:
 
 ```bash
-python -m upeftguard.cli cnn ...
+python -m upeftguard.cli experiment <extract|aggregate|train|infer|full>
 ```
 
-Older clustering, GMM, SVD, one-off experiment launchers, and legacy tests are
-archived under `archive/`. The complete pre-refactor state is also preserved on
-the git branch `archive/pre-cnn-cli-refactor-20260526` and tag
-`pre-cnn-cli-refactor-20260526`.
-
 ## Environment
+
+Create or update the Conda environment, then activate it:
 
 ```bash
 conda env create -f environment.yml
 conda activate upeftg
 ```
 
-If the environment already exists:
-
 ```bash
 conda env update -f environment.yml --prune
 conda activate upeftg
 ```
 
-## Active Layout
+Run commands from the repository root.
 
-- `upeftguard/features`: stable spectral feature extraction
-- `upeftguard/cnn_pipeline.py`: CNN orchestration and Slurm submission
-- `upeftguard/supervised`: CNN training/finalization, scoring, and results summaries
-- `upeftguard/utilities/artifacts`: aggregation, spectral metadata, and dataset-reference helpers
-- `upeftguard/utilities/merge`: spectral sharding and merge/finalize utilities
-- `upeftguard/utilities/data`: dataset download helpers
-- `sbatch/`: generic Slurm scripts used by the CLI
-- `archive/`: inactive research and trial code
+## Quick Start
 
-`runs/` is intentionally not reorganized by this refactor because historical
-metadata can contain absolute artifact paths.
-
-## Manifest Contract
-
-Use one `--manifest-json`.
-
-Single-pool manifests use a `path` section. Training can create a train/infer
-split with `--train-split`:
-
-```json
-{
-  "path": [
-    {
-      "path": "llama2_7b_toxic_backdoors_hard_rank256_qv/llama2_7b_toxic_backdoors_hard_rank256_qv_label0_",
-      "indices": [0, 249]
-    }
-  ]
-}
-```
-
-Joint manifests use `train` and `infer` sections and already define the split:
-
-```json
-{
-  "train": [{"path": "train_prefix_", "indices": [0, 249]}],
-  "infer": [{"path": "heldout_prefix_", "indices": [0, 249]}]
-}
-```
-
-Leave-one-out experiments should be represented as generated or pre-existing
-joint manifests, then submitted one manifest per run.
-
-## CNN CLI
-
-Slurm is the default backend and uses the `extra` partition by default:
+Slurm is the default backend. This command extracts features, creates an 80/20
+train/inference split, trains a logistic-regression model, and evaluates it:
 
 ```bash
-python -m upeftguard.cli cnn full --manifest-json <MANIFEST_JSON>
-python -m upeftguard.cli cnn extract --manifest-json <MANIFEST_JSON>
-python -m upeftguard.cli cnn aggregate --feature-file <FEATURE_FILE>
-python -m upeftguard.cli cnn train --manifest-json <MANIFEST_JSON> --feature-file <AGG_FEATURE_FILE>
-python -m upeftguard.cli cnn infer --run-dir runs/supervised/<RUN_ID>
+python -m upeftguard.cli experiment full \
+  --manifest-json manifests/rank_exploration/llama2_7b_tbh_rank256.json \
+  --train-split 80 \
+  --model logistic_regression \
+  --run-id logistic_tbh_rank256_train80
 ```
 
-Common backend options:
+Both `train` and `full` require an explicit `--model`. Use the single
+`--hyperparams` flag for that model's candidate-grid JSON. It is required for
+CNN, DANN, and Transformer models and optional for overriding a classical
+model's registered grid. See the
+[experiment runbook](docs/experiment-runbook.md#model-hyperparameters).
+
+Use `--backend local` to execute in the current process, or add `--dry-run` to
+inspect Slurm submissions without launching jobs.
+
+`full` requires either:
+
+- one complete `--manifest-json` plus `--train-split`; or
+- both `--train-manifest-json` and `--infer-manifest-json`.
+
+## Public Workflows
+
+| Command | Purpose |
+| --- | --- |
+| `experiment extract` | Extract spectral features from adapters in a manifest. |
+| `experiment aggregate` | Convert extracted features into the layer-sequence representation used by CNN, DANN, and Transformer models. |
+| `experiment train` | Train and finalize a selected supervised model. Sequence models consume aggregated features; classical models can consume extracted tabular features directly. |
+| `experiment infer` | Evaluate a self-contained `.pt` or `.joblib` checkpoint against an explicit inference manifest and compatible feature artifact. |
+| `experiment full` | Run extraction, optional aggregation, training, and checkpoint inference as one local or Slurm workflow. |
+
+The authoritative run root is `runs/<run-id>/`. Each selected stage owns its
+inputs, operational state, logs, scientific artifacts, and reports beneath that
+root.
+
+## Documentation
+
+- [Architecture](docs/architecture.md): package boundaries, dependency direction, public APIs, and runtime-data policy.
+- [Pipeline overview](docs/pipeline-overview.md): end-to-end data flow, artifact representations, supervised lifecycle, and output layout.
+- [Experiment CLI runbook](docs/experiment-runbook.md): complete commands, flag defaults, manifest forms, cross-validation, calibration, and experiment variants.
+- [Spectral features](docs/spectral-features.md): feature definitions, numerical implementation, spectral flags, schemas, and metadata.
+- [Slurm orchestration](docs/slurm-orchestration.md): job graphs, resource discovery, packed workers, dependencies, logs, dry runs, and troubleshooting.
+
+Use the live parser to inspect the installed checkout:
 
 ```bash
---backend slurm|local
---partition extra
---worker-cpus auto
---max-concurrent auto
---dry-run
+python -m upeftguard.cli experiment <COMMAND> --help
 ```
 
-Local execution is explicit:
+## Verification
+
+Run the same checks as CI from the activated environment:
 
 ```bash
-python -m upeftguard.cli cnn full \
-  --backend local \
-  --manifest-json manifests/single_datasets/llama2_7b_toxic_backdoors_hard.json \
-  --run-id cnn_local_demo
+python -m compileall -q upeftguard
+python -c 'import json, pathlib; [json.loads(path.read_text()) for path in pathlib.Path("manifests").rglob("*.json")]'
+ruff check upeftguard scripts
+git diff --check
 ```
 
-## Stages
+## Historical Code
 
-### Full Pipeline
+Inactive clustering, GMM, legacy standalone SVD, and one-off experiment code
+lives under `archive/`. The complete pre-refactor state is preserved on branch
+`archive/pre-cnn-cli-refactor-20260526` and tag
+`pre-cnn-cli-refactor-20260526`.
 
-```bash
-python -m upeftguard.cli cnn full \
-  --manifest-json <MANIFEST_JSON> \
-  --run-id <RUN_ID>
-```
-
-This runs:
-
-- spectral feature extraction
-- CNN layer-sequence aggregation
-- CNN training/finalization
-
-For Slurm, the CLI submits dependent jobs for extraction, aggregation, and
-training. Use `--dry-run` to inspect the generated `sbatch` commands.
-
-### Feature Extraction
-
-```bash
-python -m upeftguard.cli cnn extract \
-  --manifest-json <MANIFEST_JSON> \
-  --run-id <RUN_ID>
-```
-
-This exposes only the stable spectral extractor. SVD is archived and is not part
-of the public CLI.
-
-Slurm extraction writes the final feature bundle under:
-
-```text
-runs/feature_extract/<RUN_ID>/merged/spectral_features.npy
-```
-
-Local extraction writes under:
-
-```text
-runs/feature_extract/<RUN_ID>/features/spectral_features.npy
-```
-
-### CNN Aggregation
-
-```bash
-python -m upeftguard.cli cnn aggregate \
-  --feature-file runs/feature_extract/<RUN_ID>/merged/spectral_features.npy \
-  --output-filename <RUN_ID>_cnn_layer_sequence
-```
-
-The command creates the `layer_sequence` representation expected by `cnn_1d`,
-including the generated mask and group-name companion files.
-
-### CNN Training
-
-```bash
-python -m upeftguard.cli cnn train \
-  --manifest-json <MANIFEST_JSON> \
-  --feature-file runs/feature_extract/<RUN_ID>_cnn_layer_sequence/merged/spectral_features.npy \
-  --run-id <RUN_ID>
-```
-
-The reporting style is the existing supervised style. Key outputs include:
-
-- `run_config.json`
-- `artifact_index.json`
-- `timings.json`
-- `reports/supervised_report.json`
-- `reports/results_summary.md`
-- `reports/inference_scores.csv` when the manifest has an inference split
-
-### Checkpoint Inference
-
-```bash
-python -m upeftguard.cli cnn infer \
-  --run-dir runs/supervised/<RUN_ID>
-```
-
-or:
-
-```bash
-python -m upeftguard.cli cnn infer \
-  --checkpoint runs/supervised/<RUN_ID>/models/best_model.pt
-```
-
-Inference loads the saved CNN checkpoint and tuning manifest, scores the
-manifest inference split, and writes the same supervised report/summary style
-under `runs/supervised_inference/<RUN_ID>/`.
-
-## Timing Metadata
-
-Every CNN command writes timing metadata with:
-
-- `start_timestamp_utc`
-- `end_timestamp_utc`
-- `elapsed_seconds`
-- backend and Slurm submission metadata where applicable
-
-For Slurm, the submitter writes submission metadata immediately. Worker and
-finalize stages also write completion timing into their stage outputs and
-`timings.json`.
-
-## Internal Compatibility Commands
-
-The root CLI still contains internal compatibility commands used by Slurm
-scripts:
-
-- `python -m upeftguard.cli feature extract`
-- `python -m upeftguard.cli run supervised`
-- `python -m upeftguard.cli util aggregate-features`
-- `python -m upeftguard.cli util merge-features`
-- `python -m upeftguard.cli util export-feature-subset`
-- `python -m upeftguard.cli util download-dataset`
-
-These are not the recommended public workflow. Prefer the `cnn` namespace for
-new runs.
+Historical run directories are not reorganized because their metadata can
+contain absolute artifact paths.

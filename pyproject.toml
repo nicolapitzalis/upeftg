@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "upeftguard"
+version = "0.1.0"
+description = "Spectral PEFT-adapter feature extraction and supervised backdoor detection"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "huggingface-hub",
+  "joblib",
+  "matplotlib",
+  "numpy",
+  "safetensors",
+  "scikit-learn",
+  "scipy",
+  "torch",
+]
+
+[project.scripts]
+upeftguard = "upeftguard.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["upeftguard*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = ["archive", "runs", "old_version_results"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+

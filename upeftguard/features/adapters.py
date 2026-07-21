@@ -7,6 +7,7 @@ from typing import Any, Iterator
 import numpy as np
 from safetensors import safe_open
 
+from ..contracts.spectral import tensor_shape
 
 ADAPTER_FILENAME = "adapter_model.safetensors"
 
@@ -22,12 +23,6 @@ def extract_layers_from_keys(keys: tuple[str, ...]) -> list[int]:
     return sorted(layers)
 
 
-def get_tensor_shape_safe(reader: Any, key: str) -> tuple[int, ...]:
-    if hasattr(reader, "get_slice"):
-        return tuple(int(x) for x in reader.get_slice(key).get_shape())
-    return tuple(int(x) for x in reader.get_tensor(key).shape)
-
-
 def inspect_adapter_schema(
     adapter_path: Path,
     expected_keys: tuple[str, ...] | None,
@@ -41,12 +36,11 @@ def inspect_adapter_schema(
         shapes: list[tuple[int, ...]] = []
         n_params = 0
         for i, key in enumerate(keys):
-            shape = get_tensor_shape_safe(reader, key)
+            shape = tensor_shape(reader, key)
             shapes.append(shape)
             if expected_shapes is not None and shape != expected_shapes[i]:
                 raise ValueError(
-                    f"Shape mismatch for {adapter_path} at key {key}: "
-                    f"expected {expected_shapes[i]}, found {shape}"
+                    f"Shape mismatch for {adapter_path} at key {key}: expected {expected_shapes[i]}, found {shape}"
                 )
             n_params += int(np.prod(shape, dtype=np.int64))
 
@@ -102,11 +96,10 @@ def iter_reader_flat_chunks(
 
     for i, key in enumerate(keys):
         expected_shape = expected_shapes[i]
-        actual_shape = get_tensor_shape_safe(reader, key)
+        actual_shape = tensor_shape(reader, key)
         if actual_shape != expected_shape:
             raise ValueError(
-                f"Shape mismatch for {adapter_path} at key {key}: "
-                f"expected {expected_shape}, found {actual_shape}"
+                f"Shape mismatch for {adapter_path} at key {key}: expected {expected_shape}, found {actual_shape}"
             )
 
         if hasattr(reader, "get_slice"):
@@ -180,8 +173,7 @@ def stream_matrix_blocks(
             end = write_offset + chunk_size
             if end > n_features:
                 raise RuntimeError(
-                    "Feature write overflow in streamed blocks: "
-                    f"attempted end={end}, n_features={n_features}"
+                    f"Feature write overflow in streamed blocks: attempted end={end}, n_features={n_features}"
                 )
             yield write_offset, block
             write_offset = end

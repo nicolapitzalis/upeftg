@@ -18,7 +18,6 @@ class RunContext:
     features_dir: Path
     models_dir: Path
     reports_dir: Path
-    plots_dir: Path
     logs_dir: Path
     artifacts: dict[str, str] = field(default_factory=dict)
     timings: dict[str, float] = field(default_factory=dict)
@@ -46,7 +45,6 @@ class RunContext:
             json.dump(json_ready(timings), f, indent=2)
 
 
-
 def _default_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -56,17 +54,28 @@ def create_run_context(
     pipeline: str,
     output_root: Path = Path("runs"),
     run_id: str | None = None,
+    run_dir: Path | None = None,
+    create_directories: tuple[str, ...] = ("features", "models", "reports", "logs"),
 ) -> RunContext:
     rid = run_id or _default_run_id()
-    run_dir = output_root / pipeline / rid
+    output_root = Path(output_root).expanduser().resolve()
+    run_dir = Path(run_dir).expanduser().resolve() if run_dir is not None else output_root / pipeline / rid
     features_dir = run_dir / "features"
     models_dir = run_dir / "models"
     reports_dir = run_dir / "reports"
-    plots_dir = run_dir / "plots"
     logs_dir = run_dir / "logs"
 
-    for path in [features_dir, models_dir, reports_dir, plots_dir, logs_dir]:
-        path.mkdir(parents=True, exist_ok=True)
+    directories = {
+        "features": features_dir,
+        "models": models_dir,
+        "reports": reports_dir,
+        "logs": logs_dir,
+    }
+    unknown = set(create_directories) - set(directories)
+    if unknown:
+        raise ValueError(f"Unknown run directories: {sorted(unknown)}")
+    for name in create_directories:
+        directories[name].mkdir(parents=True, exist_ok=True)
 
     return RunContext(
         pipeline=pipeline,
@@ -76,6 +85,5 @@ def create_run_context(
         features_dir=features_dir,
         models_dir=models_dir,
         reports_dir=reports_dir,
-        plots_dir=plots_dir,
         logs_dir=logs_dir,
     )

@@ -11,4 +11,5 @@ dependencies:
   - huggingface_hub
   - joblib
   - pytorch
+  - ruff
   - pip

@@ -38,6 +38,12 @@ _KNOWN_ATTACK_NAMES = {
     "stybkd": "stybkd",
     "stykbd": "stybkd",
 }
+_DATASET_GROUP_ATTACK_TOKENS = frozenset(_KNOWN_ATTACK_NAMES)
+_DATASET_VARIANT_PREFIX_TOKENS = frozenset(
+    {"adalora", "dora", "qlora", "xl", "xxl", "large", "medium", "small", "mini", "tiny"}
+)
+_DATASET_VARIANT_PREFIX_PAIRS = frozenset({("lora", "plus"), ("lora", "only")})
+CV_ALWAYS_TRAIN_SECTION_KEY = "cv_always_train"
 
 
 def _project_root() -> Path:
@@ -209,9 +215,7 @@ def infer_attack_sample_identities(items: list[ManifestItem]) -> list[AttackSamp
         else:
             attack_name = "_".join(remainder_tokens) if remainder_tokens else "unknown"
             attack_name_source = (
-                "mixed_clean_backdoor_folder"
-                if subset_has_clean and subset_has_backdoor
-                else "folder_name"
+                "mixed_clean_backdoor_folder" if subset_has_clean and subset_has_backdoor else "folder_name"
             )
         identities.append(
             AttackSampleIdentity(
@@ -226,6 +230,48 @@ def infer_attack_sample_identities(items: list[ManifestItem]) -> list[AttackSamp
         )
 
     return identities
+
+
+def infer_dataset_group_name(identity: AttackSampleIdentity) -> str:
+    """Infer the dataset/domain key represented by an attack sample identity.
+
+    Adapter-variant prefixes, attack names, and rank/configuration suffixes are
+    excluded so that, for example, all Toxic Backdoors Hard rank and adapter
+    variants remain in the same dataset-level cross-validation group.
+    """
+
+    subset_tokens = [token for token in str(identity.subset_name or "unknown").split("_") if token]
+    model_tokens = [token for token in str(identity.model_family or "").split("_") if token]
+    remainder = subset_tokens
+    if model_tokens and subset_tokens[: len(model_tokens)] == model_tokens:
+        remainder = subset_tokens[len(model_tokens) :]
+
+    while remainder:
+        lowered = [token.lower() for token in remainder]
+        if len(lowered) >= 2 and tuple(lowered[:2]) in _DATASET_VARIANT_PREFIX_PAIRS:
+            remainder = remainder[2:]
+            continue
+        if lowered[0] in _DATASET_VARIANT_PREFIX_TOKENS:
+            remainder = remainder[1:]
+            continue
+        break
+
+    dataset_tokens: list[str] = []
+    for token in remainder:
+        token_lower = token.lower()
+        if _RANK_TOKEN_RE.match(token_lower):
+            break
+        if token_lower in _DATASET_GROUP_ATTACK_TOKENS:
+            break
+        dataset_tokens.append(token)
+
+    if dataset_tokens:
+        return "_".join(dataset_tokens)
+    if remainder:
+        filtered = [token for token in remainder if not _RANK_TOKEN_RE.match(token.lower())]
+        if filtered:
+            return "_".join(filtered)
+    return str(identity.subset_name or "unknown")
 
 
 def _parse_indices_spec(spec: str, *, manifest_path: Path, key: str) -> list[int]:
@@ -243,9 +289,7 @@ def _parse_indices_spec(spec: str, *, manifest_path: Path, key: str) -> list[int
     try:
         values = [int(p) for p in parts]
     except ValueError as exc:
-        raise ValueError(
-            f"Non-integer index value in '{key}' in {manifest_path}: '{spec}'"
-        ) from exc
+        raise ValueError(f"Non-integer index value in '{key}' in {manifest_path}: '{spec}'") from exc
 
     if any(v < 0 for v in values):
         raise ValueError(f"Negative indices are not allowed for '{key}' in {manifest_path}: '{spec}'")
@@ -343,9 +387,7 @@ def _resolve_manifest_entry(entry: str, dataset_root: Path) -> tuple[Path, Path]
         model_dir = _model_dir_from_adapter_path(adapter_path)
 
     if adapter_path.name != "adapter_model.safetensors":
-        raise ValueError(
-            f"Manifest entry must resolve to a model directory or adapter_model.safetensors: '{entry}'"
-        )
+        raise ValueError(f"Manifest entry must resolve to a model directory or adapter_model.safetensors: '{entry}'")
     if not adapter_path.exists():
         raise FileNotFoundError(f"Adapter file not found for manifest entry '{entry}': {adapter_path}")
 
@@ -422,9 +464,7 @@ def parse_manifest_entries_by_model_name(
     for line_no, entry in enumerate(entries, start=1):
         item = _manifest_item_from_name_entry(entry)
         if item.model_name in seen_names:
-            raise ValueError(
-                f"Duplicate model name in manifest {manifest_name}:{line_no} -> {item.model_name}"
-            )
+            raise ValueError(f"Duplicate model name in manifest {manifest_name}:{line_no} -> {item.model_name}")
         seen_names.add(item.model_name)
         items.append(item)
     return items
@@ -449,9 +489,7 @@ def _parse_json_section_sources(
                 "or an object with a 'sources' list"
             )
     else:
-        raise ValueError(
-            f"Section '{section_name}' in {manifest_path} must be a list or object"
-        )
+        raise ValueError(f"Section '{section_name}' in {manifest_path} must be a list or object")
 
     if not source_list:
         raise ValueError(f"Section '{section_name}' in {manifest_path} is empty")
@@ -480,8 +518,7 @@ def _parse_json_section_sources(
             continue
 
         raise ValueError(
-            f"{section_name}[{i}] in {manifest_path} must be either a string entry "
-            "or an object with path/indices"
+            f"{section_name}[{i}] in {manifest_path} must be either a string entry or an object with path/indices"
         )
     return sources
 
@@ -494,6 +531,41 @@ def _expand_sources_to_entries(sources: list[tuple[str, list[int] | None]]) -> l
         else:
             entries.extend(expand_structured_paths(path, indices))
     return entries
+
+
+def _optional_section_entries(
+    payload: dict[str, Any],
+    *,
+    section_key: str,
+    manifest_path: Path,
+) -> list[str]:
+    if section_key not in payload:
+        return []
+    sources = _parse_json_section_sources(
+        payload[section_key],
+        section_name=section_key,
+        manifest_path=manifest_path,
+    )
+    return _expand_sources_to_entries(sources)
+
+
+def _append_cv_always_train_entries(
+    entries: list[str],
+    payload: dict[str, Any],
+    *,
+    section_key: str,
+    manifest_path: Path,
+) -> list[str]:
+    if section_key != "path":
+        return entries
+    return [
+        *entries,
+        *_optional_section_entries(
+            payload,
+            section_key=CV_ALWAYS_TRAIN_SECTION_KEY,
+            manifest_path=manifest_path,
+        ),
+    ]
 
 
 def _load_manifest_payload(manifest_path: Path) -> tuple[Path, dict[str, Any]]:
@@ -525,7 +597,12 @@ def parse_single_manifest_json(
             section_name=section_key,
             manifest_path=resolved_manifest_path,
         )
-        entries = _expand_sources_to_entries(sources)
+        entries = _append_cv_always_train_entries(
+            _expand_sources_to_entries(sources),
+            payload,
+            section_key=section_key,
+            manifest_path=resolved_manifest_path,
+        )
         return parse_manifest_entries(
             entries,
             dataset_root=dataset_root,
@@ -551,8 +628,7 @@ def parse_single_manifest_json(
         )
 
     raise ValueError(
-        f"Manifest JSON {resolved_manifest_path} must include key '{section_key}' "
-        "or both 'train' and 'infer' keys"
+        f"Manifest JSON {resolved_manifest_path} must include key '{section_key}' or both 'train' and 'infer' keys"
     )
 
 
@@ -568,7 +644,12 @@ def parse_single_manifest_json_by_model_name(
             section_name=section_key,
             manifest_path=resolved_manifest_path,
         )
-        entries = _expand_sources_to_entries(sources)
+        entries = _append_cv_always_train_entries(
+            _expand_sources_to_entries(sources),
+            payload,
+            section_key=section_key,
+            manifest_path=resolved_manifest_path,
+        )
         return parse_manifest_entries_by_model_name(
             entries,
             manifest_name=f"{resolved_manifest_path}::{section_key}",
@@ -592,8 +673,27 @@ def parse_single_manifest_json_by_model_name(
         )
 
     raise ValueError(
-        f"Manifest JSON {resolved_manifest_path} must include key '{section_key}' "
-        "or both 'train' and 'infer' keys"
+        f"Manifest JSON {resolved_manifest_path} must include key '{section_key}' or both 'train' and 'infer' keys"
+    )
+
+
+def parse_cv_always_train_manifest_json_by_model_name(
+    *,
+    manifest_path: Path,
+) -> list[ManifestItem]:
+    """Parse the optional rows pinned into every CV training fold."""
+
+    resolved_manifest_path, payload = _load_manifest_payload(manifest_path)
+    entries = _optional_section_entries(
+        payload,
+        section_key=CV_ALWAYS_TRAIN_SECTION_KEY,
+        manifest_path=resolved_manifest_path,
+    )
+    if not entries:
+        return []
+    return parse_manifest_entries_by_model_name(
+        entries,
+        manifest_name=f"{resolved_manifest_path}::{CV_ALWAYS_TRAIN_SECTION_KEY}",
     )
 
 

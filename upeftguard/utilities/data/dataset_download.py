@@ -1,4 +1,3 @@
-import argparse
 import os
 import re
 from collections import defaultdict
@@ -9,7 +8,6 @@ import httpx
 from huggingface_hub import HfApi, snapshot_download
 from huggingface_hub.hf_api import RepoFile, RepoFolder
 
-from ..core.paths import default_dataset_root
 
 DEFAULT_REPO_ID = "Vincent-HKUSTGZ/PADBench"
 MODEL_DIR_RE = re.compile(r"^(?P<prefix>.+)_label(?P<label>\d+)_(?P<index>\d+)$")
@@ -53,7 +51,7 @@ class SelectionRequest:
         return self.start is None or self.end is None or self.start > self.end
 
 
-def _unique(values: Sequence[str] | None) -> List[str]:
+def unique_values(values: Sequence[str] | None) -> List[str]:
     if not values:
         return []
 
@@ -73,140 +71,6 @@ def resolve_clean_sources(datasets: Sequence[str]) -> List[Source]:
 
 def resolve_backdoored_sources(datasets: Sequence[str]) -> List[Source]:
     return [Source(subset, 1) for subset in datasets]
-
-
-def parse_selection_request(
-    raw_values: Sequence[int] | None,
-    arg_name: str,
-    parser: argparse.ArgumentParser,
-) -> SelectionRequest:
-    if raw_values is None:
-        return SelectionRequest(count=0)
-
-    if len(raw_values) == 1:
-        count = raw_values[0]
-        if count < 0:
-            parser.error(f"{arg_name} count must be >= 0")
-        return SelectionRequest(count=count)
-
-    if len(raw_values) == 2:
-        start, end = raw_values
-        if start < 0 or end < 0:
-            parser.error(f"{arg_name} range values must be >= 0")
-        if start > end:
-            parser.error(f"{arg_name} range must satisfy start <= end")
-        return SelectionRequest(start=start, end=end)
-
-    parser.error(
-        f"{arg_name} expects either one integer (<count>) "
-        "or two integers (<start> <end>)"
-    )
-    raise AssertionError("unreachable")
-
-
-def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    default_local_dir = str(default_dataset_root())
-    parser = argparse.ArgumentParser(
-        description=(
-            "Download selected PADBench adapters. Clean adapters are taken from "
-            "label0 folders and backdoored adapters from label1 folders."
-        )
-    )
-    parser.add_argument(
-        "--clean",
-        type=int,
-        nargs="+",
-        default=None,
-        metavar="N",
-        help=(
-            "Clean adapter selection. Pass one value (<count>) or two values "
-            "(<start> <end>, inclusive). Example: --clean 0 100."
-        ),
-    )
-    parser.add_argument(
-        "--backdoored",
-        "--backdoor",
-        dest="backdoored",
-        type=int,
-        nargs="+",
-        default=None,
-        metavar="N",
-        help=(
-            "Backdoored adapter selection. Pass one value (<count>, round-robin "
-            "across selected dataset folders) or two values (<start> <end>, "
-            "inclusive per selected dataset folder)."
-        ),
-    )
-    parser.add_argument(
-        "--repo-id",
-        type=str,
-        default=DEFAULT_REPO_ID,
-        help=f"Hugging Face dataset repo id (default: {DEFAULT_REPO_ID}).",
-    )
-    parser.add_argument(
-        "--show-list",
-        action="store_true",
-        help=(
-            "Print available PADBench folders and exit. When combined with "
-            "--dataset, print the available clean/backdoor indices for the "
-            "selected folder(s) instead."
-        ),
-    )
-    parser.add_argument(
-        "--dataset",
-        dest="datasets",
-        action="append",
-        default=None,
-        metavar="FOLDER",
-        help=(
-            "PADBench top-level folder to use as a download source. Repeat this "
-            "flag to select multiple folders. Required unless --show-list is "
-            "used. --clean downloads label0 adapters and --backdoored downloads "
-            "label1 adapters from the selected folders."
-        ),
-    )
-    parser.add_argument(
-        "--all",
-        action="store_true",
-        help=(
-            "Download all clean and backdoored adapters from the selected "
-            "dataset folder(s). Cannot be combined with --clean or --backdoored."
-        ),
-    )
-    parser.add_argument(
-        "--local-dir",
-        type=str,
-        default=default_local_dir,
-        help=f"Local output directory for downloaded files (default: {default_local_dir}).",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print selected model directories without downloading them.",
-    )
-
-    args = parser.parse_args(list(argv) if argv is not None else None)
-    args.datasets = _unique(args.datasets)
-    if args.all and (args.clean is not None or args.backdoored is not None):
-        parser.error("--all cannot be combined with --clean or --backdoored")
-
-    if args.all:
-        args.clean_request = SelectionRequest(select_all=True)
-        args.backdoored_request = SelectionRequest(select_all=True)
-    else:
-        args.clean_request = parse_selection_request(args.clean, "--clean", parser)
-        args.backdoored_request = parse_selection_request(
-            args.backdoored, "--backdoored", parser
-        )
-    if not args.show_list and not args.datasets:
-        parser.error("--dataset must be specified unless --show-list is used")
-    args.clean_sources = resolve_clean_sources(args.datasets)
-    args.backdoored_sources = resolve_backdoored_sources(args.datasets)
-    if not args.show_list and args.clean_request.is_empty and args.backdoored_request.is_empty:
-        parser.error(
-            "at least one of --clean or --backdoored must select at least one adapter"
-        )
-    return args
 
 
 def parse_model_dir(subset: str, model_dir: str) -> Tuple[int, int] | None:
@@ -241,9 +105,7 @@ def parse_tree_entry_path(entry_path: str, default_subset: str) -> Tuple[str, st
 
 
 def relevant_subsets(*source_groups: Sequence[Source]) -> List[str]:
-    return sorted(
-        {source.subset for sources in source_groups for source in sources}
-    )
+    return sorted({source.subset for sources in source_groups for source in sources})
 
 
 def _is_slurm_context() -> bool:
@@ -330,8 +192,7 @@ def validate_requested_datasets(
     if missing:
         missing_text = ", ".join(sorted(missing))
         raise ValueError(
-            f"Unknown PADBench folder(s): {missing_text}. "
-            "Use --show-list to inspect the available folders."
+            f"Unknown PADBench folder(s): {missing_text}. Use --show-list to inspect the available folders."
         )
 
 
@@ -378,9 +239,7 @@ def allocate_round_robin(total: int, capacities: Sequence[int]) -> List[int]:
     if not capacities:
         raise ValueError("no sources configured for allocation")
     if sum(capacities) < total:
-        raise ValueError(
-            f"requested {total} models but only {sum(capacities)} are available"
-        )
+        raise ValueError(f"requested {total} models but only {sum(capacities)} are available")
 
     allocation = [0] * len(capacities)
     remaining = total
@@ -422,8 +281,7 @@ def select_patterns(
             allocation = allocate_round_robin(requested_total, capacities)
         except ValueError as exc:
             details = ", ".join(
-                f"{source.subset} label{source.label}: {capacity}"
-                for source, capacity in zip(sources, capacities)
+                f"{source.subset} label{source.label}: {capacity}" for source, capacity in zip(sources, capacities)
             )
             raise ValueError(
                 f"Unable to satisfy --{name}={requested_total}. Available per source -> {details}"
@@ -450,13 +308,9 @@ def select_patterns(
 
     if not allow_patterns:
         details = ", ".join(
-            f"{source.subset} label{source.label}: {len(available_by_source.get(source.key, []))}"
-            for source in sources
+            f"{source.subset} label{source.label}: {len(available_by_source.get(source.key, []))}" for source in sources
         )
-        raise ValueError(
-            f"Unable to satisfy --{name} range {start}..{end}. "
-            f"Available counts per source -> {details}"
-        )
+        raise ValueError(f"Unable to satisfy --{name} range {start}..{end}. Available counts per source -> {details}")
 
     return allow_patterns, selection
 
@@ -475,10 +329,7 @@ def print_selection(
     for source, indices in selection.items():
         source_bytes = sum(size_by_model_dir.get(source.model_dir(index), 0) for index in indices)
         total_bytes += source_bytes
-        print(
-            f"  - {source.subset} label{source.label}: "
-            f"{len(indices)} adapters, {format_gb(source_bytes)}"
-        )
+        print(f"  - {source.subset} label{source.label}: {len(indices)} adapters, {format_gb(source_bytes)}")
     return total_bytes
 
 
@@ -509,8 +360,7 @@ def print_dataset_indices(
         print(f"  backdoor (label1): {_format_indices(available_by_source.get((dataset, 1), []))}")
 
 
-def main() -> None:
-    args = parse_args()
+def download_padbench(args) -> None:
     if args.show_list:
         if not args.datasets:
             print(f"Listing PADBench folders for '{args.repo_id}'...")
@@ -590,7 +440,3 @@ def main() -> None:
     except httpx.ConnectError as exc:
         _fatal_hf_connect_error("Downloading selected adapters", args.repo_id, exc)
     print("Download complete!")
-
-
-if __name__ == "__main__":
-    main()

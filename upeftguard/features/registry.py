@@ -1,17 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from .spectral import SPECTRAL_EXTRACTOR_VERSION, extract_spectral_features, spectral_extractor_params
-from ..utilities.artifacts.spectral_metadata import (
-    dataset_layouts_from_source,
-    write_spectral_metadata,
-)
 from ..utilities.core.manifest import ManifestItem
 from ..utilities.core.serialization import json_ready
 
@@ -69,13 +63,12 @@ def _compute_bundle(
         features, labels, model_names, metadata = extract_spectral_features(
             items=items,
             spectral_features=(
-                list(params.get("spectral_features"))
-                if params.get("spectral_features") is not None
-                else None
+                list(params.get("spectral_features")) if params.get("spectral_features") is not None else None
             ),
             spectral_qv_sum_mode=str(params.get("spectral_qv_sum_mode", "none")),
             spectral_moment_source=str(params.get("spectral_moment_source", "sv")),
             spectral_entrywise_delta_mode=str(params.get("spectral_entrywise_delta_mode", "auto")),
+            spectral_attention_granularity=str(params.get("spectral_attention_granularity", "module")),
             sv_top_k=int(params.get("spectral_sv_top_k", 8)),
             block_size=int(params.get("block_size", 131072)),
             dtype=dtype,
@@ -85,9 +78,7 @@ def _compute_bundle(
             _warning_messages_from_skipped_spectral_models(metadata),
         )
 
-    raise ValueError(
-        f"Unknown extractor '{extractor_name}'. Supported: {sorted(_EXTRACTOR_VERSIONS.keys())}"
-    )
+    raise ValueError(f"Unknown extractor '{extractor_name}'. Supported: {sorted(_EXTRACTOR_VERSIONS.keys())}")
 
 
 def extract_features(
@@ -95,12 +86,9 @@ def extract_features(
     extractor_name: str,
     items: list[ManifestItem],
     params: dict[str, Any],
-    run_features_dir: Path,
-) -> tuple[FeatureBundle, dict[str, Any], list[str]]:
+) -> tuple[FeatureBundle, list[str]]:
     if extractor_name not in _EXTRACTOR_VERSIONS:
-        raise ValueError(
-            f"Unknown extractor '{extractor_name}'. Supported: {sorted(_EXTRACTOR_VERSIONS.keys())}"
-        )
+        raise ValueError(f"Unknown extractor '{extractor_name}'. Supported: {sorted(_EXTRACTOR_VERSIONS.keys())}")
 
     bundle, warnings = _compute_bundle(
         extractor_name=extractor_name,
@@ -118,57 +106,7 @@ def extract_features(
             )
         ),
     }
-    kept_model_names = set(bundle.model_names)
-    kept_items = [item for item in items if item.model_name in kept_model_names]
-
-    run_features_dir.mkdir(parents=True, exist_ok=True)
-    run_feature_path = run_features_dir / f"{extractor_name}_features.npy"
-    np.save(run_feature_path, bundle.features)
-
-    run_labels_path: Path | None = None
-    if bundle.labels is not None:
-        run_labels_path = run_features_dir / f"{extractor_name}_labels.npy"
-        np.save(run_labels_path, bundle.labels)
-
-    run_names_path = run_features_dir / f"{extractor_name}_model_names.json"
-    with open(run_names_path, "w", encoding="utf-8") as f:
-        json.dump(bundle.model_names, f, indent=2)
-
-    run_metadata_path = run_features_dir / f"{extractor_name}_metadata.json"
-    if extractor_name == "spectral":
-        dataset_counts: dict[str, int] = {}
-        for item in kept_items:
-            dataset_name = str(item.model_dir.parent.name or "unknown")
-            dataset_counts[dataset_name] = int(dataset_counts.get(dataset_name, 0)) + 1
-        dataset_reference_payload = {
-            "dataset_groups": [
-                {
-                    "dataset_name": dataset_name,
-                    "sample_count": int(sample_count),
-                }
-                for dataset_name, sample_count in sorted(dataset_counts.items())
-            ]
-        }
-        dataset_layouts = dataset_layouts_from_source(
-            metadata=bundle.metadata,
-            dataset_reference_payload=dataset_reference_payload,
-        )
-        write_spectral_metadata(
-            run_metadata_path,
-            internal_metadata=bundle.metadata,
-            dataset_layouts=dataset_layouts,
-        )
-    else:
-        with open(run_metadata_path, "w", encoding="utf-8") as f:
-            json.dump(json_ready(bundle.metadata), f, indent=2)
-
-    artifact_info = {
-        "feature_path": str(run_feature_path),
-        "labels_path": str(run_labels_path) if run_labels_path is not None else None,
-        "model_names_path": str(run_names_path),
-        "metadata_path": str(run_metadata_path),
-    }
-    return bundle, artifact_info, warnings
+    return bundle, warnings
 
 
 def supported_extractors() -> list[str]:

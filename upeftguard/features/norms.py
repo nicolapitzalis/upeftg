@@ -70,7 +70,7 @@ class _MomentAccumulator:
         ex4 = self.sum_x4 / n
 
         variance = max(0.0, ex2 - (ex1 * ex1))
-        centered_fourth = ex4 - (4.0 * ex1 * ex3) + (6.0 * (ex1 ** 2) * ex2) - (3.0 * (ex1 ** 4))
+        centered_fourth = ex4 - (4.0 * ex1 * ex3) + (6.0 * (ex1**2) * ex2) - (3.0 * (ex1**4))
         if variance <= 1e-18:
             kurtosis = 0.0
         else:
@@ -91,10 +91,7 @@ class _MomentAccumulator:
 def resolve_entrywise_delta_mode(mode: str | None) -> str:
     resolved = DEFAULT_ENTRYWISE_DELTA_MODE if mode is None else str(mode).strip().lower()
     if resolved not in SUPPORTED_ENTRYWISE_DELTA_MODES:
-        raise ValueError(
-            f"Unknown entrywise_delta_mode '{mode}'. "
-            f"Supported: {list(SUPPORTED_ENTRYWISE_DELTA_MODES)}"
-        )
+        raise ValueError(f"Unknown entrywise_delta_mode '{mode}'. Supported: {list(SUPPORTED_ENTRYWISE_DELTA_MODES)}")
     return resolved
 
 
